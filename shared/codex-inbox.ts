@@ -24,6 +24,22 @@ interface CodexInboxState {
   unread: LeasedMessage[];
 }
 
+export interface CodexInboxMessageMetadata {
+  id: number;
+  from_id: string;
+  from_name: string;
+  from_peer_type: string;
+  from_cwd: string;
+  from_summary: string;
+  to_id: string;
+  sent_at: string;
+}
+
+export interface CodexInboxMetadataState {
+  unread: CodexInboxMessageMetadata[];
+  updated_at: string;
+}
+
 const EMPTY_STATE: CodexInboxState = { unread: [] };
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
@@ -37,7 +53,7 @@ function defaultRootDir(): string {
   return join(homedir(), ".agent-peers-codex");
 }
 
-async function atomicWriteJson(path: string, value: CodexInboxState): Promise<void> {
+async function atomicWriteJson<T>(path: string, value: T): Promise<void> {
   const dir = dirname(path);
   // Create the dir with 0o700 and re-chmod defensively — mkdir's mode can be
   // masked by umask on some Node/Bun versions, so we always follow up with
@@ -64,7 +80,10 @@ async function atomicWriteJson(path: string, value: CodexInboxState): Promise<vo
 
 export class CodexInboxStore {
   private readonly filePath: string;
+  private readonly metadataFilePath: string;
   private readonly persistState: (path: string, value: CodexInboxState) => Promise<void>;
+  private readonly persistMetadata: (path: string, value: CodexInboxMetadataState) => Promise<void>;
+  private readonly onMetadataError: (error: unknown) => void;
   private state: CodexInboxState = { unread: [] };
   private queue: Promise<void> = Promise.resolve();
 
@@ -72,11 +91,20 @@ export class CodexInboxStore {
     peerId: PeerId;
     rootDir?: string;
     persistState?: (path: string, value: CodexInboxState) => Promise<void>;
+    persistMetadata?: (path: string, value: CodexInboxMetadataState) => Promise<void>;
+    onMetadataError?: (error: unknown) => void;
   }) {
     const rootDir = opts.rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? defaultRootDir();
     const safePeerId = encodeURIComponent(opts.peerId);
     this.filePath = join(rootDir, `${safePeerId}.json`);
+    this.metadataFilePath = join(rootDir, `${safePeerId}.metadata.json`);
     this.persistState = opts.persistState ?? atomicWriteJson;
+    this.persistMetadata = opts.persistMetadata ?? atomicWriteJson;
+    this.onMetadataError = opts.onMetadataError ?? ((error) => {
+      console.error(
+        `[agent-peers/codex-inbox] failed to persist bodyless metadata for ${this.metadataFilePath}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
   }
 
   async init(): Promise<void> {
@@ -89,6 +117,10 @@ export class CodexInboxStore {
     return this.withLock(async () => cloneMessages(this.state.unread));
   }
 
+  async getUnreadMessageMetadata(): Promise<CodexInboxMessageMetadata[]> {
+    return this.withLock(async () => metadataForMessages(this.state.unread));
+  }
+
   async queueLeasedMessages(messages: LeasedMessage[]): Promise<void> {
     await this.withLock(async () => {
       const unreadById = new Map(this.state.unread.map((message) => [message.id, { ...message }]));
@@ -96,6 +128,7 @@ export class CodexInboxStore {
       const nextState = { unread: Array.from(unreadById.values()).sort((a, b) => a.id - b.id) };
       await this.persistState(this.filePath, nextState);
       this.state = nextState;
+      await this.persistMetadataBestEffort(nextState);
     });
   }
 
@@ -105,6 +138,7 @@ export class CodexInboxStore {
       const nextState = { unread: [] };
       await this.persistState(this.filePath, nextState);
       this.state = nextState;
+      await this.persistMetadataBestEffort(nextState);
       return unread;
     });
   }
@@ -128,6 +162,7 @@ export class CodexInboxStore {
       if (nextState.unread.length === this.state.unread.length) return;
       await this.persistState(this.filePath, nextState);
       this.state = nextState;
+      await this.persistMetadataBestEffort(nextState);
     });
   }
 
@@ -136,7 +171,19 @@ export class CodexInboxStore {
       const nextState = { unread: [] };
       await this.persistState(this.filePath, nextState);
       this.state = nextState;
+      await this.persistMetadataBestEffort(nextState);
     });
+  }
+
+  private async persistMetadataBestEffort(state: CodexInboxState): Promise<void> {
+    try {
+      await this.persistMetadata(this.metadataFilePath, {
+        unread: metadataForMessages(state.unread),
+        updated_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      this.onMetadataError(error);
+    }
   }
 
   private async readStateFromDisk(): Promise<CodexInboxState> {
@@ -198,6 +245,19 @@ export class CodexInboxStore {
       release();
     }
   }
+}
+
+function metadataForMessages(messages: LeasedMessage[]): CodexInboxMessageMetadata[] {
+  return messages.map((message) => ({
+    id: message.id,
+    from_id: message.from_id,
+    from_name: message.from_name,
+    from_peer_type: message.from_peer_type,
+    from_cwd: message.from_cwd,
+    from_summary: message.from_summary,
+    to_id: message.to_id,
+    sent_at: message.sent_at,
+  }));
 }
 
 export { EMPTY_STATE as EMPTY_CODEX_INBOX_STATE };
