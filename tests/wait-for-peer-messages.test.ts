@@ -2,9 +2,40 @@ import { expect, test } from "bun:test";
 
 import {
   hasFreshUnread,
+  planWaitForPeerMessages,
   waitForFreshPeerMessages,
 } from "../shared/wait-for-peer-messages.ts";
 import type { LeasedMessage } from "../shared/types.ts";
+
+const PLAN_LIMITS = { defaultMs: 300_000, maxMs: 300_000 };
+
+test("planWaitForPeerMessages short-circuits to skip-wakeable for wakeable sessions", () => {
+  // The crux of the no-freeze fix: a wakeable session never blocks here, so the
+  // turn can't be pinned "working" for minutes. timeoutMs is still normalized so
+  // the handler can report what it would have waited.
+  expect(planWaitForPeerMessages({ isWakeable: true, rawTimeout: undefined, ...PLAN_LIMITS }))
+    .toEqual({ kind: "skip-wakeable", timeoutMs: 300_000 });
+  expect(planWaitForPeerMessages({ isWakeable: true, rawTimeout: 5000, ...PLAN_LIMITS }))
+    .toEqual({ kind: "skip-wakeable", timeoutMs: 5000 });
+});
+
+test("planWaitForPeerMessages still waits (blocks) for non-wakeable sessions", () => {
+  expect(planWaitForPeerMessages({ isWakeable: false, rawTimeout: undefined, ...PLAN_LIMITS }))
+    .toEqual({ kind: "wait", timeoutMs: 300_000 });
+  expect(planWaitForPeerMessages({ isWakeable: false, rawTimeout: 1234, ...PLAN_LIMITS }))
+    .toEqual({ kind: "wait", timeoutMs: 1234 });
+});
+
+test("planWaitForPeerMessages clamps and floors the requested timeout", () => {
+  expect(planWaitForPeerMessages({ isWakeable: false, rawTimeout: 999_999, ...PLAN_LIMITS }).timeoutMs).toBe(300_000);
+  expect(planWaitForPeerMessages({ isWakeable: false, rawTimeout: -50, ...PLAN_LIMITS }).timeoutMs).toBe(0);
+  expect(planWaitForPeerMessages({ isWakeable: false, rawTimeout: 12.9, ...PLAN_LIMITS }).timeoutMs).toBe(12);
+});
+
+test("planWaitForPeerMessages rejects a non-finite explicit timeout, even when wakeable", () => {
+  expect(() => planWaitForPeerMessages({ isWakeable: true, rawTimeout: "soon", ...PLAN_LIMITS })).toThrow("finite number");
+  expect(() => planWaitForPeerMessages({ isWakeable: false, rawTimeout: Number.NaN, ...PLAN_LIMITS })).toThrow("finite number");
+});
 
 function message(id: number): LeasedMessage {
   return {

@@ -3,6 +3,7 @@
 // Inspection + admin CLI for agent-peers-mcp. Talks to broker on :7900.
 
 import { createClient } from "./shared/broker-client.ts";
+import { isValidName, pickAvailablePeerName } from "./shared/names.ts";
 import { readSharedSecret } from "./shared/shared-secret.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore } from "./shared/wake-launch-claims.ts";
@@ -514,6 +515,31 @@ async function cmdKillBroker() {
   }
 }
 
+// Print a unique, memorable peer name for `base` (read-only). Used by
+// bin/codex-peer so a 2nd+ concurrent peer in the same repo auto-gets a funny
+// suffix (e.g. <repo>-codex-otter) instead of a positional -2, with no typing.
+// Queries the broker for LIVE peer names; if the broker is down or unreachable
+// the base is echoed unchanged (the broker's register-time ladder still
+// guarantees uniqueness). ONLY the chosen name goes to stdout, so the launcher
+// can capture it directly; everything else is silent.
+async function cmdSuggestName(base: string) {
+  if (!isValidName(base)) {
+    // Not our job to sanitize — hand it back; register will reject/ladder it.
+    console.log(base);
+    return;
+  }
+  let taken = new Set<string>();
+  try {
+    if (await client.isAlive()) {
+      const peers = await client.listPeers({ scope: "machine", cwd: process.cwd(), git_root: null });
+      taken = new Set(peers.map((p) => p.name));
+    }
+  } catch {
+    /* broker unreachable — echo base; register-time ladder is the backstop */
+  }
+  console.log(pickAvailablePeerName(base, taken));
+}
+
 const [, , sub, ...rest] = process.argv;
 switch (sub) {
   case "status":
@@ -556,6 +582,13 @@ switch (sub) {
     }
     await cmdRepairWake(rest[0]!);
     break;
+  case "suggest-name":
+    if (rest.length !== 1) {
+      console.error("usage: cli.ts suggest-name <base>");
+      process.exit(2);
+    }
+    await cmdSuggestName(rest[0]!);
+    break;
   case "messages":
     await cmdMessages();
     break;
@@ -574,6 +607,7 @@ switch (sub) {
   bun cli.ts rename <name-or-id> <new-name>
   bun cli.ts retire <name-or-id>
   bun cli.ts repair-wake <name-or-id>
+  bun cli.ts suggest-name <base>
   bun cli.ts messages
   bun cli.ts orphaned-messages
   bun cli.ts kill-broker`);

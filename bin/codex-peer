@@ -36,7 +36,11 @@ Simple zsh aliases installed on Mike's machine:
 Usage:
   codex-peer
       Start wakeable Codex in the current directory.
-      Auto-names the peer from the repo, like ccr-website-codex.
+      Auto-names the peer from the repo, like ccr-website-codex. If another
+      LIVE peer in the same repo already holds that name, this one gets a
+      memorable funny suffix instead of a positional -2 (e.g.
+      ccr-website-codex-otter), so multiple instances in one repo are each
+      individually addressable with no typing.
 
   codex-peer google-ads [-- extra codex args]
       Start a wakeable Codex peer in /Users/mike/www/ai/google-ads-expert
@@ -160,6 +164,23 @@ run_bun() {
   bun "$@"
 }
 
+# Resolve a name that won't collide with a LIVE peer. If the requested name is
+# free (or only held by a stale/dead peer) it is returned unchanged, so the
+# primary instance keeps its clean canonical name (e.g. <repo>-codex) and the
+# broker's reclaim-on-relaunch still works. A 2nd+ CONCURRENT peer in the same
+# repo gets a memorable funny suffix (e.g. <repo>-codex-otter) instead of -2 —
+# no typing required. Read-only; if the broker is down or the query fails we
+# fall back to the requested name (the broker's register-time suffix ladder is
+# the final uniqueness backstop, so this never has to be perfect).
+resolve_unique_name() {
+  local base="$1" resolved
+  resolved="$(run_bun cli.ts suggest-name "$base" 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+  case "$resolved" in
+    ''|*[!a-zA-Z0-9_-]*) printf '%s' "$base" ;;
+    *) printf '%s' "$resolved" ;;
+  esac
+}
+
 start_peer() {
   local peer_name="$1"
   local repo_path="$2"
@@ -167,6 +188,8 @@ start_peer() {
   ensure_repo "$repo_path"
   need_cmd codex
   ensure_daemon
+  peer_name="$(resolve_unique_name "$peer_name")"
+  printf 'codex-peer: network peer name: %s\n' "$peer_name" >&2
   run_bun wakeable-codex.ts --cwd "$repo_path" --name "$peer_name" "$@"
 }
 
@@ -174,7 +197,7 @@ start_here() {
   local repo_path peer_name
   repo_path="$(canonical_dir "$PWD")"
   peer_name="$(auto_peer_name "$repo_path")"
-  printf 'codex-peer: starting wakeable Codex in %s as %s\n' "$repo_path" "$peer_name" >&2
+  printf 'codex-peer: starting wakeable Codex in %s\n' "$repo_path" >&2
   start_peer "$peer_name" "$repo_path" "$@"
 }
 

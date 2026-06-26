@@ -77,7 +77,7 @@ import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
-import { waitForFreshPeerMessages as waitForFreshPeerMessagesLoop } from "./shared/wait-for-peer-messages.ts";
+import { planWaitForPeerMessages, waitForFreshPeerMessages as waitForFreshPeerMessagesLoop } from "./shared/wait-for-peer-messages.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
@@ -109,6 +109,13 @@ let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 let inboxStore: CodexInboxStore | null = null;
 let pollInFlight: Promise<void> | null = null;
+// True once this MCP has registered the session in the wake registry, i.e. an
+// external wake daemon can start a fresh turn the instant mail arrives. In that
+// mode `wait_for_peer_messages` is pointless (and actively harmful — it pins the
+// turn "working" for up to 5 minutes, so the session LOOKS hung between peer
+// pings). We short-circuit it to a no-op for wakeable sessions; see the
+// wait_for_peer_messages handler.
+let isWakeableSession = false;
 
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
@@ -150,10 +157,18 @@ Exceptions: you do NOT need to call \`check_messages\` before:
     have no reason to expect a peer interaction. Even then, call
     \`check_messages\` again at the start of the next user turn.
 
-If the user asks you to stand by for peer collaboration, call
-\`wait_for_peer_messages\` with a bounded timeout. It keeps this same
-Codex turn alive until messages arrive or the timeout expires; it is not
-the same as waking a fully idle session.
+If the user asks you to stand by for peer collaboration in a NON-wakeable
+session, call \`wait_for_peer_messages\` with a bounded timeout. It keeps
+this same Codex turn alive until messages arrive or the timeout expires; it
+is not the same as waking a fully idle session.
+
+If this is a WAKEABLE session (launched via \`codex-peer\` — an external
+daemon starts a fresh turn the instant a peer message arrives), do NOT call
+\`wait_for_peer_messages\` to await a reply: just finish your turn and go
+idle. The daemon wakes you on arrival. Blocking would only pin this turn
+"working" for minutes and make the session look hung. (As a safety net the
+server short-circuits \`wait_for_peer_messages\` to return immediately for
+wakeable sessions, but the right habit is simply not to call it.)
 
 DELIVERY CHANNELS:
 
@@ -212,7 +227,7 @@ const TOOLS = [
   {
     name: "wait_for_peer_messages",
     description:
-      "Stand by for incoming peer messages for up to timeout_ms, then surface them through the normal [PEER INBOX] tool-response path. This keeps this same Codex turn alive; it is not a fully idle wake mechanism.",
+      "Stand by for incoming peer messages for up to timeout_ms, then surface them through the normal [PEER INBOX] tool-response path. This keeps this same Codex turn alive; it is not a fully idle wake mechanism. NOTE: in a wakeable session (one launched via `codex-peer`, where a wake daemon starts a fresh turn on message arrival) this returns IMMEDIATELY without blocking — you do not need to wait, just end your turn and go idle. Only use this to block the current turn in a non-wakeable session.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -530,7 +545,7 @@ async function withPiggyback(
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
-  let waitResult: { didWait: boolean; found: boolean; timeoutMs: number } | null = null;
+  let waitResult: { didWait: boolean; found: boolean; timeoutMs: number; skippedWakeable?: boolean } | null = null;
 
   return withPiggyback(async () => {
     switch (name) {
@@ -579,6 +594,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "wait_for_peer_messages": {
+        if (waitResult?.skippedWakeable) {
+          // Any messages already in the inbox are surfaced above via [PEER INBOX]
+          // (the broker poll ran before this hook). We deliberately did NOT block:
+          // this session is registered with the wake daemon, which starts a fresh
+          // turn the instant new mail arrives. Blocking here would only freeze the
+          // turn "working" for minutes and make the session look hung.
+          return {
+            text:
+              "This is a wakeable session, so wait_for_peer_messages returned immediately " +
+              "instead of blocking. You do NOT need to wait for peers: end your turn and go " +
+              "idle. The agent-peers wake daemon will start a fresh turn the moment a new peer " +
+              "message arrives. (Any messages already waiting are shown above.)",
+          };
+        }
         if (!waitResult?.didWait) {
           return { text: "wait_for_peer_messages did not run.", isError: true };
         }
@@ -606,15 +635,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }, {
     beforeReadQueue: name === "wait_for_peer_messages"
       ? async () => {
-          const rawTimeout = (args as { timeout_ms?: unknown } | undefined)?.timeout_ms;
-          if (rawTimeout !== undefined && (typeof rawTimeout !== "number" || !Number.isFinite(rawTimeout))) {
-            throw new Error("timeout_ms must be a finite number");
+          const plan = planWaitForPeerMessages({
+            isWakeable: isWakeableSession,
+            rawTimeout: (args as { timeout_ms?: unknown } | undefined)?.timeout_ms,
+            defaultMs: WAIT_FOR_MESSAGES_DEFAULT_MS,
+            maxMs: WAIT_FOR_MESSAGES_MAX_MS,
+          });
+          // Wakeable sessions get woken on demand by the daemon; blocking here
+          // would pin the turn "working" for up to the timeout and make the
+          // session look hung. Skip the wait entirely — pending mail is already
+          // surfaced by the broker poll that ran before this hook.
+          if (plan.kind === "skip-wakeable") {
+            log(`wait_for_peer_messages skipped: wakeable session (would have waited ${plan.timeoutMs}ms)`);
+            waitResult = { didWait: false, found: false, timeoutMs: plan.timeoutMs, skippedWakeable: true };
+            return;
           }
-          const normalized = rawTimeout === undefined
-            ? WAIT_FOR_MESSAGES_DEFAULT_MS
-            : Math.max(0, Math.min(WAIT_FOR_MESSAGES_MAX_MS, Math.floor(rawTimeout)));
-          const found = await waitForFreshPeerMessages(normalized);
-          waitResult = { didWait: true, found, timeoutMs: normalized };
+          const found = await waitForFreshPeerMessages(plan.timeoutMs);
+          waitResult = { didWait: true, found, timeoutMs: plan.timeoutMs };
         }
       : undefined,
   });
@@ -796,6 +833,9 @@ async function registerWakeableSessionIfEnabled(opts: {
   if (hints.claim_id !== "env") {
     await new WakeLaunchClaimStore().consume(hints.claim_id, opts.peerId).catch(() => {});
   }
+  // This session is now wake-target: the daemon will start a fresh turn on mail
+  // arrival, so the model never needs to block in wait_for_peer_messages.
+  isWakeableSession = true;
   log(`wake registry updated for thread ${hints.thread_id}`);
 }
 

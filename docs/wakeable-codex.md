@@ -156,6 +156,22 @@ Codex. The wake only causes a turn; it never *is* the message.
   from the detail line's `thread=<thread_id>` so the two never collide. A wedged or
   half-dead app-server makes the probe fail fast and the field is simply omitted.
   (The spinner itself is an upstream Codex `--remote` rendering behavior.)
+- **`wait_for_peer_messages` is a no-op in a wakeable session — so a woken peer
+  can't freeze itself waiting for a reply.** The blocking long-poll
+  `wait_for_peer_messages` (up to 5 min) made sense for a non-wakeable session
+  that wants to hold its turn open; in a *wakeable* session it is redundant and
+  actively harmful — the daemon already starts a fresh turn on mail arrival, so
+  blocking only pins the `--remote` TUI "working" for minutes and queues the
+  operator's typed input behind the call (looks hung between peer pings). The
+  server now detects wake-target sessions (a module flag set when the wake
+  registry upsert succeeds) and **short-circuits `wait_for_peer_messages` to
+  return immediately** for them (`planWaitForPeerMessages()` →
+  `kind: "skip-wakeable"`). Any already-pending mail still surfaces, because the
+  broker poll runs *before* the wait hook; future arrivals are covered by the
+  daemon. The tool description and the system preamble also tell wakeable
+  sessions to simply end the turn and go idle rather than long-poll. (The
+  short-circuit is a launch-time property of the running MCP — a peer started
+  before this change keeps blocking until relaunched.)
 
 ## Operating it
 
@@ -176,6 +192,27 @@ codex-peer daemon-stop       # stop it
 codex-peer repair-wake NAME  # re-attach a live peer whose wake pointer was lost
 codex-peer retire NAME       # remove a stale/confusing peer from discovery
 ```
+
+### Peer naming (multiple instances per repo)
+
+A bare `codex-peer` auto-names the peer `<repo>-codex` (e.g. `ccr-website-codex`).
+The name is intentionally deterministic so the primary instance is predictable
+to address and so a relaunch **reclaims the same name** (the broker reclaims a
+stale same-named row in place).
+
+If you start a **second concurrent** peer in the same repo while the first is
+still live, the launcher gives it a **memorable funny suffix** instead of a
+positional `-2` — e.g. `ccr-website-codex-otter`. The launcher resolves this by
+asking the broker (read-only, `cli.ts suggest-name <base>`) for the set of
+**live** peer names: if `<base>` is free it is used unchanged (preserving the
+canonical name + reclaim); if it is held by a live peer, a single animal word is
+appended, trimmed if needed to stay within the 32-char name limit. Each instance
+therefore gets a unique, individually-addressable name with no typing, so you can
+tell any specific one to collaborate over the network. (The broker's own
+register-time suffix ladder remains the final uniqueness backstop for the rare
+check-vs-register race.) For a *chosen* stable name, use
+`codex-peer start <name> <repo-path>`; a running peer can also rename itself via
+the `rename_peer` tool.
 
 **The background wake daemon auto-starts on every launch** — idempotent,
 single-instance (pidfile + atomic lock), detached via `nohup`/`disown` so it
