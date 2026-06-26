@@ -122,27 +122,27 @@ Codex. The wake only causes a turn; it never *is* the message.
 - **Confirm-on-next-call delivery.** Messages stay in the durable inbox until the
   *next* tool call proves the prior response reached the model, so a dropped wake
   response re-delivers instead of silently losing mail.
-- **Split identity per session (KNOWN OPEN ISSUE — delivery can be flaky).** The
-  Codex app-server starts one agent-peers MCP *per conversation*. A wakeable launch
-  has two conversations — the materialize turn (writes the rollout) and the
-  TUI/resume session — so **both** register as separate broker peers (name + `-2`),
-  each with its own inbox and lease loop. A message addressed to one identity can
-  then be invisible to a `check_messages` served by the other → "no pending messages"
-  even though the message is on disk. **Why this is hard to fix:** in `--remote` mode
-  the visible `codex resume --remote` TUI is a thin client — it spawns **no** MCP
-  itself; the **app-server** spawns the MCP for *every* conversation it hosts, using
-  the **app-server process's** `-c` config. So per-conversation enable/disable via
-  config is impossible: a `-c …AGENT_PEERS_ENABLED=…` on either the app-server or the
-  resume command is applied to ALL the app-server's MCPs (or ignored, respectively).
-  A 2026-06-25 attempt to disable agent-peers only on the materialize side
-  (`AGENT_PEERS_ENABLED=0` on the app-server) therefore disabled it for the WHOLE
-  session — no registration at all, peers not wakeable — and was **reverted**
-  (`d1fb58c`). The real fix must **tear down the materialize conversation's MCP after
-  launch** (leaving only the resume identity), and must be validated live, not by
-  unit tests. Until then the system runs in the split state: usually one of the twins
-  is the wakeable one and delivery works, but it can race. Track via `codexpeer live`.
-  See `.specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md` (§6.1 + the §12
-  post-mortem).
+- **One agent-peers identity per session (two-app-server launch).** In `--remote`
+  mode the visible `codex resume --remote` TUI is a thin client — it spawns **no**
+  MCP itself; the **app-server** spawns the agent-peers MCP for *every* conversation
+  it hosts, using the **app-server process's** `-c` config (verified via `ps eww`:
+  the MCP child's env exactly mirrors the app-server's `-c mcp_servers.agent-peers.env.*`,
+  and the resume command's own `-c` is ignored). So a single shared app-server
+  registers **both** the materialize conversation and the resume conversation
+  (name + `-2`); mail addressed to `name` lands in the materialize twin's inbox while
+  the daemon wakes the resume twin → split delivery. Per-conversation config can't
+  fix it, and disabling agent-peers on the one shared app-server disables the whole
+  session (the 2026-06-25 first attempt, reverted in `d1fb58c`). **The fix splits the
+  launch across two app-servers:** phase 1 runs the materialize setup turn on a
+  throwaway app-server with agent-peers **disabled** (so it registers nothing) and
+  kills it; phase 2 brings up a fresh app-server that hosts **only** the visible
+  resume session, so its single MCP registers under the canonical name and is the
+  wake target. Cross-app-server resume is safe because the thread store is shared on
+  disk — the phase-2 app-server re-opens the thread via `thread/resume` (verified:
+  `thread/resume` + `turn/start` succeed on a fresh app-server after the creator
+  died). The codex-server registration/delivery path is untouched. Verify with
+  `codexpeer live`: a healthy session shows exactly **one** wakeable identity per repo
+  (no `-2`). See `.specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md`.
 - **The TUI "working" spinner can lie — trust `thread_status=` in `codexpeer live`.**
   The materialize handshake and every daemon wake are injected into the thread by an
   *external* client (the launcher / wake daemon), not the TUI. The `--remote` TUI
