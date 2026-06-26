@@ -2,6 +2,7 @@
 // Managed launcher for app-server-backed wakeable Codex TUI sessions.
 
 import { createServer } from "node:net";
+import { existsSync, statSync } from "node:fs";
 
 import { CodexAppServerWsClient } from "./app-server-client.ts";
 import { WakeLaunchClaimStore } from "./wake-launch-claims.ts";
@@ -122,6 +123,32 @@ export function buildMcpPeerNameConfigArgs(peerName?: string): string[] {
     : [];
 }
 
+export function buildMaterializeMcpConfigArgs(peerName?: string): string[] {
+  // Config for the SHORT-LIVED materialize app-server (phase 1 of the launch).
+  // Its only job is to run one setup turn so the rollout exists on disk; its
+  // agent-peers MCP must be a no-op so it NEVER registers a broker peer.
+  //
+  // Why a separate app-server at all: in `--remote` mode the app-server (NOT
+  // the thin resume TUI) spawns the agent-peers MCP for every conversation it
+  // hosts, using the app-server process's `-c` config. A single shared
+  // app-server therefore registers BOTH the materialize and the resume
+  // conversation (name + name-2); the message addressed to `name` lands in the
+  // materialize twin's inbox while the daemon wakes the resume twin → split
+  // delivery. Isolating materialize on its own app-server with agent-peers
+  // disabled (AGENT_PEERS_ENABLED=0 → codex-server.ts early-returns: no broker
+  // connection, no inbox, zero tools) means that app-server registers nothing;
+  // it is killed right after materialize, and the resume app-server then hosts
+  // exactly ONE conversation → ONE identity under the canonical name. PEER_NAME
+  // is still passed for log/tab clarity even though a disabled MCP never
+  // registers under it. See
+  // `.specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md`.
+  const args = ["-c", `mcp_servers.agent-peers.env.AGENT_PEERS_ENABLED=${tomlString("0")}`];
+  if (peerName) {
+    args.push("-c", `mcp_servers.agent-peers.env.PEER_NAME=${tomlString(peerName)}`);
+  }
+  return args;
+}
+
 export function buildWakeableEnv(opts: {
   baseEnv: NodeJS.ProcessEnv;
   appServerUrl: string;
@@ -142,8 +169,6 @@ export function buildWakeableEnv(opts: {
 }
 
 export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promise<number> {
-  const port = opts.port ?? await allocatePort();
-  const appServerUrl = `ws://127.0.0.1:${port}`;
   const claimStore = new WakeLaunchClaimStore();
   const claim = await claimStore.create({
     cwd: opts.cwd,
@@ -152,87 +177,157 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
   });
   let claimReady = false;
 
-  const appServer = Bun.spawn([
+  try {
+    // ----------------------------------------------------------------------
+    // PHASE 1 — Materialize the thread on a throwaway app-server.
+    //
+    // `codex resume --remote <thread>` needs an on-disk rollout, which only
+    // exists after the thread takes its first turn. We run that setup turn on a
+    // SEPARATE, short-lived app-server whose agent-peers MCP is disabled, so the
+    // setup conversation registers NOTHING, and then kill it. The thread store
+    // is shared on disk, so the resume app-server in phase 2 re-opens this exact
+    // thread (verified: thread/resume + turn/start succeed on a fresh app-server
+    // after the creator died). This isolation is what guarantees a single
+    // identity — see buildMaterializeMcpConfigArgs.
+    const thread = await materializeThread(opts);
+
+    // ----------------------------------------------------------------------
+    // PHASE 2 — Resume on a fresh app-server that hosts ONLY the visible
+    // session. Its single agent-peers MCP registers under the canonical name
+    // and becomes the wake target (matched to this launch's claim by cwd+tty).
+    const port = opts.port ?? await allocatePort();
+    const appServerUrl = `ws://127.0.0.1:${port}`;
+    const appServer = Bun.spawn([
+      "codex",
+      ...buildMcpPeerNameConfigArgs(opts.peerName),
+      "app-server",
+      "--listen",
+      appServerUrl,
+    ], {
+      // Pin the app-server to the peer's repo. `bin/codex-peer`'s run_bun cd's
+      // into the agent-peers-mcp install dir before launching us, so without an
+      // explicit cwd the app-server inherits THAT dir instead of the repo. The
+      // TUI spawn below also sets cwd: opts.cwd; the app-server must match it.
+      cwd: opts.cwd,
+      stdout: "inherit",
+      stderr: "inherit",
+      env: process.env,
+    });
+
+    try {
+      await waitForReadyz(port);
+      // The claim is the wake-registration channel: the resume MCP finds it by
+      // cwd+tty and reads the app-server URL/pid + thread from it. Point it at
+      // the RESUME app-server (phase 2) — that is what the wake daemon connects
+      // to. (The resume command's own -c env is ignored in --remote mode, where
+      // the app-server, not the TUI, spawns the MCP; the claim is authoritative.)
+      await claimStore.update(claim.claim_id, {
+        app_server_url: appServerUrl,
+        app_server_pid: appServer.pid,
+        thread_id: thread.id,
+        rollout_path: thread.path,
+        status: "ready",
+      });
+      claimReady = true;
+
+      const codexArgs = buildCodexResumeArgs({
+        appServerUrl,
+        appServerPid: appServer.pid,
+        threadId: thread.id,
+        rolloutPath: thread.path,
+        peerName: opts.peerName,
+        noAltScreen: opts.noAltScreen,
+        extraCodexArgs: opts.extraCodexArgs,
+      });
+      const env = buildWakeableEnv({
+        baseEnv: process.env,
+        appServerUrl,
+        appServerPid: appServer.pid,
+        threadId: thread.id,
+        rolloutPath: thread.path,
+        peerName: opts.peerName,
+      });
+
+      console.error(`[agent-peers/wakeable] app-server=${appServerUrl} pid=${appServer.pid}`);
+      console.error(`[agent-peers/wakeable] thread=${thread.id}`);
+      const tui = Bun.spawn(["codex", ...codexArgs], {
+        cwd: opts.cwd,
+        stdin: "inherit",
+        stdout: "inherit",
+        stderr: "inherit",
+        env,
+      });
+      await claimStore.update(claim.claim_id, { tui_pid: tui.pid });
+      return await tui.exited;
+    } finally {
+      try { appServer.kill("SIGTERM"); } catch { /* best effort */ }
+      await appServer.exited.catch(() => {});
+    }
+  } finally {
+    if (!claimReady) {
+      await claimStore.update(claim.claim_id, { status: "failed" }).catch(() => {});
+    }
+  }
+}
+
+// Phase 1 of the launch: bring up a throwaway agent-peers-disabled app-server,
+// create + materialize the thread on it, ensure the rollout is flushed to disk,
+// then tear the app-server down. Returns the thread id + rollout path for the
+// resume app-server to re-open. Always kills the materialize app-server, even
+// on error.
+async function materializeThread(opts: WakeableLauncherOptions): Promise<{ id: string; path: string | null }> {
+  const matPort = await allocatePort();
+  const matUrl = `ws://127.0.0.1:${matPort}`;
+  const matServer = Bun.spawn([
     "codex",
-    ...buildMcpPeerNameConfigArgs(opts.peerName),
+    ...buildMaterializeMcpConfigArgs(opts.peerName),
     "app-server",
     "--listen",
-    appServerUrl,
+    matUrl,
   ], {
-    // Pin the app-server to the peer's repo. `bin/codex-peer`'s run_bun cd's into
-    // the agent-peers-mcp install dir before launching us, so without an explicit
-    // cwd the app-server inherits THAT dir instead of the repo. In `--remote`
-    // mode the in-TUI `/resume` picker is served by the app-server and scopes its
-    // session list by the app-server's cwd — so a wrong cwd makes `/resume` list
-    // every repo's sessions instead of only this repo's. The TUI spawn below
-    // already sets cwd: opts.cwd; the app-server must match it.
     cwd: opts.cwd,
     stdout: "inherit",
     stderr: "inherit",
     env: process.env,
   });
-  await claimStore.update(claim.claim_id, {
-    app_server_url: appServerUrl,
-    app_server_pid: appServer.pid,
-  });
-
   try {
-    await waitForReadyz(port);
-    const client = new CodexAppServerWsClient(appServerUrl);
-    let thread = await client.startThread({ cwd: opts.cwd });
-    if (opts.materialize) {
-      await retryEmptyRolloutRace(() => client.startWakeTurn({
-        threadId: thread.id,
-        clientUserMessageId: "agent-peers-wakeable-materialize",
-        prompt: "Wakeable Codex session initialized for agent-peers. Reply exactly: WAKEABLE_CODEX_READY. Do not use tools.",
-        wakeId: "wakeable-materialize",
-        pendingSignature: "materialize",
-      }));
-      thread = await retryEmptyRolloutRace(() => client.readThread(thread.id));
+    await waitForReadyz(matPort);
+    const client = new CodexAppServerWsClient(matUrl);
+    try {
+      let thread = await client.startThread({ cwd: opts.cwd });
+      if (opts.materialize) {
+        await retryEmptyRolloutRace(() => client.startWakeTurn({
+          threadId: thread.id,
+          clientUserMessageId: "agent-peers-wakeable-materialize",
+          prompt: "Wakeable Codex session initialized for agent-peers. Reply exactly: WAKEABLE_CODEX_READY. Do not use tools.",
+          wakeId: "wakeable-materialize",
+          pendingSignature: "materialize",
+        }));
+        thread = await retryEmptyRolloutRace(() => client.readThread(thread.id));
+        // The resume app-server can only re-open this thread once its rollout
+        // is actually on disk. readThread succeeding usually implies that, but
+        // wait for a non-empty file before we kill this app-server to close the
+        // cross-app-server flush race.
+        await waitForRolloutOnDisk(thread.path);
+      }
+      return { id: thread.id, path: thread.path };
+    } finally {
+      client.close();
     }
-    await claimStore.update(claim.claim_id, {
-      thread_id: thread.id,
-      rollout_path: thread.path,
-      status: "ready",
-    });
-    claimReady = true;
-    client.close();
-
-    const codexArgs = buildCodexResumeArgs({
-      appServerUrl,
-      appServerPid: appServer.pid,
-      threadId: thread.id,
-      rolloutPath: thread.path,
-      peerName: opts.peerName,
-      noAltScreen: opts.noAltScreen,
-      extraCodexArgs: opts.extraCodexArgs,
-    });
-    const env = buildWakeableEnv({
-      baseEnv: process.env,
-      appServerUrl,
-      appServerPid: appServer.pid,
-      threadId: thread.id,
-      rolloutPath: thread.path,
-      peerName: opts.peerName,
-    });
-
-    console.error(`[agent-peers/wakeable] app-server=${appServerUrl} pid=${appServer.pid}`);
-    console.error(`[agent-peers/wakeable] thread=${thread.id}`);
-    const tui = Bun.spawn(["codex", ...codexArgs], {
-      cwd: opts.cwd,
-      stdin: "inherit",
-      stdout: "inherit",
-      stderr: "inherit",
-      env,
-    });
-    await claimStore.update(claim.claim_id, { tui_pid: tui.pid });
-    return await tui.exited;
   } finally {
-    if (!claimReady) {
-      await claimStore.update(claim.claim_id, { status: "failed" }).catch(() => {});
-    }
-    try { appServer.kill("SIGTERM"); } catch { /* best effort */ }
-    await appServer.exited.catch(() => {});
+    try { matServer.kill("SIGTERM"); } catch { /* best effort */ }
+    await matServer.exited.catch(() => {});
+  }
+}
+
+async function waitForRolloutOnDisk(path: string | null, timeoutMs = 10_000): Promise<void> {
+  if (!path) return;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (existsSync(path) && statSync(path).size > 0) return;
+    } catch { /* keep polling */ }
+    await Bun.sleep(100);
   }
 }
 

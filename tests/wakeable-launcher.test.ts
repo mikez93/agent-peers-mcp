@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   buildCodexResumeArgs,
+  buildMaterializeMcpConfigArgs,
   buildMcpEnvConfigArgs,
   buildMcpPeerNameConfigArgs,
   buildWakeableEnv,
@@ -96,6 +97,34 @@ test("buildMcpPeerNameConfigArgs targets the app-server MCP child", () => {
     "mcp_servers.agent-peers.env.PEER_NAME=\"wakee2e\"",
   ]);
   expect(buildMcpPeerNameConfigArgs()).toEqual([]);
+});
+
+test("buildMaterializeMcpConfigArgs disables agent-peers on the throwaway materialize app-server", () => {
+  // Phase 1's app-server exists only to write the rollout; its agent-peers MCP
+  // must be a no-op (AGENT_PEERS_ENABLED=0) so it never registers a broker peer.
+  // PEER_NAME is still passed for log/tab clarity. The single-identity guarantee
+  // depends on the materialize side registering NOTHING.
+  expect(buildMaterializeMcpConfigArgs("wakee2e")).toEqual([
+    "-c",
+    "mcp_servers.agent-peers.env.AGENT_PEERS_ENABLED=\"0\"",
+    "-c",
+    "mcp_servers.agent-peers.env.PEER_NAME=\"wakee2e\"",
+  ]);
+  expect(buildMaterializeMcpConfigArgs()).toEqual([
+    "-c",
+    "mcp_servers.agent-peers.env.AGENT_PEERS_ENABLED=\"0\"",
+  ]);
+});
+
+test("two-app-server invariant: materialize side disabled, resume side default-enabled", () => {
+  // The crux of the fix: the materialize app-server must NOT register
+  // agent-peers (=0), while the resume app-server inherits the config.toml
+  // default (=1, so its sole conversation registers as the canonical identity).
+  const materialize = buildMaterializeMcpConfigArgs("wakee2e").join(" ");
+  const resume = buildMcpPeerNameConfigArgs("wakee2e").join(" ");
+  expect(materialize).toContain("AGENT_PEERS_ENABLED=\"0\"");
+  expect(resume).not.toContain("AGENT_PEERS_ENABLED");
+  expect(resume).toContain("PEER_NAME=\"wakee2e\"");
 });
 
 test("buildWakeableEnv injects only wake registry hints, not broker secrets", () => {
