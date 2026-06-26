@@ -52,8 +52,6 @@ test("buildCodexResumeArgs targets the managed remote thread", () => {
   })).toEqual([
     "resume",
     "-c",
-    "mcp_servers.agent-peers.env.AGENT_PEERS_ENABLED=\"1\"",
-    "-c",
     "mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_ENABLED=\"1\"",
     "-c",
     "mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_APP_SERVER_URL=\"ws://127.0.0.1:41037\"",
@@ -82,8 +80,6 @@ test("buildMcpEnvConfigArgs omits optional values when absent", () => {
     rolloutPath: null,
   })).toEqual([
     "-c",
-    "mcp_servers.agent-peers.env.AGENT_PEERS_ENABLED=\"1\"",
-    "-c",
     "mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_ENABLED=\"1\"",
     "-c",
     "mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_APP_SERVER_URL=\"ws://127.0.0.1:41037\"",
@@ -94,39 +90,12 @@ test("buildMcpEnvConfigArgs omits optional values when absent", () => {
   ]);
 });
 
-test("buildMcpPeerNameConfigArgs disables agent-peers on the app-server (materialize) MCP", () => {
-  // The app-server's materialize conversation must NOT register a second peer:
-  // AGENT_PEERS_ENABLED=0 makes that MCP a no-op. PEER_NAME is still passed for
-  // log/tab clarity. See .specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md §6.1.
+test("buildMcpPeerNameConfigArgs targets the app-server MCP child", () => {
   expect(buildMcpPeerNameConfigArgs("wakee2e")).toEqual([
-    "-c",
-    "mcp_servers.agent-peers.env.AGENT_PEERS_ENABLED=\"0\"",
     "-c",
     "mcp_servers.agent-peers.env.PEER_NAME=\"wakee2e\"",
   ]);
-  expect(buildMcpPeerNameConfigArgs()).toEqual([
-    "-c",
-    "mcp_servers.agent-peers.env.AGENT_PEERS_ENABLED=\"0\"",
-  ]);
-});
-
-test("single-identity invariant: app-server disables agent-peers, TUI enables it", () => {
-  // The crux of the delivery fix: exactly ONE conversation may register a broker
-  // peer. The app-server (materialize) path disables agent-peers; the TUI/resume
-  // path enables it. If both enabled, delivery splits across two peer-ids.
-  const appServer = buildMcpPeerNameConfigArgs("wakee2e").join(" ");
-  const tui = buildMcpEnvConfigArgs({
-    appServerUrl: "ws://127.0.0.1:41037",
-    appServerPid: 123,
-    threadId: "thread-1",
-    rolloutPath: "/rollout.jsonl",
-    peerName: "wakee2e",
-  }).join(" ");
-
-  expect(appServer).toContain("AGENT_PEERS_ENABLED=\"0\"");
-  expect(appServer).not.toContain("AGENT_PEERS_ENABLED=\"1\"");
-  expect(tui).toContain("AGENT_PEERS_ENABLED=\"1\"");
-  expect(tui).not.toContain("AGENT_PEERS_ENABLED=\"0\"");
+  expect(buildMcpPeerNameConfigArgs()).toEqual([]);
 });
 
 test("buildWakeableEnv injects only wake registry hints, not broker secrets", () => {

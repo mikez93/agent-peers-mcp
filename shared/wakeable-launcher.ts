@@ -102,13 +102,6 @@ export function buildMcpEnvConfigArgs(opts: {
   peerName?: string;
 }): string[] {
   const values: Record<string, string> = {
-    // Own the wakeable agent-peers identity HERE, in the TUI/resume conversation,
-    // and own it explicitly rather than inheriting config.toml's default — the
-    // app-server spawn now disables agent-peers (AGENT_PEERS_ENABLED=0, see
-    // buildMcpPeerNameConfigArgs), so this is the ONE conversation that registers
-    // a broker peer. Single identity ⇒ the lease recipient and the check_messages
-    // reader are the same peer-id (see .specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md §6.1).
-    AGENT_PEERS_ENABLED: "1",
     AGENT_PEERS_WAKE_ENABLED: "1",
     AGENT_PEERS_WAKE_APP_SERVER_URL: opts.appServerUrl,
     AGENT_PEERS_WAKE_APP_SERVER_PID: String(opts.appServerPid),
@@ -124,26 +117,9 @@ export function buildMcpEnvConfigArgs(opts: {
 }
 
 export function buildMcpPeerNameConfigArgs(peerName?: string): string[] {
-  // The app-server's own conversation is used ONLY for the materialize turn that
-  // writes the rollout to disk — it does not need agent-peers tools. Disabling
-  // the MCP here makes the materialize-side instance a no-op
-  // (codex-server.ts:614 early-returns when AGENT_PEERS_ENABLED !== "1": no
-  // broker connection, no inbox, no poll loop, zero tools), so it does NOT
-  // register a second broker peer. Without this, the app-server starts one MCP
-  // per conversation and BOTH (materialize + TUI) register — the message is
-  // leased into one identity's inbox while the woken turn's check_messages is
-  // served by the other, and delivery silently splits. The wakeable identity is
-  // owned by the TUI conversation (buildMcpEnvConfigArgs sets
-  // AGENT_PEERS_ENABLED=1). PEER_NAME is still passed for log/tab clarity even
-  // though a disabled MCP never registers under it.
-  const args = [
-    "-c",
-    `mcp_servers.agent-peers.env.AGENT_PEERS_ENABLED=${tomlString("0")}`,
-  ];
-  if (peerName) {
-    args.push("-c", `mcp_servers.agent-peers.env.PEER_NAME=${tomlString(peerName)}`);
-  }
-  return args;
+  return peerName
+    ? ["-c", `mcp_servers.agent-peers.env.PEER_NAME=${tomlString(peerName)}`]
+    : [];
 }
 
 export function buildWakeableEnv(opts: {
