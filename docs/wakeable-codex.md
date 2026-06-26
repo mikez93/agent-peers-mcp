@@ -122,6 +122,29 @@ Codex. The wake only causes a turn; it never *is* the message.
 - **Confirm-on-next-call delivery.** Messages stay in the durable inbox until the
   *next* tool call proves the prior response reached the model, so a dropped wake
   response re-delivers instead of silently losing mail.
+- **One agent-peers identity per session (delivery correctness).** The Codex
+  app-server starts one agent-peers MCP *per conversation*. A wakeable launch has
+  two conversations — the materialize turn (writes the rollout) and the TUI/resume
+  session — so without care **both** would register as separate broker peers (name +
+  `-2`), each with its own inbox and lease loop. A message addressed to one identity
+  would then be invisible to a `check_messages` served by the other → "no pending
+  messages" even though the message is on disk. The launcher prevents this by
+  **disabling agent-peers on the materialize (app-server) conversation**
+  (`AGENT_PEERS_ENABLED=0`, a no-op MCP) and **owning the wakeable identity solely in
+  the TUI/resume conversation** (`AGENT_PEERS_ENABLED=1`). Result: exactly one broker
+  peer per session, so the lease recipient and the `check_messages` reader are the
+  same id. Verify with `codexpeer live` — a healthy session shows exactly **one**
+  wakeable identity per repo (no `-2` ladder). See
+  `.specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md`.
+- **The TUI "working" spinner can lie — trust `thread=` in `codexpeer live`.** The
+  materialize handshake and every daemon wake are injected into the thread by an
+  *external* client (the launcher / wake daemon), not the TUI. The `--remote` TUI
+  renders a "working" animation for turns it didn't initiate and **does not clear it**
+  when such a turn finishes — so an idle, ready-to-wake session can *look* hung
+  ("working" forever; Esc does nothing). It isn't hung: the thread is `idle`.
+  `codexpeer live` now prints the **true** app-server thread status (`thread=idle` /
+  `thread=active` / `thread=notLoaded`); trust that over the spinner. (The spinner
+  itself is an upstream Codex `--remote` rendering behavior.)
 
 ## Operating it
 
