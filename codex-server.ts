@@ -496,6 +496,20 @@ async function withPiggyback(
     enqueueAck(m.lease_token);
   }
 
+  // Serving-identity delivery breadcrumb (delivery-fix spec §6.4). This is the
+  // ONE place a message is handed to the model, so logging the serving identity
+  // here makes the wakeable routing bet observable instead of silent: on a
+  // daemon-woken turn the operator can correlate the wake daemon's "nudged
+  // thread T for peer Y" against this process's "delivered N as peer X (pid P,
+  // wake_thread T)". A match on the happy path confirms single-identity routing
+  // (Branch A); an ABSENT line on a wake whose rollout shows a turn fired is the
+  // Branch-B tell — the turn was served by a context without these tools. Gated
+  // on fresh.length so quiet tool calls stay silent.
+  if (fresh.length > 0) {
+    const wakeThread = process.env.AGENT_PEERS_WAKE_THREAD_ID;
+    log(`delivered ${fresh.length} inbox message(s) as peer=${myName} id=${myId} pid=${process.pid}${wakeThread ? ` wake_thread=${wakeThread}` : ""}`);
+  }
+
   // ------------------------------------------------------------------------
   // STEP 4 — Run the tool handler + build the response.
   let toolText = "";
