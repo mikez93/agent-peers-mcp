@@ -159,6 +159,14 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
     "--listen",
     appServerUrl,
   ], {
+    // Pin the app-server to the peer's repo. `bin/codex-peer`'s run_bun cd's into
+    // the agent-peers-mcp install dir before launching us, so without an explicit
+    // cwd the app-server inherits THAT dir instead of the repo. In `--remote`
+    // mode the in-TUI `/resume` picker is served by the app-server and scopes its
+    // session list by the app-server's cwd — so a wrong cwd makes `/resume` list
+    // every repo's sessions instead of only this repo's. The TUI spawn below
+    // already sets cwd: opts.cwd; the app-server must match it.
+    cwd: opts.cwd,
     stdout: "inherit",
     stderr: "inherit",
     env: process.env,
