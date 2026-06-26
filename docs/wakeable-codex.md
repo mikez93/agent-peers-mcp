@@ -136,15 +136,19 @@ Codex. The wake only causes a turn; it never *is* the message.
   same id. Verify with `codexpeer live` — a healthy session shows exactly **one**
   wakeable identity per repo (no `-2` ladder). See
   `.specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md`.
-- **The TUI "working" spinner can lie — trust `thread=` in `codexpeer live`.** The
-  materialize handshake and every daemon wake are injected into the thread by an
+- **The TUI "working" spinner can lie — trust `thread_status=` in `codexpeer live`.**
+  The materialize handshake and every daemon wake are injected into the thread by an
   *external* client (the launcher / wake daemon), not the TUI. The `--remote` TUI
   renders a "working" animation for turns it didn't initiate and **does not clear it**
   when such a turn finishes — so an idle, ready-to-wake session can *look* hung
   ("working" forever; Esc does nothing). It isn't hung: the thread is `idle`.
-  `codexpeer live` now prints the **true** app-server thread status (`thread=idle` /
-  `thread=active` / `thread=notLoaded`); trust that over the spinner. (The spinner
-  itself is an upstream Codex `--remote` rendering behavior.)
+  `codexpeer live` now prints the **true** app-server thread status as a
+  distinctly-named field (`thread_status=idle` / `thread_status=active` /
+  `thread_status=active:waitingOnApproval` / `thread_status=notLoaded` /
+  `thread_status=systemError`); trust that over the spinner. It is named separately
+  from the detail line's `thread=<thread_id>` so the two never collide. A wedged or
+  half-dead app-server makes the probe fail fast and the field is simply omitted.
+  (The spinner itself is an upstream Codex `--remote` rendering behavior.)
 
 ## Operating it
 

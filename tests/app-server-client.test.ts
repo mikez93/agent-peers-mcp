@@ -1,8 +1,30 @@
 import { afterEach, expect, test } from "bun:test";
 
-import { CodexAppServerWsClient } from "../shared/app-server-client.ts";
+import { CodexAppServerWsClient, formatThreadStatus } from "../shared/app-server-client.ts";
 
 const stoppers: Array<() => void> = [];
+
+test("formatThreadStatus renders each status as a stable operator token", () => {
+  // The one bit of logic in `codexpeer live`'s true-status probe: active threads
+  // must surface their flags so a parked waitingOnApproval/Input is visually
+  // distinct from a genuinely-working `active`, and every other variant maps to
+  // its bare type. Covered here so the probe's network wrapper stays dumb.
+  expect(formatThreadStatus({ type: "idle" })).toBe("idle");
+  expect(formatThreadStatus({ type: "notLoaded" })).toBe("notLoaded");
+  expect(formatThreadStatus({ type: "systemError" })).toBe("systemError");
+  expect(formatThreadStatus({ type: "active", activeFlags: [] })).toBe("active");
+  expect(formatThreadStatus({ type: "active", activeFlags: ["waitingOnApproval"] }))
+    .toBe("active:waitingOnApproval");
+  expect(formatThreadStatus({ type: "active", activeFlags: ["waitingOnApproval", "waitingOnUserInput"] }))
+    .toBe("active:waitingOnApproval,waitingOnUserInput");
+});
+
+test("formatThreadStatus tolerates a missing activeFlags array", () => {
+  // Defensive: the app-server contract types activeFlags as required, but a
+  // malformed/older payload should degrade to bare `active`, not throw inside an
+  // operator status command.
+  expect(formatThreadStatus({ type: "active" } as never)).toBe("active");
+});
 
 afterEach(() => {
   for (const stop of stoppers.splice(0)) {

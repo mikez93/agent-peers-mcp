@@ -6,14 +6,18 @@ import { createClient } from "./shared/broker-client.ts";
 import { readSharedSecret } from "./shared/shared-secret.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore } from "./shared/wake-launch-claims.ts";
-import { CodexAppServerWsClient } from "./shared/app-server-client.ts";
+import { CodexAppServerWsClient, formatThreadStatus } from "./shared/app-server-client.ts";
 import type { Peer } from "./shared/types.ts";
 
 // True app-server thread status for a wakeable peer — the GROUND TRUTH the
 // operator can trust over the TUI's "working" spinner, which lingers after
 // externally-injected (materialize / daemon-wake) turns even though the thread
-// has returned to idle (see the delivery-fix spec §6.3). Best-effort + bounded:
-// a wedged or half-dead app-server fails fast and we just omit the field.
+// has returned to idle (see the delivery-fix spec §6.3). Best-effort and
+// bounded: each RPC (connect + one readThread) caps at 3s, so a wedged or
+// half-dead app-server costs at most ~6s before we give up and omit the field.
+// `wake-status` probes every peer concurrently (Promise.all), so the added
+// network I/O bounds the whole command at ~6s regardless of peer count rather
+// than summing per peer.
 async function probeTrueThreadStatus(
   appServerUrl: string | null | undefined,
   threadId: string | null | undefined,
@@ -23,11 +27,7 @@ async function probeTrueThreadStatus(
   try {
     appClient = new CodexAppServerWsClient(appServerUrl, { timeoutMs: 3000 });
     const thread = await appClient.readThread(threadId);
-    if (thread.status.type === "active") {
-      const flags = thread.status.activeFlags ?? [];
-      return flags.length ? `active:${flags.join(",")}` : "active";
-    }
-    return thread.status.type;
+    return formatThreadStatus(thread.status);
   } catch {
     return null;
   } finally {
@@ -379,10 +379,11 @@ async function cmdWakeStatus() {
 
 function printWakePeer(peer: Peer, entry: Awaited<ReturnType<WakeRegistry["list"]>>[number] | undefined, pending: number, trueStatus?: string): void {
   const wakeable = entry ? (entry.status === "ready" ? "yes" : `no (${entry.status})`) : "no";
-  // `thread` = true app-server status (idle/active/...) — trust this over the
-  // TUI spinner. A long-lived `active` with the peer idle at the prompt is the
-  // spinner desync, not a real hang.
-  const threadStatus = trueStatus ? `  thread=${trueStatus}` : "";
+  // `thread_status` = true app-server status (idle/active/...) — trust this over
+  // the TUI spinner. A long-lived `active` with the peer idle at the prompt is
+  // the spinner desync, not a real hang. Named distinctly from the detail line's
+  // `thread=<thread_id>` below so the two never read as the same field.
+  const threadStatus = trueStatus ? `  thread_status=${trueStatus}` : "";
   console.log(`  ${peer.name}  wakeable=${wakeable}  unread=${pending}${threadStatus}  id=${peer.id}`);
   console.log(`    cwd=${peer.cwd}${peer.tty ? `  tty=${peer.tty}` : ""}`);
   if (entry) {

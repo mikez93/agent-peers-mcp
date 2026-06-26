@@ -14,6 +14,19 @@ export interface AppServerThread {
   status: ThreadStatus;
 }
 
+// Render a ThreadStatus as a single stable token for operator output
+// (`codexpeer live`). `active` carries its flags so a parked
+// waitingOnApproval/waitingOnUserInput thread is distinguishable from a
+// genuinely-working one — `active:waitingOnApproval` vs bare `active`. Pure +
+// total over the union so it is unit-testable without a live app-server.
+export function formatThreadStatus(status: ThreadStatus): string {
+  if (status.type === "active") {
+    const flags = status.activeFlags ?? [];
+    return flags.length ? `active:${flags.join(",")}` : "active";
+  }
+  return status.type;
+}
+
 export interface AppServerClient {
   listLoadedThreads(): Promise<string[]>;
   readThread(threadId: string): Promise<AppServerThread>;
