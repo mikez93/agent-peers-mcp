@@ -6,7 +6,34 @@ import { createClient } from "./shared/broker-client.ts";
 import { readSharedSecret } from "./shared/shared-secret.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore } from "./shared/wake-launch-claims.ts";
+import { CodexAppServerWsClient } from "./shared/app-server-client.ts";
 import type { Peer } from "./shared/types.ts";
+
+// True app-server thread status for a wakeable peer — the GROUND TRUTH the
+// operator can trust over the TUI's "working" spinner, which lingers after
+// externally-injected (materialize / daemon-wake) turns even though the thread
+// has returned to idle (see the delivery-fix spec §6.3). Best-effort + bounded:
+// a wedged or half-dead app-server fails fast and we just omit the field.
+async function probeTrueThreadStatus(
+  appServerUrl: string | null | undefined,
+  threadId: string | null | undefined,
+): Promise<string | null> {
+  if (!appServerUrl || !threadId) return null;
+  let appClient: CodexAppServerWsClient | null = null;
+  try {
+    appClient = new CodexAppServerWsClient(appServerUrl, { timeoutMs: 3000 });
+    const thread = await appClient.readThread(threadId);
+    if (thread.status.type === "active") {
+      const flags = thread.status.activeFlags ?? [];
+      return flags.length ? `active:${flags.join(",")}` : "active";
+    }
+    return thread.status.type;
+  } catch {
+    return null;
+  } finally {
+    try { appClient?.close(); } catch { /* best effort */ }
+  }
+}
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -300,11 +327,22 @@ async function cmdWakeStatus() {
     !wakeableRows.includes(row) && !needsRepairRows.includes(row)
   );
 
+  // Probe true app-server thread status for the wakeable rows (concurrent,
+  // bounded). This is the ground truth the operator can trust over the TUI's
+  // stuck "working" spinner.
+  const trueStatusByPeerId = new Map<string, string>();
+  await Promise.all(wakeableRows.map(async (row) => {
+    const status = await probeTrueThreadStatus(row.entry?.app_server_url, row.entry?.thread_id);
+    if (status) trueStatusByPeerId.set(row.peer.id, status);
+  }));
+
   console.log("wakeable Codex sessions:");
   if (wakeableRows.length === 0) {
     console.log("  (none)");
   } else {
-    for (const row of wakeableRows) printWakePeer(row.peer, row.entry, row.pending);
+    for (const row of wakeableRows) {
+      printWakePeer(row.peer, row.entry, row.pending, trueStatusByPeerId.get(row.peer.id));
+    }
   }
 
   if (needsRepairRows.length > 0) {
@@ -339,9 +377,13 @@ async function cmdWakeStatus() {
   }
 }
 
-function printWakePeer(peer: Peer, entry: Awaited<ReturnType<WakeRegistry["list"]>>[number] | undefined, pending: number): void {
+function printWakePeer(peer: Peer, entry: Awaited<ReturnType<WakeRegistry["list"]>>[number] | undefined, pending: number, trueStatus?: string): void {
   const wakeable = entry ? (entry.status === "ready" ? "yes" : `no (${entry.status})`) : "no";
-  console.log(`  ${peer.name}  wakeable=${wakeable}  unread=${pending}  id=${peer.id}`);
+  // `thread` = true app-server status (idle/active/...) — trust this over the
+  // TUI spinner. A long-lived `active` with the peer idle at the prompt is the
+  // spinner desync, not a real hang.
+  const threadStatus = trueStatus ? `  thread=${trueStatus}` : "";
+  console.log(`  ${peer.name}  wakeable=${wakeable}  unread=${pending}${threadStatus}  id=${peer.id}`);
   console.log(`    cwd=${peer.cwd}${peer.tty ? `  tty=${peer.tty}` : ""}`);
   if (entry) {
     console.log(`    thread=${entry.thread_id}  app_server_pid=${entry.app_server_pid}  mcp_pid=${entry.mcp_pid}${entry.tui_pid ? `  tui_pid=${entry.tui_pid}` : ""}`);
