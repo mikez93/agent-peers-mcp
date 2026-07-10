@@ -53,6 +53,10 @@ Usage:
   codex-peer start <peer-name> <repo-path> [-- extra codex args]
       Start any repo as a wakeable Codex peer with a stable peer name.
 
+  codex-peer resume <session-id> [-- extra codex args]
+      Resume an existing Codex session as a wakeable peer. The saved rollout
+      supplies the repo path, so this works from any directory.
+
   codex-peer daemon [seconds]
       Run the wake loop in the FOREGROUND. Keep this open in one Zed terminal.
       Default interval: 5 seconds. You normally do NOT need this — any launch
@@ -199,6 +203,29 @@ start_here() {
   peer_name="$(auto_peer_name "$repo_path")"
   printf 'codex-peer: starting wakeable Codex in %s\n' "$repo_path" >&2
   start_peer "$peer_name" "$repo_path" "$@"
+}
+
+session_cwd() {
+  local session_id="$1"
+  local codex_home="${CODEX_HOME:-${HOME}/.codex}"
+  local rollout cwd
+  rollout="$(find "$codex_home/sessions" -type f -name "*-${session_id}.jsonl" -print -quit 2>/dev/null || true)"
+  [ -n "$rollout" ] || die "session rollout not found: $session_id"
+  need_cmd jq
+  cwd="$(jq -r 'select(.type == "session_meta") | .payload.cwd // empty' "$rollout" 2>/dev/null | head -n1)"
+  [ -n "$cwd" ] || die "session rollout has no cwd: $rollout"
+  printf '%s\n' "$cwd"
+}
+
+resume_peer() {
+  local session_id="$1"
+  shift
+  local repo_path peer_name
+  repo_path="$(session_cwd "$session_id")"
+  ensure_repo "$repo_path"
+  peer_name="$(auto_peer_name "$repo_path")"
+  printf 'codex-peer: resuming %s as a wakeable peer in %s\n' "$session_id" "$repo_path" >&2
+  start_peer "$peer_name" "$repo_path" --thread-id "$session_id" "$@"
 }
 
 # Print the PID of a live wake daemon (and succeed) or return non-zero.
@@ -349,6 +376,12 @@ case "$cmd" in
     repo_path="$2"
     shift 2
     start_peer "$peer_name" "$repo_path" "$@"
+    ;;
+  resume)
+    [ "$#" -ge 1 ] || die "usage: codex-peer resume <session-id> [-- extra codex args]"
+    session_id="$1"
+    shift
+    resume_peer "$session_id" "$@"
     ;;
   daemon)
     run_daemon "${1:-5}"

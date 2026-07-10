@@ -874,6 +874,12 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
   };
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+  // Auto-spawned brokers inherit the spawning session's controlling TTY
+  // (Bun.spawn has no detached/setsid). Closing that terminal tab delivers
+  // SIGHUP, whose default action killed the broker for the whole machine
+  // (observed 2026-07-06). The broker has no terminal to hang up from —
+  // ignore it and stay up for the sessions that outlive the spawner.
+  process.on("SIGHUP", () => {});
 
   console.error(`[broker] listening on http://127.0.0.1:${port}, db=${dbPath}, pid=${process.pid}`);
   return { server, db, gcTimer };

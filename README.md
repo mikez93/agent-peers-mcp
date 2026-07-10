@@ -269,6 +269,9 @@ codex-peer
 
 # ...or any repo, with an explicit stable name
 codex-peer start my-service ~/code/my-service
+
+# resume an existing session and keep it wakeable on the peer network
+codex-peer resume <session-id>
 ```
 
 Every launch **auto-starts a single background wake daemon** (idempotent, pidfile-tracked, detached) — you never have to remember to run a watcher, and it comes back on its own on your next launch after a reboot.
@@ -293,6 +296,7 @@ It is the **same live instance** — same thread, same rollout, same visible TUI
 |---|---|
 | `codex-peer` | Start a wakeable peer in the cwd (auto-name) |
 | `codex-peer start <name> <path>` | Start a wakeable peer with a stable name |
+| `codex-peer resume <session-id>` | Resume an existing session as a wakeable peer |
 | `codex-peer live` | Show wakeable sessions + unread counts |
 | `codex-peer daemon-status` / `daemon-stop` | Inspect / stop the background daemon |
 | `codex-peer repair-wake <name>` | Re-attach a live peer whose wake pointer was lost |

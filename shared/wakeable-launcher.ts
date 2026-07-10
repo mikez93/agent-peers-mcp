@@ -4,7 +4,7 @@
 import { createServer } from "node:net";
 import { existsSync, statSync } from "node:fs";
 
-import { CodexAppServerWsClient } from "./app-server-client.ts";
+import { CodexAppServerWsClient, type AppServerThread } from "./app-server-client.ts";
 import { WakeLaunchClaimStore } from "./wake-launch-claims.ts";
 import { getTty } from "./peer-context.ts";
 
@@ -12,6 +12,7 @@ export interface WakeableLauncherOptions {
   cwd: string;
   port?: number;
   peerName?: string;
+  threadId?: string;
   noAltScreen: boolean;
   materialize: boolean;
   extraCodexArgs: string[];
@@ -49,6 +50,10 @@ export function parseWakeableLauncherArgs(argv: string[]): WakeableLauncherOptio
     }
     if (arg === "--name") {
       opts.peerName = requireValue(argv, ++i, arg);
+      continue;
+    }
+    if (arg === "--thread-id") {
+      opts.threadId = requireValue(argv, ++i, arg);
       continue;
     }
     if (arg === "--alt-screen") {
@@ -169,9 +174,17 @@ export function buildWakeableEnv(opts: {
 }
 
 export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promise<number> {
+  // A fresh launch creates + materializes a new thread. A resume launch first
+  // reads the existing on-disk thread through a short-lived peer-disabled
+  // app-server, so it adds no setup turn and cannot register a duplicate peer.
+  const thread = opts.threadId
+    ? await inspectExistingThread(opts, opts.threadId)
+    : await materializeThread(opts);
+  const launchCwd = thread.cwd || opts.cwd;
+
   const claimStore = new WakeLaunchClaimStore();
   const claim = await claimStore.create({
-    cwd: opts.cwd,
+    cwd: launchCwd,
     tty: getTty(),
     requestedPeerName: opts.peerName,
   });
@@ -179,18 +192,15 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
 
   try {
     // ----------------------------------------------------------------------
-    // PHASE 1 — Materialize the thread on a throwaway app-server.
+    // PHASE 1 — Resolve the thread on a throwaway app-server.
     //
-    // `codex resume --remote <thread>` needs an on-disk rollout, which only
-    // exists after the thread takes its first turn. We run that setup turn on a
-    // SEPARATE, short-lived app-server whose agent-peers MCP is disabled, so the
-    // setup conversation registers NOTHING, and then kill it. The thread store
-    // is shared on disk, so the resume app-server in phase 2 re-opens this exact
-    // thread (verified: thread/resume + turn/start succeed on a fresh app-server
-    // after the creator died). This isolation is what guarantees a single
-    // identity — see buildMaterializeMcpConfigArgs.
-    const thread = await materializeThread(opts);
-
+    // Fresh launches create + materialize here because `codex resume --remote`
+    // requires an on-disk rollout. Existing-session launches only read and
+    // validate the saved thread. Both operations use a SEPARATE, short-lived
+    // app-server whose agent-peers MCP is disabled, so phase 1 registers
+    // NOTHING. Phase 2 then re-opens the exact thread on the visible app-server.
+    // This isolation guarantees a single identity; see
+    // buildMaterializeMcpConfigArgs.
     // ----------------------------------------------------------------------
     // PHASE 2 — Resume on a fresh app-server that hosts ONLY the visible
     // session. Its single agent-peers MCP registers under the canonical name
@@ -207,8 +217,8 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
       // Pin the app-server to the peer's repo. `bin/codex-peer`'s run_bun cd's
       // into the agent-peers-mcp install dir before launching us, so without an
       // explicit cwd the app-server inherits THAT dir instead of the repo. The
-      // TUI spawn below also sets cwd: opts.cwd; the app-server must match it.
-      cwd: opts.cwd,
+      // TUI spawn below also sets cwd: launchCwd; the app-server must match it.
+      cwd: launchCwd,
       stdout: "inherit",
       stderr: "inherit",
       env: process.env,
@@ -251,7 +261,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
       console.error(`[agent-peers/wakeable] app-server=${appServerUrl} pid=${appServer.pid}`);
       console.error(`[agent-peers/wakeable] thread=${thread.id}`);
       const tui = Bun.spawn(["codex", ...codexArgs], {
-        cwd: opts.cwd,
+        cwd: launchCwd,
         stdin: "inherit",
         stdout: "inherit",
         stderr: "inherit",
@@ -275,7 +285,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
 // then tear the app-server down. Returns the thread id + rollout path for the
 // resume app-server to re-open. Always kills the materialize app-server, even
 // on error.
-async function materializeThread(opts: WakeableLauncherOptions): Promise<{ id: string; path: string | null }> {
+async function materializeThread(opts: WakeableLauncherOptions): Promise<AppServerThread> {
   const matPort = await allocatePort();
   const matUrl = `ws://127.0.0.1:${matPort}`;
   const matServer = Bun.spawn([
@@ -310,13 +320,50 @@ async function materializeThread(opts: WakeableLauncherOptions): Promise<{ id: s
         // cross-app-server flush race.
         await waitForRolloutOnDisk(thread.path);
       }
-      return { id: thread.id, path: thread.path };
+      return thread;
     } finally {
       client.close();
     }
   } finally {
     try { matServer.kill("SIGTERM"); } catch { /* best effort */ }
     await matServer.exited.catch(() => {});
+  }
+}
+
+// Read and validate an existing rollout without adding a turn. This mirrors
+// the isolated materialize phase: agent-peers is disabled on the temporary
+// app-server, so only the final visible resume app-server registers a peer.
+async function inspectExistingThread(
+  opts: WakeableLauncherOptions,
+  threadId: string,
+): Promise<AppServerThread> {
+  const inspectPort = await allocatePort();
+  const inspectUrl = `ws://127.0.0.1:${inspectPort}`;
+  const inspectServer = Bun.spawn([
+    "codex",
+    ...buildMaterializeMcpConfigArgs(opts.peerName),
+    "app-server",
+    "--listen",
+    inspectUrl,
+  ], {
+    cwd: opts.cwd,
+    stdout: "inherit",
+    stderr: "inherit",
+    env: process.env,
+  });
+  try {
+    await waitForReadyz(inspectPort);
+    const client = new CodexAppServerWsClient(inspectUrl);
+    try {
+      const thread = await client.readThread(threadId);
+      await waitForRolloutOnDisk(thread.path);
+      return thread;
+    } finally {
+      client.close();
+    }
+  } finally {
+    try { inspectServer.kill("SIGTERM"); } catch { /* best effort */ }
+    await inspectServer.exited.catch(() => {});
   }
 }
 

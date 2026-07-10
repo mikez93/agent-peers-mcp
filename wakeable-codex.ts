@@ -10,6 +10,6 @@ try {
   process.exit(code);
 } catch (error) {
   console.error(`wakeable-codex failed: ${error instanceof Error ? error.message : String(error)}`);
-  console.error("usage: bun wakeable-codex.ts [--cwd DIR] [--port PORT] [--name PEER_NAME] [--alt-screen] [--materialize] [--no-materialize] [-- <codex-resume-extra-args>]");
+  console.error("usage: bun wakeable-codex.ts [--cwd DIR] [--port PORT] [--name PEER_NAME] [--thread-id SESSION_ID] [--alt-screen] [--materialize] [--no-materialize] [-- <codex-resume-extra-args>]");
   process.exit(2);
 }

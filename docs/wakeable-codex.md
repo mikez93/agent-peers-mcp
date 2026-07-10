@@ -185,6 +185,9 @@ codex-peer
 # launch any repo with a stable name
 codex-peer start my-service ~/code/my-service
 
+# resume an existing session as a wakeable peer (saved cwd is automatic)
+codex-peer resume <session-id>
+
 # inspect / manage
 codex-peer live              # wakeable sessions + unread counts
 codex-peer daemon-status     # is the background daemon running?

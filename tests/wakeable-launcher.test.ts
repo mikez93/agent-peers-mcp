@@ -15,6 +15,7 @@ test("parseWakeableLauncherArgs parses launcher flags and passthrough args", () 
     "--cwd", "/repo",
     "--port", "41037",
     "--name", "brisk-bison",
+    "--thread-id", "thread-existing",
     "--alt-screen",
     "--materialize",
     "--",
@@ -24,6 +25,7 @@ test("parseWakeableLauncherArgs parses launcher flags and passthrough args", () 
   expect(opts.cwd).toBe("/repo");
   expect(opts.port).toBe(41037);
   expect(opts.peerName).toBe("brisk-bison");
+  expect(opts.threadId).toBe("thread-existing");
   expect(opts.noAltScreen).toBe(false);
   expect(opts.materialize).toBe(true);
   expect(opts.extraCodexArgs).toEqual(["--model", "gpt-5"]);
