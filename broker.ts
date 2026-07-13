@@ -340,9 +340,18 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
 // the check and the mutation, letting an old session mutate the reclaimed
 // peer's row. Binding the token in WHERE closes that race.
 
-export function heartbeatPeer(db: Database, id: string, session_token: string): void {
-  db.query("UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?")
+// Returns whether the broker still KNOWS this peer (bd-e57.10).
+//
+// An UPDATE matching zero rows is not an error in SQL, so this used to return
+// void and the caller was told {ok: true} whether or not the peer still existed.
+// If the broker is ever down longer than STALE_THRESHOLD_MS, gcStalePeers
+// deletes every peer, and each surviving client would then heartbeat into a
+// deleted row — succeeding, silently, forever, while invisible to the network.
+// The row count is the only evidence that the heartbeat landed. Report it.
+export function heartbeatPeer(db: Database, id: string, session_token: string): boolean {
+  const info = db.query("UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?")
     .run(nowIso(), id, session_token);
+  return (info.changes ?? 0) > 0;
 }
 
 export function unregisterPeer(db: Database, id: string, session_token: string): void {
@@ -1042,7 +1051,7 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
 
         switch (url.pathname) {
           case "/register":      return json(registerPeer(db, await readJson(req)));
-          case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); heartbeatPeer(db, b.id, b.session_token); return json({ ok: true }); }
+          case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); return json({ ok: true, known: heartbeatPeer(db, b.id, b.session_token) }); }
           case "/unregister":    { const b = await readJson<{ id: string; session_token: string }>(req); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
           case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
           case "/list-peers":    return json(listPeers(db, await readJson(req)));

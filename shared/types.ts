@@ -51,6 +51,12 @@ export interface RegisterResponse {
 
 export interface HeartbeatRequest { id: PeerId; session_token: string; }
 
+// `known` is whether the broker still has a row for this peer (bd-e57.10).
+// It is OPTIONAL on purpose: a broker predating this field omits it entirely,
+// and a missing `known` must be read as "this broker cannot tell me" — never as
+// "you have been evicted". Only an explicit `false` may trigger re-registration.
+export interface HeartbeatResponse { ok: boolean; known?: boolean; }
+
 export interface UnregisterRequest { id: PeerId; session_token: string; }
 
 export interface SetSummaryRequest { id: PeerId; session_token: string; summary: string; }

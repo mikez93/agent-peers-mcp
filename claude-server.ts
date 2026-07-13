@@ -38,7 +38,7 @@ import type { PeerId } from "./shared/types.ts";
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
-const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_INTERVAL_MS = parseInt(process.env.AGENT_PEERS_HEARTBEAT_MS ?? "15000", 10);
 
 function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the protocol).
@@ -458,10 +458,49 @@ async function main() {
   };
   scheduleNextPush();
 
+  // bd-e57.10 — heartbeat, and act on being told we are no longer known.
+  //
+  // If the broker is down longer than its stale threshold (60s), its GC deletes
+  // every peer row. We survive that; our row does not. Before this, the reply
+  // was an unconditional {ok: true} and we would go on heartbeating into a
+  // deleted row forever — invisible to `list_peers`, unable to receive a single
+  // message, and never once told. Now the broker reports whether the write
+  // landed, and a `false` means: rejoin under our own name.
+  //
+  // `known === undefined` is NOT eviction. It means the broker predates the
+  // field and cannot answer. Never re-register on silence — only on a "no".
+  let rejoining = false;
   const hb = setInterval(async () => {
-    if (myId && mySession) {
-      try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
-    }
+    if (!myId || !mySession || rejoining) return;
+    try {
+      const res = await client.heartbeat({ id: myId, session_token: mySession });
+      if (res?.known !== false) return;
+
+      rejoining = true;
+      try {
+        log(`Broker no longer knows us (id=${myId}) — evicted, most likely a broker outage >60s. Re-registering as ${myName}.`);
+        const again = await client.register({
+          peer_type: "claude",
+          name: myName ?? process.env.PEER_NAME,
+          pid: process.pid,
+          cwd: myCwd,
+          git_root: myGitRoot,
+          tty,
+          summary: initialSummary,
+        });
+        myId = again.id;
+        myName = again.name;
+        mySession = again.session_token;
+        setTabTitle(`peer:${myName}`);
+        log(`Rejoined the network as ${myName} (id=${myId})`);
+      } catch (e) {
+        // Broker still down, or refusing. Stay evicted and try again next tick —
+        // do NOT swallow this the way the old heartbeat did.
+        log(`Re-registration failed, still off the network: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        rejoining = false;
+      }
+    } catch { /* broker unreachable; the next tick retries */ }
   }, HEARTBEAT_INTERVAL_MS);
 
   // Wire the deferred lifecycle cleanup into the earlyKillHandler registered

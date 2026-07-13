@@ -5,14 +5,14 @@ import type {
   RegisterRequest, RegisterResponse, SetSummaryRequest, ListPeersRequest,
   SendMessageRequest, SendMessageResponse, AckMessagesRequest, AckMessagesResponse,
   RenamePeerRequest, RenamePeerResponse,
-  HeartbeatRequest, UnregisterRequest, PollMessagesRequest,
+  HeartbeatRequest, HeartbeatResponse, UnregisterRequest, PollMessagesRequest,
   LeasedMessage, Peer,
 } from "./types.ts";
 
 export interface BrokerClient {
   isAlive(): Promise<boolean>;
   register(req: RegisterRequest): Promise<RegisterResponse>;
-  heartbeat(req: HeartbeatRequest): Promise<void>;
+  heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
   unregister(req: UnregisterRequest): Promise<void>;
   setSummary(req: SetSummaryRequest): Promise<void>;
   listPeers(req: ListPeersRequest): Promise<Peer[]>;
@@ -49,7 +49,7 @@ export function createClient(baseUrl: string, sharedSecret: string): BrokerClien
       } catch { return false; }
     },
     register(req) { return post<RegisterResponse>("/register", req); },
-    async heartbeat(req) { await post("/heartbeat", req); },
+    heartbeat(req) { return post<HeartbeatResponse>("/heartbeat", req); },
     async unregister(req) { await post("/unregister", req); },
     async setSummary(req) { await post("/set-summary", req); },
     listPeers(req) { return post<Peer[]>("/list-peers", req); },
