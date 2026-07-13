@@ -598,6 +598,191 @@ export function gcStalePeers(db: Database): number {
   return info.changes ?? 0;
 }
 
+// ----- Protection check (consumed by MacGuardian's process reaper) -----
+//
+// Contract with mac-os-system-expert/guardians: this endpoint is a POSITIVE
+// signal ONLY. Its answer may SPARE a process; it may never condemn one.
+// A pid's absence here is not evidence of death — the reaper falls back to its
+// own (weaker) tests. If the broker is unreachable the reaper reaps nothing in
+// the classes that depend on us. Rationale: an LLM agent waiting on a model
+// response sits at ~0% CPU, so no CPU/idleness heuristic can distinguish live
+// work from a corpse. Only an authoritative registry can.
+//
+// PROTECTION_GENERATION lets the reaper detect a broker restart between its
+// classify-time query and its pre-signal re-query, and bail rather than act on
+// a lease issued by a previous instance.
+export const PROTECTION_GENERATION = randomUUID();
+export const PROTECTION_SCHEMA = 1;
+export const PROTECTION_LEASE_MS = 15_000;
+const PROTECTION_MAX_ENTRIES = 512;
+
+export interface ProtectionQueryEntry {
+  pid: number;
+  start_time?: string | null;
+}
+
+/** `ps` start-time string for a pid, or null if it is gone. Both sides derive
+ *  identity the same way (`ps -o lstart= -p <pid>`), so the strings compare. */
+function processStartTime(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const p = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
+    if (p.exitCode !== 0) return null;
+    const s = new TextDecoder().decode(p.stdout).trim();
+    return s.length > 0 ? s : null;
+  } catch { return null; }
+}
+
+interface ProcTable {
+  parentOf: Map<number, number>;
+  commandOf: Map<number, string>;
+  childrenOf: Map<number, number[]>;
+}
+
+/** One snapshot of the live process table. An empty table means inspection
+ *  failed, which must mean "we vouch for nothing" — never "everything is dead". */
+function readProcTable(): ProcTable {
+  const parentOf = new Map<number, number>();
+  const commandOf = new Map<number, string>();
+  const childrenOf = new Map<number, number[]>();
+  try {
+    const p = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="]);
+    if (p.exitCode !== 0) return { parentOf, commandOf, childrenOf };
+    for (const line of new TextDecoder().decode(p.stdout).split("\n")) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m?.[1] || !m[2] || !m[3]) continue;
+      const pid = parseInt(m[1], 10);
+      const ppid = parseInt(m[2], 10);
+      parentOf.set(pid, ppid);
+      commandOf.set(pid, m[3]);
+      const kids = childrenOf.get(ppid);
+      if (kids) kids.push(pid); else childrenOf.set(ppid, [pid]);
+    }
+  } catch { /* fall through with empty maps */ }
+  return { parentOf, commandOf, childrenOf };
+}
+
+/** A GUI application process (ChatGPT.app, Zed.app, cmux.app, …). */
+function isGuiApp(command: string | undefined): boolean {
+  return command !== undefined && /\.app\/Contents\/MacOS\//.test(command);
+}
+
+/** Live agent-peers MCP servers. Each one's PARENT is its agent host — either a
+ *  GUI app (ChatGPT/Zed/cmux) or, for headless sessions, a bare claude/codex
+ *  process whose own parent is launchd or sshd. */
+function findAgentMcpServers(table: ProcTable): number[] {
+  const pids: number[] = [];
+  for (const [pid, command] of table.commandOf) {
+    if (/agent-peers-mcp\/(claude|codex)-server\.ts/.test(command)) pids.push(pid);
+  }
+  return pids;
+}
+
+/**
+ * The set of pids that belong to live agent work, and therefore must never be
+ * reaped. Anchors come from TWO independent sources, unioned:
+ *
+ *   1. The peers registry (authoritative, but gcStalePeers() deletes any peer
+ *      that has not heartbeated in STALE_THRESHOLD_MS).
+ *   2. Direct discovery of live agent-peers MCP servers in the process table.
+ *
+ * Source 2 exists precisely because source 1 can expire. A session that is
+ * thinking for twenty minutes may stop heartbeating while being entirely
+ * alive; if the registry were our only anchor we would silently stop vouching
+ * for it, which is the "idle looks dead" bug in a new costume. A process that
+ * EXISTS is alive by definition — that inference is sound in a way that
+ * inferring death from idleness never was.
+ *
+ * From each anchor we protect the MCP server and its agent host. We expand the
+ * host's whole subtree ONLY for headless hosts. A GUI host is deliberately not
+ * expanded: ChatGPT.app is the direct parent of ~200 MCP servers, so expanding
+ * it would sweep in hundreds of unrelated processes to say something the
+ * reaper's own `.app`-ancestor test already says. The gap worth closing is the
+ * headless session — launched from launchd, sshd, or a bare shell — which has
+ * no `.app` above it and is therefore invisible to that test. That is where the
+ * broker knows something the reaper cannot infer.
+ */
+export function buildProtectedPidSet(db: Database): Set<number> {
+  const protectedPids = new Set<number>();
+  const table = readProcTable();
+  const { parentOf, commandOf, childrenOf } = table;
+  if (parentOf.size === 0) return protectedPids; // inspection failed: vouch for nothing
+
+  const alive = (pid: number) => parentOf.has(pid);
+
+  // The broker itself. It is PPID=1 by design (a LaunchAgent), which is exactly
+  // what made the old reaper misread it as an orphan and SIGKILL it every 30
+  // minutes for weeks.
+  if (alive(process.pid)) protectedPids.add(process.pid);
+
+  const anchors = new Set<number>(findAgentMcpServers(table));
+  try {
+    for (const row of db.query("SELECT pid FROM peers WHERE pid IS NOT NULL").all() as { pid: number }[]) {
+      if (Number.isInteger(row.pid) && alive(row.pid)) anchors.add(row.pid);
+    }
+  } catch { /* registry unreadable: fall back to process-table anchors only */ }
+
+  for (const anchor of anchors) {
+    protectedPids.add(anchor);
+
+    // The agent host is the MCP server's parent. Never expand from pid 0/1:
+    // launchd's subtree is the whole machine, and "protect everything" would
+    // make the reaper useless rather than safe.
+    const host = parentOf.get(anchor);
+    if (host === undefined || host <= 1) continue;
+    protectedPids.add(host);
+
+    if (isGuiApp(commandOf.get(host))) continue; // already covered by the .app test
+
+    const stack = [...(childrenOf.get(host) ?? [])];
+    while (stack.length > 0) {
+      const pid = stack.pop()!;
+      if (protectedPids.has(pid)) continue;
+      protectedPids.add(pid);
+      for (const kid of childrenOf.get(pid) ?? []) stack.push(kid);
+    }
+  }
+
+  return protectedPids;
+}
+
+export function checkProtection(db: Database, entries: ProtectionQueryEntry[]) {
+  const protectedPids = buildProtectedPidSet(db);
+  const leaseUntil = new Date(Date.now() + PROTECTION_LEASE_MS).toISOString();
+
+  const results = entries.slice(0, PROTECTION_MAX_ENTRIES).map((entry) => {
+    const pid = Number(entry.pid);
+    const observedStart = processStartTime(pid);
+
+    if (observedStart === null) {
+      // Gone between the caller's snapshot and now. We cannot vouch for a pid
+      // we cannot see. Not a condemnation — just an absence of protection.
+      return { pid, protected: false, reason: "process_not_found", start_time: null };
+    }
+    // Identity fence against PID reuse: if the caller's start_time disagrees
+    // with ours, the pid it classified is NOT the pid we are looking at.
+    if (entry.start_time && entry.start_time.trim() !== observedStart) {
+      return { pid, protected: false, reason: "identity_mismatch", start_time: observedStart };
+    }
+    const isProtected = protectedPids.has(pid);
+    return {
+      pid,
+      protected: isProtected,
+      reason: isProtected ? "live_agent_session_tree" : "not_registered",
+      start_time: observedStart,
+    };
+  });
+
+  return {
+    schema: PROTECTION_SCHEMA,
+    generation: PROTECTION_GENERATION,
+    generated_at: nowIso(),
+    lease_until: leaseUntil,
+    protected_count: protectedPids.size,
+    results,
+  };
+}
+
 // ----- Orphans -----
 
 export interface OrphanMessage {
@@ -833,6 +1018,21 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
           return json({ ok: true, pid: process.pid });
         }
         if (req.method !== "POST") return json({ error: "method not allowed" }, { status: 405 });
+
+        // Deliberately OUTSIDE the shared-secret gate. The reaper runs as a
+        // separate system (mac-os-system-expert) and requiring the secret would
+        // widen that secret's trust boundary to another codebase for no gain:
+        // this endpoint only reveals which pids belong to live agent sessions —
+        // information any local process can already derive from `ps` — and its
+        // answer can only SPARE a process, never condemn one. Registering as a
+        // peer (the only way to get into the protected set) still requires the
+        // secret, so this cannot be used to launder protection onto a hostile
+        // process.
+        if (url.pathname === "/v1/protection/check") {
+          const body = await readJson<{ entries?: ProtectionQueryEntry[] } | ProtectionQueryEntry[]>(req);
+          const entries = Array.isArray(body) ? body : (body?.entries ?? []);
+          return json(checkProtection(db, entries));
+        }
 
         // Shared-secret gate for every non-/health request.
         const presented = req.headers.get(SECRET_HEADER);
