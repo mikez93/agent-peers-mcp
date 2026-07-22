@@ -80,6 +80,7 @@ import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { planWaitForPeerMessages, waitForFreshPeerMessages as waitForFreshPeerMessagesLoop } from "./shared/wait-for-peer-messages.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
+import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
@@ -658,6 +659,35 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 async function main() {
+  const initialParentPid = process.ppid;
+  let lifecycleCleanup: (() => Promise<void> | void) | null = null;
+  let terminating = false;
+  const earlyKillHandler = async () => {
+    if (terminating) return;
+    terminating = true;
+    try {
+      if (lifecycleCleanup) await lifecycleCleanup();
+    } catch { /* best effort during death */ }
+    clearTabTitleSync();
+    process.exit(0);
+  };
+  process.on("SIGINT", earlyKillHandler);
+  process.on("SIGTERM", earlyKillHandler);
+  process.on("SIGHUP", earlyKillHandler);
+  process.on("SIGQUIT", earlyKillHandler);
+  process.on("exit", clearTabTitleSync);
+
+  // Bun's stdio transport can remain alive after its app-server parent dies,
+  // leaving an orphan that still heartbeats forever. The direct app-server is
+  // the MCP session owner: once it reparents to launchd, this session is gone.
+  const parentWatch = setInterval(() => {
+    if (parentProcessWasLost(initialParentPid, process.ppid)) {
+      log(`app-server parent ${initialParentPid} exited; stopping orphaned MCP`);
+      void earlyKillHandler();
+    }
+  }, 1_000);
+  lifecycleCleanup = () => clearInterval(parentWatch);
+
   // Activation gate — matches claude-server. If AGENT_PEERS_ENABLED is not "1",
   // run as a no-op MCP (no broker connection, no tab title). Codex sessions
   // set this via the `env = { "AGENT_PEERS_ENABLED" = "1" }` block in
@@ -676,20 +706,6 @@ async function main() {
   // that sync-clear the title, optionally run whatever deferred cleanup is
   // wired, then exit. This closes the startup window where setTabTitle has
   // already fired but the full lifecycle cleanup isn't wired yet.
-  let lifecycleCleanup: (() => Promise<void> | void) | null = null;
-  const earlyKillHandler = async () => {
-    try {
-      if (lifecycleCleanup) await lifecycleCleanup();
-    } catch { /* best effort during death */ }
-    clearTabTitleSync();
-    process.exit(0);
-  };
-  process.on("SIGINT", earlyKillHandler);
-  process.on("SIGTERM", earlyKillHandler);
-  process.on("SIGHUP", earlyKillHandler);
-  process.on("SIGQUIT", earlyKillHandler);
-  process.on("exit", clearTabTitleSync);
-
   // Write a placeholder title + arm the keepalive BEFORE register() so
   // there's no "node" window between MCP-spawn and peer-registered.
   // The post-register setTabTitle(`peer:${myName}`) overwrites this.
@@ -833,6 +849,7 @@ async function main() {
   // the top of main(). Intentionally NO pendingAcks flush (spec §5.5) and NO
   // unregister (preserves reclaim-by-name window). Timer cleanup only.
   lifecycleCleanup = async () => {
+    clearInterval(parentWatch);
     clearInterval(hb);
     pollStopped = true;
     if (pollTickTimer) clearTimeout(pollTickTimer);

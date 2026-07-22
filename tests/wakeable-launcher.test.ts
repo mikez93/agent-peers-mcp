@@ -35,6 +35,24 @@ test("parseWakeableLauncherArgs materializes by default so bare resume has a rol
   const opts = parseWakeableLauncherArgs([]);
 
   expect(opts.materialize).toBe(true);
+  expect(opts.noAltScreen).toBe(false);
+});
+
+test("parseWakeableLauncherArgs keeps inline mode as an explicit compatibility option", () => {
+  expect(parseWakeableLauncherArgs(["--no-alt-screen"]).noAltScreen).toBe(true);
+});
+
+test("the default launch keeps --no-alt-screen out of the visible TUI command", () => {
+  const opts = parseWakeableLauncherArgs([]);
+  const args = buildCodexResumeArgs({
+    appServerUrl: "ws://127.0.0.1:41037",
+    appServerPid: 123,
+    threadId: "thread-1",
+    rolloutPath: "/rollout.jsonl",
+    noAltScreen: opts.noAltScreen,
+  });
+
+  expect(args).not.toContain("--no-alt-screen");
 });
 
 test("parseWakeableLauncherArgs honors --no-materialize opt-out", () => {

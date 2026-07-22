@@ -5,6 +5,7 @@ import { createServer } from "node:net";
 import { existsSync, statSync } from "node:fs";
 
 import { CodexAppServerWsClient, type AppServerThread } from "./app-server-client.ts";
+import { BoundedLog, createWakeableAppServerLog } from "./bounded-log.ts";
 import { WakeLaunchClaimStore } from "./wake-launch-claims.ts";
 import { getTty } from "./peer-context.ts";
 
@@ -21,7 +22,7 @@ export interface WakeableLauncherOptions {
 export function parseWakeableLauncherArgs(argv: string[]): WakeableLauncherOptions {
   const opts: WakeableLauncherOptions = {
     cwd: process.cwd(),
-    noAltScreen: true,
+    noAltScreen: false,
     // Materialize by default: `thread/start` only reserves a rollout path; the
     // rollout JSONL is not written to disk until the thread takes its first
     // turn. `codex resume --remote <threadId>` requires that on-disk rollout to
@@ -58,6 +59,10 @@ export function parseWakeableLauncherArgs(argv: string[]): WakeableLauncherOptio
     }
     if (arg === "--alt-screen") {
       opts.noAltScreen = false;
+      continue;
+    }
+    if (arg === "--no-alt-screen") {
+      opts.noAltScreen = true;
       continue;
     }
     if (arg === "--materialize") {
@@ -174,12 +179,16 @@ export function buildWakeableEnv(opts: {
 }
 
 export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promise<number> {
+  const appServerLog = createWakeableAppServerLog({
+    peerName: opts.peerName,
+    cwd: opts.cwd,
+  });
   // A fresh launch creates + materializes a new thread. A resume launch first
   // reads the existing on-disk thread through a short-lived peer-disabled
   // app-server, so it adds no setup turn and cannot register a duplicate peer.
   const thread = opts.threadId
-    ? await inspectExistingThread(opts, opts.threadId)
-    : await materializeThread(opts);
+    ? await inspectExistingThread(opts, opts.threadId, appServerLog)
+    : await materializeThread(opts, appServerLog);
   const launchCwd = thread.cwd || opts.cwd;
 
   const claimStore = new WakeLaunchClaimStore();
@@ -207,7 +216,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
     // and becomes the wake target (matched to this launch's claim by cwd+tty).
     const port = opts.port ?? await allocatePort();
     const appServerUrl = `ws://127.0.0.1:${port}`;
-    const appServer = Bun.spawn([
+    const appServer = spawnLoggedAppServer([
       "codex",
       ...buildMcpPeerNameConfigArgs(opts.peerName),
       "app-server",
@@ -219,13 +228,11 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
       // explicit cwd the app-server inherits THAT dir instead of the repo. The
       // TUI spawn below also sets cwd: launchCwd; the app-server must match it.
       cwd: launchCwd,
-      stdout: "inherit",
-      stderr: "inherit",
       env: process.env,
-    });
+    }, appServerLog, "resume");
 
     try {
-      await waitForReadyz(port);
+      await waitForReadyz(port, appServerLog.path);
       // The claim is the wake-registration channel: the resume MCP finds it by
       // cwd+tty and reads the app-server URL/pid + thread from it. Point it at
       // the RESUME app-server (phase 2) — that is what the wake daemon connects
@@ -233,7 +240,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
       // the app-server, not the TUI, spawns the MCP; the claim is authoritative.)
       await claimStore.update(claim.claim_id, {
         app_server_url: appServerUrl,
-        app_server_pid: appServer.pid,
+        app_server_pid: appServer.process.pid,
         thread_id: thread.id,
         rollout_path: thread.path,
         status: "ready",
@@ -242,7 +249,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
 
       const codexArgs = buildCodexResumeArgs({
         appServerUrl,
-        appServerPid: appServer.pid,
+        appServerPid: appServer.process.pid,
         threadId: thread.id,
         rolloutPath: thread.path,
         peerName: opts.peerName,
@@ -252,14 +259,12 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
       const env = buildWakeableEnv({
         baseEnv: process.env,
         appServerUrl,
-        appServerPid: appServer.pid,
+        appServerPid: appServer.process.pid,
         threadId: thread.id,
         rolloutPath: thread.path,
         peerName: opts.peerName,
       });
 
-      console.error(`[agent-peers/wakeable] app-server=${appServerUrl} pid=${appServer.pid}`);
-      console.error(`[agent-peers/wakeable] thread=${thread.id}`);
       const tui = Bun.spawn(["codex", ...codexArgs], {
         cwd: launchCwd,
         stdin: "inherit",
@@ -270,8 +275,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
       await claimStore.update(claim.claim_id, { tui_pid: tui.pid });
       return await tui.exited;
     } finally {
-      try { appServer.kill("SIGTERM"); } catch { /* best effort */ }
-      await appServer.exited.catch(() => {});
+      await stopLoggedAppServer(appServer);
     }
   } finally {
     if (!claimReady) {
@@ -285,10 +289,13 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
 // then tear the app-server down. Returns the thread id + rollout path for the
 // resume app-server to re-open. Always kills the materialize app-server, even
 // on error.
-async function materializeThread(opts: WakeableLauncherOptions): Promise<AppServerThread> {
+async function materializeThread(
+  opts: WakeableLauncherOptions,
+  appServerLog: BoundedLog,
+): Promise<AppServerThread> {
   const matPort = await allocatePort();
   const matUrl = `ws://127.0.0.1:${matPort}`;
-  const matServer = Bun.spawn([
+  const matServer = spawnLoggedAppServer([
     "codex",
     ...buildMaterializeMcpConfigArgs(opts.peerName),
     "app-server",
@@ -296,12 +303,10 @@ async function materializeThread(opts: WakeableLauncherOptions): Promise<AppServ
     matUrl,
   ], {
     cwd: opts.cwd,
-    stdout: "inherit",
-    stderr: "inherit",
     env: process.env,
-  });
+  }, appServerLog, "materialize");
   try {
-    await waitForReadyz(matPort);
+    await waitForReadyz(matPort, appServerLog.path);
     const client = new CodexAppServerWsClient(matUrl);
     try {
       let thread = await client.startThread({ cwd: opts.cwd });
@@ -313,7 +318,12 @@ async function materializeThread(opts: WakeableLauncherOptions): Promise<AppServ
           wakeId: "wakeable-materialize",
           pendingSignature: "materialize",
         }));
-        thread = await retryEmptyRolloutRace(() => client.readThread(thread.id));
+        await waitForThreadIdle(client, thread.id);
+        // A turn is currently required to force Codex to persist a new rollout,
+        // but it is launcher plumbing, not conversation history. Drop it before
+        // the visible TUI attaches so a new `codexpeer` session opens at a clean
+        // prompt instead of showing WAKEABLE_CODEX_READY.
+        thread = await client.rollbackThread(thread.id, 1);
         // The resume app-server can only re-open this thread once its rollout
         // is actually on disk. readThread succeeding usually implies that, but
         // wait for a non-empty file before we kill this app-server to close the
@@ -325,8 +335,7 @@ async function materializeThread(opts: WakeableLauncherOptions): Promise<AppServ
       client.close();
     }
   } finally {
-    try { matServer.kill("SIGTERM"); } catch { /* best effort */ }
-    await matServer.exited.catch(() => {});
+    await stopLoggedAppServer(matServer);
   }
 }
 
@@ -336,10 +345,11 @@ async function materializeThread(opts: WakeableLauncherOptions): Promise<AppServ
 async function inspectExistingThread(
   opts: WakeableLauncherOptions,
   threadId: string,
+  appServerLog: BoundedLog,
 ): Promise<AppServerThread> {
   const inspectPort = await allocatePort();
   const inspectUrl = `ws://127.0.0.1:${inspectPort}`;
-  const inspectServer = Bun.spawn([
+  const inspectServer = spawnLoggedAppServer([
     "codex",
     ...buildMaterializeMcpConfigArgs(opts.peerName),
     "app-server",
@@ -347,12 +357,10 @@ async function inspectExistingThread(
     inspectUrl,
   ], {
     cwd: opts.cwd,
-    stdout: "inherit",
-    stderr: "inherit",
     env: process.env,
-  });
+  }, appServerLog, "inspect");
   try {
-    await waitForReadyz(inspectPort);
+    await waitForReadyz(inspectPort, appServerLog.path);
     const client = new CodexAppServerWsClient(inspectUrl);
     try {
       const thread = await client.readThread(threadId);
@@ -362,8 +370,7 @@ async function inspectExistingThread(
       client.close();
     }
   } finally {
-    try { inspectServer.kill("SIGTERM"); } catch { /* best effort */ }
-    await inspectServer.exited.catch(() => {});
+    await stopLoggedAppServer(inspectServer);
   }
 }
 
@@ -401,7 +408,7 @@ async function allocatePort(): Promise<number> {
   });
 }
 
-async function waitForReadyz(port: number): Promise<void> {
+async function waitForReadyz(port: number, logPath?: string): Promise<void> {
   const deadline = Date.now() + 10_000;
   const url = `http://127.0.0.1:${port}/readyz`;
   while (Date.now() < deadline) {
@@ -413,7 +420,62 @@ async function waitForReadyz(port: number): Promise<void> {
     }
     await Bun.sleep(100);
   }
-  throw new Error(`app-server did not become ready at ${url}`);
+  throw new Error(`app-server did not become ready at ${url}${logPath ? `; diagnostics: ${logPath}` : ""}`);
+}
+
+async function waitForThreadIdle(
+  client: CodexAppServerWsClient,
+  threadId: string,
+  timeoutMs = 60_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const thread = await retryEmptyRolloutRace(() => client.readThread(threadId));
+    if (thread.status.type === "idle") return;
+    if (thread.status.type === "systemError") {
+      throw new Error(`materialize turn entered systemError for thread ${threadId}`);
+    }
+    await Bun.sleep(100);
+  }
+  throw new Error(`materialize turn did not become idle for thread ${threadId}`);
+}
+
+function spawnLoggedAppServer(
+  command: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv },
+  log: BoundedLog,
+  phase: string,
+) {
+  log.append(`\n[${new Date().toISOString()}] ${phase} app-server starting\n`);
+  const process = Bun.spawn(command, {
+    ...options,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const drained = Promise.all([
+    pumpProcessOutput(process.stdout, log),
+    pumpProcessOutput(process.stderr, log),
+  ]);
+  return { process, drained };
+}
+
+async function stopLoggedAppServer(server: ReturnType<typeof spawnLoggedAppServer>): Promise<void> {
+  try { server.process.kill("SIGTERM"); } catch { /* best effort */ }
+  await server.process.exited.catch(() => {});
+  await server.drained.catch(() => {});
+}
+
+async function pumpProcessOutput(stream: ReadableStream<Uint8Array>, log: BoundedLog): Promise<void> {
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      if (value.byteLength > 0) log.append(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function tomlString(value: string): string {

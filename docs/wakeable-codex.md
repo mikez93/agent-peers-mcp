@@ -143,6 +143,16 @@ Codex. The wake only causes a turn; it never *is* the message.
   died). The codex-server registration/delivery path is untouched. Verify with
   `codexpeer live`: a healthy session shows exactly **one** wakeable identity per repo
   (no `-2`). See `.specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md`.
+- **Launcher plumbing stays out of the session window.** Both app-servers send
+  stdout/stderr to a private, per-peer bounded log under
+  `~/.agent-peers-codex/logs/`; the launcher uses the normal alternate screen;
+  and the materialization turn is removed with `thread/rollback` before the
+  visible TUI attaches. The raw rollout retains its append-only audit events,
+  but the logical thread has zero visible turns. Set `CODEX_PEER_VERBOSE=1` to
+  restore the normally-hidden launcher status lines while debugging.
+- **An MCP exits when its owning app-server dies.** The Codex MCP watches its
+  original direct parent and exits if it is reparented to launchd. This closes
+  the Bun stdio edge case that left dead sessions heartbeating as live peers.
 - **The TUI "working" spinner can lie — trust `thread_status=` in `codexpeer live`.**
   The materialize handshake and every daemon wake are injected into the thread by an
   *external* client (the launcher / wake daemon), not the TUI. The `--remote` TUI
@@ -231,6 +241,9 @@ Relevant environment variables:
 | `CODEX_PEER_DAEMON_INTERVAL` | `5` | Background daemon poll interval (seconds) |
 | `CODEX_PEER_DAEMON_LOG_MAX_BYTES` | `5242880` | Size at which `wake-daemon.log` is rotated (copy-truncate) |
 | `CODEX_PEER_DAEMON_LOG_KEEP` | `3` | Number of rotated wake-daemon logs to keep |
+| `CODEX_PEER_APP_SERVER_LOG_MAX_BYTES` | `5242880` | Per-peer app-server log rotation size |
+| `CODEX_PEER_APP_SERVER_LOG_KEEP` | `3` | Number of rotated per-peer app-server logs to keep |
+| `CODEX_PEER_VERBOSE` | `0` | Set to `1` to show launcher status lines before the TUI |
 
 Day-to-day wake-daemon operations — log format, how repeated skips are coalesced,
 the wedged-peer (`systemError`) backoff + bounce signal, and rotation — are
@@ -248,8 +261,10 @@ The wake path is covered by focused tests:
 - `tests/wake-daemon-backoff.test.ts` — escalating backoff, re-wake on schedule, abandon at the cap
 - `tests/wake-registry.test.ts` — persistence, dedupe, liveness filtering, perms, GC
 - `tests/wake-launch-claims.test.ts` — claim matching, consumed-claim reuse, ambiguity surfacing, GC
-- `tests/wakeable-launcher.test.ts` — arg/env/config construction (no secret leakage into env)
-- `tests/app-server-client.test.ts` — connect/request timeouts
+- `tests/wakeable-launcher.test.ts` — arg/env/config construction and full-screen defaults (no secret leakage into env)
+- `tests/app-server-client.test.ts` — connect/request timeouts and bootstrap rollback
+- `tests/bounded-log.test.ts` — private log paths, permissions, and rotation
+- `tests/process-lifecycle.test.ts` — orphan-parent detection safety boundary
 - `tests/codex-inbox-store.test.ts` — durable queue + bodyless metadata + fail-closed perms
 
 Run `bunx tsc --noEmit` and `bun test` to verify.

@@ -276,6 +276,12 @@ codex-peer resume <session-id>
 
 Every launch **auto-starts a single background wake daemon** (idempotent, pidfile-tracked, detached) — you never have to remember to run a watcher, and it comes back on its own on your next launch after a reboot.
 
+The normal launch path is intentionally quiet and uses Codex's full-screen TUI.
+Internal app-server output is written to a private bounded log under
+`~/.agent-peers-codex/logs/`, and the rollout-materialization turn is rolled
+back before the TUI attaches, so launcher plumbing never appears as chat. Set
+`CODEX_PEER_VERBOSE=1` only when you want launcher status lines.
+
 ### How the wake works
 
 1. `codex-peer` starts `codex app-server --listen ws://127.0.0.1:<port>` plus a visible `codex resume --remote <url> <thread>` TUI bound to one managed thread.
@@ -319,6 +325,9 @@ Full design, security model, and failure-mode notes: [`docs/wakeable-codex.md`](
 | `CODEX_PEER_DAEMON_INTERVAL` | `5` | Background wake daemon poll interval (seconds) |
 | `CODEX_PEER_DAEMON_LOG_MAX_BYTES` | `5242880` | Size at which `wake-daemon.log` is rotated (copy-truncate) |
 | `CODEX_PEER_DAEMON_LOG_KEEP` | `3` | Number of rotated wake-daemon logs to keep |
+| `CODEX_PEER_APP_SERVER_LOG_MAX_BYTES` | `5242880` | Per-peer app-server log rotation size |
+| `CODEX_PEER_APP_SERVER_LOG_KEEP` | `3` | Number of rotated per-peer app-server logs to keep |
+| `CODEX_PEER_VERBOSE` | `0` | Set to `1` to show launcher status lines before the TUI |
 
 See [docs/wake-daemon.md](docs/wake-daemon.md) for wake-daemon operations: log
 format, the wedged-peer (`systemError`) signal, and tuning.

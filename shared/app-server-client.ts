@@ -129,6 +129,16 @@ export class CodexAppServerWsClient implements AppServerClient {
     return thread;
   }
 
+  async rollbackThread(threadId: string, numTurns = 1): Promise<AppServerThread> {
+    await this.connect();
+    const result = await this.request("thread/rollback", { threadId, numTurns });
+    const thread = (result as { thread?: AppServerThread }).thread;
+    if (!thread || typeof thread.id !== "string") {
+      throw new Error(`thread/rollback returned invalid thread for ${threadId}`);
+    }
+    return thread;
+  }
+
   async startWakeTurn(params: {
     threadId: string;
     clientUserMessageId: string;
