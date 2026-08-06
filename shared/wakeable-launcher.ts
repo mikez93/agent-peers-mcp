@@ -134,6 +134,32 @@ export function buildMcpPeerNameConfigArgs(peerName?: string): string[] {
     : [];
 }
 
+// Config for the VISIBLE resume app-server (phase 2).
+//
+// AGENT_PEERS_WAKE_LAUNCH marks every agent-peers MCP this app-server spawns as
+// belonging to a wakeable launch. The app-server spawns one MCP PER CODEX
+// THREAD, and there is no spawn-time signal telling a child which thread owns
+// it, so children elect a single root via the launch claim. The flag is what
+// lets a child that loses that election tell "I am a secondary thread, go
+// inert" from "I am an ordinary codex session with no claim, register
+// normally". Without it the two are indistinguishable and gating would remove
+// every plain Codex session from the network.
+//
+// required=true makes Codex await agent-peers initialization before
+// Session::spawn/resume completes. That is what makes the election
+// deterministic rather than a race: the root thread is constructed first and no
+// descendant runtime is auto-opened during resume, so the root always claims
+// before any user- or model-spawned secondary can exist. Scoped to THIS
+// app-server only — plain `codex` sessions keep agent-peers optional and still
+// degrade gracefully if the broker is down.
+export function buildResumeMcpConfigArgs(peerName?: string): string[] {
+  return [
+    ...buildMcpPeerNameConfigArgs(peerName),
+    "-c", `mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_LAUNCH=${tomlString("1")}`,
+    "-c", "mcp_servers.agent-peers.required=true",
+  ];
+}
+
 export function buildMaterializeMcpConfigArgs(peerName?: string): string[] {
   // Config for the SHORT-LIVED materialize app-server (phase 1 of the launch).
   // Its only job is to run one setup turn so the rollout exists on disk; its
@@ -219,7 +245,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
     const appServerUrl = `ws://127.0.0.1:${port}`;
     const appServer = spawnLoggedAppServer([
       "codex",
-      ...buildMcpPeerNameConfigArgs(opts.peerName),
+      ...buildResumeMcpConfigArgs(opts.peerName),
       "app-server",
       "--listen",
       appServerUrl,

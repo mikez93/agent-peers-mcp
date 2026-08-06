@@ -196,6 +196,47 @@ export class WakeLaunchClaimStore {
       .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
   }
 
+  // Atomically elect ONE owner for a claim, before any broker registration.
+  //
+  // `consume()` is a read-modify-write and cannot arbitrate a race: in
+  // `--remote` mode several per-thread MCP children start against the same
+  // app-server, and two of them can both see the claim as unconsumed before
+  // either writes. This uses exclusive create (`wx`), which is atomic on POSIX,
+  // so exactly one child wins no matter how they interleave. The loser learns
+  // it is a secondary thread and goes inert instead of taking a peer identity.
+  //
+  // The lock is advisory over the claim's own lifetime — `remove()` and
+  // `prune()` clear it with the claim, and a lock whose owner process is dead
+  // is reclaimable so a crashed root does not strand the launch forever.
+  async tryAcquireRoot(claimId: string, ownerPid: number): Promise<boolean> {
+    await ensurePrivateDir(this.dir);
+    const lockPath = this.lockPathFor(claimId);
+    try {
+      await writeFile(lockPath, JSON.stringify({ owner_pid: ownerPid, acquired_at: new Date().toISOString() }), {
+        encoding: "utf8",
+        mode: FILE_MODE,
+        flag: "wx",
+      });
+      return true;
+    } catch {
+      // Someone holds it. Reclaim only if that someone is gone.
+      try {
+        const raw = await readFile(lockPath, "utf8");
+        const held = JSON.parse(raw) as { owner_pid?: number };
+        if (held?.owner_pid === ownerPid) return true;
+        if (isProcessAlive(held?.owner_pid ?? null)) return false;
+        await unlink(lockPath);
+        return await this.tryAcquireRoot(claimId, ownerPid);
+      } catch {
+        return false;
+      }
+    }
+  }
+
+  async releaseRoot(claimId: string): Promise<void> {
+    try { await unlink(this.lockPathFor(claimId)); } catch { /* already gone */ }
+  }
+
   async consume(claimId: string, peerId: string): Promise<void> {
     await this.update(claimId, {
       status: "consumed",
@@ -205,6 +246,7 @@ export class WakeLaunchClaimStore {
 
   async remove(claimId: string): Promise<void> {
     try { await unlink(this.pathFor(claimId)); } catch { /* already gone */ }
+    await this.releaseRoot(claimId);
   }
 
   // Garbage-collect claim files that are neither live nor recent. A claim is
@@ -258,5 +300,9 @@ export class WakeLaunchClaimStore {
 
   private pathFor(claimId: string): string {
     return join(this.dir, `${claimId}.json`);
+  }
+
+  private lockPathFor(claimId: string): string {
+    return join(this.dir, `${claimId}.root.lock`);
   }
 }

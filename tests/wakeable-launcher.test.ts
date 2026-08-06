@@ -5,6 +5,7 @@ import {
   buildMaterializeMcpConfigArgs,
   buildMcpEnvConfigArgs,
   buildMcpPeerNameConfigArgs,
+  buildResumeMcpConfigArgs,
   buildWakeableEnv,
   isEmptyRolloutRaceError,
   materializeThreadName,
@@ -200,4 +201,37 @@ test("materializeThreadName prefers the peer name and falls back to the repo dir
     .toBe("agent-peers: repo");
   expect(materializeThreadName(undefined, "/Users/mike/www/ai/repo/"))
     .toBe("agent-peers: repo");
+});
+
+test("the resume app-server marks its MCPs as a wakeable launch and requires them", () => {
+  // Intent: both flags are load-bearing for single-identity election.
+  // AGENT_PEERS_WAKE_LAUNCH lets a losing child distinguish "secondary thread"
+  // from "ordinary codex session with no claim". required=true makes Codex
+  // await agent-peers init before resume completes, so the root deterministically
+  // claims before any secondary thread can exist.
+  const args = buildResumeMcpConfigArgs("brisk-bison");
+
+  expect(args).toContain(`mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_LAUNCH="1"`);
+  expect(args).toContain("mcp_servers.agent-peers.required=true");
+  expect(args).toContain(`mcp_servers.agent-peers.env.PEER_NAME="brisk-bison"`);
+});
+
+test("the wake-launch marker is set even when no peer name was requested", () => {
+  // An unnamed launch still needs election, so the marker must not be
+  // conditional on PEER_NAME the way the name arg is.
+  const args = buildResumeMcpConfigArgs(undefined);
+
+  expect(args).toContain(`mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_LAUNCH="1"`);
+  expect(args).toContain("mcp_servers.agent-peers.required=true");
+  expect(args.join(" ")).not.toContain("PEER_NAME");
+});
+
+test("the materialize app-server stays fully disabled and is never a wake launch", () => {
+  // Phase 1 must register NOTHING. If it inherited the wake-launch marker it
+  // would join the election and could steal the claim from the real session.
+  const args = buildMaterializeMcpConfigArgs("brisk-bison");
+
+  expect(args).toContain(`mcp_servers.agent-peers.env.AGENT_PEERS_ENABLED="0"`);
+  expect(args.join(" ")).not.toContain("AGENT_PEERS_WAKE_LAUNCH");
+  expect(args.join(" ")).not.toContain("required=true");
 });

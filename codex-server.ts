@@ -73,6 +73,7 @@ import { waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
+import { decideWakeLaunchRole, isWakeLaunchEnv, shouldRegisterAsPeer } from "./shared/wake-launch-role.ts";
 import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
@@ -658,6 +659,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   });
 });
 
+let wakeRootClaim: CompleteWakeLaunchClaim | null = null;
+
 async function main() {
   const initialParentPid = process.ppid;
   let lifecycleCleanup: (() => Promise<void> | void) | null = null;
@@ -696,6 +699,45 @@ async function main() {
     mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
     await mcp.connect(new StdioServerTransport());
     log("agent-peers disabled (set AGENT_PEERS_ENABLED=1 to activate); idle");
+    return;
+  }
+
+  // ---- Single-identity election for wakeable launches -------------------
+  // The app-server spawns one agent-peers MCP PER CODEX THREAD, and every one
+  // of them used to call broker register(), so a single `codexpeer` launch
+  // produced N addressable peers (observed: 4 per app-server). Only the child
+  // that wins the launcher's single-use claim may take the peer identity; the
+  // rest are secondary threads (fork/subagent/extra thread) and go inert.
+  //
+  // This runs BEFORE setTabTitle/ensureBroker on purpose: a secondary must not
+  // write escape sequences to the shared terminal or open a broker connection.
+  // See shared/wake-launch-role.ts for why no spawn-time thread id exists.
+  const electionCwd = process.cwd();
+  const electionTty = getTty();
+  const wakeLaunch = isWakeLaunchEnv(process.env);
+  if (wakeLaunch) {
+    const claimStore = new WakeLaunchClaimStore();
+    const claim = await claimStore.findMatching({
+      cwd: electionCwd,
+      tty: electionTty,
+      waitMs: 30_000,
+      includeConsumed: true,
+    });
+    wakeRootClaim = claim && await claimStore.tryAcquireRoot(claim.claim_id, process.pid)
+      ? claim
+      : null;
+  }
+  const wakeLaunchRole = decideWakeLaunchRole({
+    isWakeLaunch: wakeLaunch,
+    claimedWakeRoot: wakeRootClaim !== null,
+  });
+  if (!shouldRegisterAsPeer(wakeLaunchRole)) {
+    // Expose an MCP so the owning thread can still start — with
+    // `mcp_servers.agent-peers.required=true` a failed init would block the
+    // thread — but take no identity and produce no side effects.
+    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+    await mcp.connect(new StdioServerTransport());
+    log("secondary thread of a wakeable launch; not registering a peer identity");
     return;
   }
 
@@ -939,13 +981,10 @@ async function resolveWakeRegistrationHints(opts: {
     };
   }
 
-  const claimStore = new WakeLaunchClaimStore();
-  return claimStore.findMatching({
-    cwd: opts.cwd,
-    tty: opts.tty,
-    waitMs: 30_000,
-    includeConsumed: true,
-  });
+  // Reuse the claim this child actually won during the election. Re-querying
+  // here with includeConsumed:true is what let every sibling child resolve the
+  // same claim and write its own wake-registry row.
+  return wakeRootClaim;
 }
 
 main().catch(async (e) => {
