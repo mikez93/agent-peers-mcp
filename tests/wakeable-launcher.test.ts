@@ -7,7 +7,9 @@ import {
   buildMcpPeerNameConfigArgs,
   buildWakeableEnv,
   isEmptyRolloutRaceError,
+  materializeThreadName,
   parseWakeableLauncherArgs,
+  waitForRolloutOnDisk,
 } from "../shared/wakeable-launcher.ts";
 
 test("parseWakeableLauncherArgs parses launcher flags and passthrough args", () => {
@@ -172,4 +174,30 @@ test("isEmptyRolloutRaceError matches only the transient app-server empty rollou
   ))).toBe(true);
   expect(isEmptyRolloutRaceError(new Error("thread-store internal error: permission denied"))).toBe(false);
   expect(isEmptyRolloutRaceError("rollout at /tmp/rollout.jsonl is empty")).toBe(false);
+});
+
+test("waitForRolloutOnDisk fails loudly when the rollout never appears", async () => {
+  // Intent: the rollout file IS the materialization proof — `codex resume
+  // --remote` fails with "no rollout found for thread id" without it. A silent
+  // timeout here would defer that failure to the resume phase, where the error
+  // no longer points at the real cause. This must throw, not return.
+  await expect(waitForRolloutOnDisk("/nonexistent/rollout.jsonl", 300))
+    .rejects.toThrow(/never written/);
+});
+
+test("waitForRolloutOnDisk tolerates a thread with no rollout path", async () => {
+  // A null path means the app-server did not report one; that is not a
+  // materialization failure and must not throw.
+  await expect(waitForRolloutOnDisk(null, 300)).resolves.toBeUndefined();
+});
+
+test("materializeThreadName prefers the peer name and falls back to the repo dir", () => {
+  // The name is user-visible in Codex's thread list, so it should identify the
+  // peer rather than leaking launcher internals.
+  expect(materializeThreadName("brisk-bison", "/Users/mike/www/ai/repo"))
+    .toBe("agent-peers: brisk-bison");
+  expect(materializeThreadName(undefined, "/Users/mike/www/ai/repo"))
+    .toBe("agent-peers: repo");
+  expect(materializeThreadName(undefined, "/Users/mike/www/ai/repo/"))
+    .toBe("agent-peers: repo");
 });

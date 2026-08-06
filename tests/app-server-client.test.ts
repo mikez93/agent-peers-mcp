@@ -62,7 +62,12 @@ test("connect rejects fast when nothing is listening", async () => {
   client.close();
 });
 
-test("rollbackThread drops the launcher bootstrap turn", async () => {
+test("setThreadName materializes via thread/name/set and never runs a turn", async () => {
+  // Intent: materialization must persist the rollout WITHOUT a model turn.
+  // This test fails if anyone reintroduces the old materialize-turn approach
+  // (turn/start) or the deprecated thread/rollback cleanup it required — both
+  // of which are what made `codexpeer` fail with "Cannot rollback while a turn
+  // is in progress" once codex-cli tightened the rollback guard.
   const seen: Array<{ method?: string; params?: unknown }> = [];
   const server = Bun.serve({
     port: 0,
@@ -74,20 +79,19 @@ test("rollbackThread drops the launcher bootstrap turn", async () => {
       message(ws, raw) {
         const request = JSON.parse(String(raw)) as { id: number; method?: string; params?: unknown };
         seen.push(request);
-        const result = request.method === "thread/rollback"
-          ? { thread: { id: "thread-1", cwd: "/repo", path: "/rollout", status: { type: "idle" } } }
-          : {};
-        ws.send(JSON.stringify({ id: request.id, result }));
+        ws.send(JSON.stringify({ id: request.id, result: {} }));
       },
     },
   });
   stoppers.push(() => server.stop(true));
 
   const client = new CodexAppServerWsClient(`ws://127.0.0.1:${server.port}`);
-  const thread = await client.rollbackThread("thread-1", 1);
+  await client.setThreadName("thread-1", "agent-peers: brisk-bison");
 
-  expect(thread.id).toBe("thread-1");
-  expect(seen.find((request) => request.method === "thread/rollback")?.params)
-    .toEqual({ threadId: "thread-1", numTurns: 1 });
+  expect(seen.find((request) => request.method === "thread/name/set")?.params)
+    .toEqual({ threadId: "thread-1", name: "agent-peers: brisk-bison" });
+  const methods = seen.map((request) => request.method);
+  expect(methods).not.toContain("turn/start");
+  expect(methods).not.toContain("thread/rollback");
   client.close();
 });

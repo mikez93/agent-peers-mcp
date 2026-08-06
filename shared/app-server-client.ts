@@ -129,14 +129,20 @@ export class CodexAppServerWsClient implements AppServerClient {
     return thread;
   }
 
-  async rollbackThread(threadId: string, numTurns = 1): Promise<AppServerThread> {
+  // Naming a thread is the launcher's materialization primitive: it forces the
+  // app-server to persist the thread's rollout JSONL to disk WITHOUT running a
+  // model turn. `thread/start` alone only reserves the rollout path, and
+  // `codex resume --remote <threadId>` fails with "no rollout found for thread
+  // id" until the file actually exists.
+  //
+  // This replaces the old materialize-turn + `thread/rollback` dance. That dance
+  // burned a real model turn (measured 5.3s-29.4s per launch) purely to force
+  // file creation, then deleted it — and the delete raced the turn it was
+  // deleting. `thread/rollback` is also deprecated in codex-cli 0.146.1.
+  // See tests/wakeable-launcher.test.ts and docs/wakeable-codex.md.
+  async setThreadName(threadId: string, name: string): Promise<void> {
     await this.connect();
-    const result = await this.request("thread/rollback", { threadId, numTurns });
-    const thread = (result as { thread?: AppServerThread }).thread;
-    if (!thread || typeof thread.id !== "string") {
-      throw new Error(`thread/rollback returned invalid thread for ${threadId}`);
-    }
-    return thread;
+    await this.request("thread/name/set", { threadId, name });
   }
 
   async startWakeTurn(params: {

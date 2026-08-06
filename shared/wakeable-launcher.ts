@@ -24,10 +24,11 @@ export function parseWakeableLauncherArgs(argv: string[]): WakeableLauncherOptio
     cwd: process.cwd(),
     noAltScreen: false,
     // Materialize by default: `thread/start` only reserves a rollout path; the
-    // rollout JSONL is not written to disk until the thread takes its first
-    // turn. `codex resume --remote <threadId>` requires that on-disk rollout to
-    // exist, so without a setup turn the bare `codexpeer` launch fails with
-    // "no rollout found for thread id ... (code -32600)". `--no-materialize`
+    // rollout JSONL is not written to disk until something forces a persist.
+    // `codex resume --remote <threadId>` requires that on-disk rollout to exist,
+    // so without materialization a bare `codexpeer` launch fails with "no
+    // rollout found for thread id ... (code -32600)". We materialize with
+    // `thread/name/set` (no model turn); see setThreadName. `--no-materialize`
     // remains as an experimental opt-out. See
     // .specs/2026-06-18-wakeable-codex-zed-recipe.md and error-patterns.md.
     materialize: true,
@@ -309,25 +310,18 @@ async function materializeThread(
     await waitForReadyz(matPort, appServerLog.path);
     const client = new CodexAppServerWsClient(matUrl);
     try {
-      let thread = await client.startThread({ cwd: opts.cwd });
+      const thread = await client.startThread({ cwd: opts.cwd });
       if (opts.materialize) {
-        await retryEmptyRolloutRace(() => client.startWakeTurn({
-          threadId: thread.id,
-          clientUserMessageId: "agent-peers-wakeable-materialize",
-          prompt: "Wakeable Codex session initialized for agent-peers. Reply exactly: WAKEABLE_CODEX_READY. Do not use tools.",
-          wakeId: "wakeable-materialize",
-          pendingSignature: "materialize",
-        }));
-        await waitForThreadIdle(client, thread.id);
-        // A turn is currently required to force Codex to persist a new rollout,
-        // but it is launcher plumbing, not conversation history. Drop it before
-        // the visible TUI attaches so a new `codexpeer` session opens at a clean
-        // prompt instead of showing WAKEABLE_CODEX_READY.
-        thread = await client.rollbackThread(thread.id, 1);
-        // The resume app-server can only re-open this thread once its rollout
-        // is actually on disk. readThread succeeding usually implies that, but
-        // wait for a non-empty file before we kill this app-server to close the
-        // cross-app-server flush race.
+        // Naming the thread persists its rollout with no model turn. See
+        // CodexAppServerWsClient.setThreadName for why this replaced the old
+        // materialize-turn + thread/rollback approach.
+        await retryEmptyRolloutRace(() => client.setThreadName(
+          thread.id,
+          materializeThreadName(opts.peerName, opts.cwd),
+        ));
+        // The resume app-server can only re-open this thread once its rollout is
+        // actually on disk. Wait for a non-empty file before we kill this
+        // app-server, to close the cross-app-server flush race.
         await waitForRolloutOnDisk(thread.path);
       }
       return thread;
@@ -374,7 +368,11 @@ async function inspectExistingThread(
   }
 }
 
-async function waitForRolloutOnDisk(path: string | null, timeoutMs = 10_000): Promise<void> {
+// The rollout file IS the materialization proof — `codex resume --remote` fails
+// with "no rollout found for thread id" without it. Time out loudly rather than
+// returning silently, so a materialization failure surfaces here instead of as a
+// confusing resume error two phases later.
+export async function waitForRolloutOnDisk(path: string | null, timeoutMs = 10_000): Promise<void> {
   if (!path) return;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -383,6 +381,14 @@ async function waitForRolloutOnDisk(path: string | null, timeoutMs = 10_000): Pr
     } catch { /* keep polling */ }
     await Bun.sleep(100);
   }
+  throw new Error(`thread rollout was never written to ${path} within ${timeoutMs}ms`);
+}
+
+// Thread name used to materialize the rollout. Cosmetic but user-visible in
+// Codex's thread list, so prefer the peer's own name over the repo directory.
+export function materializeThreadName(peerName: string | undefined, cwd: string): string {
+  const fallback = cwd.split("/").filter(Boolean).pop() || "wakeable";
+  return `agent-peers: ${peerName || fallback}`;
 }
 
 function requireValue(argv: string[], index: number, flag: string): string {
@@ -421,23 +427,6 @@ async function waitForReadyz(port: number, logPath?: string): Promise<void> {
     await Bun.sleep(100);
   }
   throw new Error(`app-server did not become ready at ${url}${logPath ? `; diagnostics: ${logPath}` : ""}`);
-}
-
-async function waitForThreadIdle(
-  client: CodexAppServerWsClient,
-  threadId: string,
-  timeoutMs = 60_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const thread = await retryEmptyRolloutRace(() => client.readThread(threadId));
-    if (thread.status.type === "idle") return;
-    if (thread.status.type === "systemError") {
-      throw new Error(`materialize turn entered systemError for thread ${threadId}`);
-    }
-    await Bun.sleep(100);
-  }
-  throw new Error(`materialize turn did not become idle for thread ${threadId}`);
 }
 
 function spawnLoggedAppServer(
