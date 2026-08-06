@@ -278,14 +278,15 @@ Every launch **auto-starts a single background wake daemon** (idempotent, pidfil
 
 The normal launch path is intentionally quiet and uses Codex's full-screen TUI.
 Internal app-server output is written to a private bounded log under
-`~/.agent-peers-codex/logs/`, and the rollout-materialization turn is rolled
-back before the TUI attaches, so launcher plumbing never appears as chat. Set
+`~/.agent-peers-codex/logs/`, and the session opens at a clean, empty prompt:
+the rollout is materialized with `thread/name/set`, which persists it **without
+running a model turn**, so there is no launcher plumbing to appear as chat. Set
 `CODEX_PEER_VERBOSE=1` only when you want launcher status lines.
 
 ### How the wake works
 
 1. `codex-peer` starts `codex app-server --listen ws://127.0.0.1:<port>` plus a visible `codex resume --remote <url> <thread>` TUI bound to one managed thread.
-2. The agent-peers MCP child (running under the app-server) registers as a peer and, when mail arrives, writes **bodyless** metadata (sender id/name, timestamp — no body, no lease token) to `~/.agent-peers-codex/<peer>.metadata.json` next to the durable inbox.
+2. The agent-peers MCP child (running under the app-server) wins the launch's single-identity election, registers as a peer and, when mail arrives, writes **bodyless** metadata (sender id/name, timestamp — no body, no lease token) to `~/.agent-peers-codex/<peer>.metadata.json` next to the durable inbox.
 3. The wake daemon polls that metadata plus a durable wake registry. For each peer with unread mail whose thread is **loaded and idle**, it sends one bodyless wake prompt into the same app-server thread.
 4. Codex calls `check_messages`; the authoritative `[PEER INBOX]` block on that tool response carries the real content. Then it returns to waiting.
 
@@ -293,6 +294,10 @@ It is the **same live instance** — same thread, same rollout, same visible TUI
 
 ### What it costs
 
+- **Launching a peer costs zero model tokens and takes a few seconds.** Materializing
+  the thread is a metadata write (`thread/name/set`), not a conversation. Before
+  2026-08-06 every launch ran a throwaway model turn purely to force the rollout file
+  onto disk and then deleted it — 5.3s–29.4s each time, plus tokens.
 - **An idle wakeable peer with no mail spends zero model tokens.** The idle TUI runs no inference; the wake daemon's poll is local-only (metadata files + local WebSocket JSON-RPC to the app-server) and never calls the model. A model turn fires only when there is real unread mail.
 - **Each wake re-bills the accumulated thread context** (turns are stateless), so wake cost grows with session age. Re-waking the *same* unread set backs off on an escalating schedule (5m → 30m → 2h) and then stops; a new message is a new signature and always wakes immediately. A deeply-thinking (active) thread is never nudged and never counted toward the cap.
 
@@ -328,6 +333,7 @@ Full design, security model, and failure-mode notes: [`docs/wakeable-codex.md`](
 | `CODEX_PEER_APP_SERVER_LOG_MAX_BYTES` | `5242880` | Per-peer app-server log rotation size |
 | `CODEX_PEER_APP_SERVER_LOG_KEEP` | `3` | Number of rotated per-peer app-server logs to keep |
 | `CODEX_PEER_VERBOSE` | `0` | Set to `1` to show launcher status lines before the TUI |
+| `AGENT_PEERS_WAKE_LAUNCH` | — | **Set by the launcher, not by you.** Marks every agent-peers MCP spawned by a wakeable launch's app-server so the duplicate-identity election can tell a secondary Codex thread from an ordinary `codex` session |
 
 See [docs/wake-daemon.md](docs/wake-daemon.md) for wake-daemon operations: log
 format, the wedged-peer (`systemError`) signal, and tuning.
@@ -335,6 +341,23 @@ format, the wedged-peer (`systemError`) signal, and tuning.
 ---
 
 ## Known behaviors
+
+**One `codexpeer` launch = exactly one peer, even though Codex starts several MCPs.**
+In `--remote` mode the app-server spawns the agent-peers MCP **once per Codex
+thread** — a fork, a spawned subagent, a detached review and a cold resume each get
+their own — and it keeps unsubscribed threads loaded for 30 minutes, so they
+accumulate. Every one of those children used to register its own peer, which is
+where names like `ccr-codex-3-2-2-2` came from, and worse: mail addressed to the
+name could land in a twin the wake daemon wasn't watching and simply never arrive.
+Children now elect a single root via the launch claim (atomic exclusive-create);
+losers serve an empty MCP and take no identity. Plain `codex` sessions are
+unaffected and still register normally — the launcher sets `AGENT_PEERS_WAKE_LAUNCH=1`
+specifically so the two cases stay distinguishable. Details:
+[`docs/wakeable-codex.md`](docs/wakeable-codex.md).
+
+**Sessions started before this change keep their duplicates.** The election is
+applied at launch, so already-running peers with `-2`/`-2-2` twins only clean up
+when you close and relaunch them.
 
 **Claude sessions only activate peers when you launch via `agentpeers`.**
 The `agentpeers` alias sets `AGENT_PEERS_ENABLED=1`. Plain `claude` does not, so the MCP loads in idle/no-op mode — no peer registration, no tab title change, no broker connection. This is intentional: the MCP is registered globally in `~/.claude.json`, so every `claude` session spawns it, and we don't want the peer network showing up in unrelated sessions.
@@ -374,6 +397,21 @@ Ask it to call `list_peers` or `check_messages` — messages surface on any agen
 **Upgraded from an older install and existing peers aren't working**
 The broker migrates pre-session-token databases by dropping all legacy peer rows (they can't authenticate under the new scheme). Restart all your sessions to re-register. Any in-flight messages for the dropped peers are visible via `bun cli.ts orphaned-messages`.
 
+**`codexpeer` fails with "Cannot rollback while a turn is in progress"**
+Fixed on 2026-08-06 — upgrade. Materialization used to run a throwaway model turn and
+then delete it with `thread/rollback`; because `turn/start` returns *before* the
+thread reports itself busy, the delete could land inside the still-running turn
+(reproduced in 1 of 6 launches). Materialization no longer runs a turn at all, so
+there is nothing to roll back. `thread/rollback` is also deprecated in codex-cli
+0.146.1.
+
+**One repo shows several peers with compounding names (`name-2`, `name-3-2-2-2`)**
+Fixed on 2026-08-06 — relaunch the affected sessions. The app-server spawns one
+agent-peers MCP per Codex thread and each used to register separately; children now
+elect a single root. Already-running sessions keep their duplicates until relaunched.
+If you see this on a *fresh* launch, that is a real bug — check that the launcher
+passed `AGENT_PEERS_WAKE_LAUNCH=1` (`ps eww` on the app-server).
+
 **Running alongside upstream `claude-peers-mcp`**
 They coexist cleanly on different ports (7900 vs 7899) and different MCP names (`agent-peers` vs `claude-peers`). You can use both simultaneously; they don't share state.
 
@@ -402,15 +440,17 @@ agent-peers-mcp/
 │   ├── app-server-client.ts                   # Minimal Codex app-server JSON-RPC client (bounded timeouts)
 │   ├── wakeable-launcher.ts                   # Starts app-server + managed thread + visible TUI
 │   ├── wake-registry.ts                       # Durable peer_id -> app-server/thread registry (+ GC)
-│   ├── wake-launch-claims.ts                  # Launcher <-> MCP-child handshake (+ ambiguity-safe matching)
+│   ├── wake-launch-claims.ts                  # Launcher <-> MCP-child handshake (+ ambiguity-safe matching, atomic root election)
+│   ├── wake-launch-role.ts                    # standalone/root/secondary — the one-identity-per-launch gate
 │   ├── wake-daemon.ts                         # Wake engine: idle-only nudge, backoff + attempt cap + GC
 │   ├── wait-for-peer-messages.ts              # Bounded wait helper for wait_for_peer_messages
 │   ├── colleague-prompt.ts                    # COLLEAGUE_PROTOCOL string shared by both servers
 │   ├── shared-secret.ts                       # Per-user broker auth secret provisioning
 │   └── names.ts                               # adjective-noun generator
-├── tests/                                     # 131 tests — broker, migration, piggyback, client, names, codex-inbox, shared-secret, wake-*, app-server-client
+├── tests/                                     # 185 tests — broker, migration, piggyback, client, names, codex-inbox, shared-secret, wake-*, app-server-client
 ├── docs/
-│   └── wakeable-codex.md                       # Wakeable Codex design, security model, failure modes
+│   ├── wakeable-codex.md                       # Wakeable Codex design, security model, failure modes
+│   └── wake-daemon.md                          # Wake-daemon operations: log format, signals, tuning
 ├── docs/superpowers/
 │   ├── specs/2026-04-13-agent-peers-mcp-design.md      # Full spec (post 7 review rounds + PR #2 amendments)
 │   └── plans/2026-04-13-agent-peers-mcp-implementation.md

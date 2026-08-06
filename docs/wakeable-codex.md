@@ -41,9 +41,10 @@ same visible TUI. It is never killed or restarted with fresh context.
 |---|---|
 | `bin/codex-peer` | Operator CLI: launch wakeable peers, manage the background daemon, inspect/repair/retire |
 | `wakeable-codex.ts` → `shared/wakeable-launcher.ts` | Start the app-server, start/resume the thread, launch the visible TUI, write a launch claim |
-| `shared/app-server-client.ts` | Minimal Codex app-server JSON-RPC client (`thread/loaded/list`, `thread/read`, `turn/start`) with bounded connect/request timeouts |
+| `shared/app-server-client.ts` | Minimal Codex app-server JSON-RPC client (`thread/loaded/list`, `thread/read`, `thread/name/set`, `turn/start`) with bounded connect/request timeouts |
 | `shared/wake-registry.ts` | Durable `peer_id -> app-server/thread` registry (0o600), liveness checks, GC of dead rows |
-| `shared/wake-launch-claims.ts` | Launcher ↔ MCP-child handshake so the visible session's `peer_id` is bound to the right app-server/thread |
+| `shared/wake-launch-claims.ts` | Launcher ↔ MCP-child handshake so the visible session's `peer_id` is bound to the right app-server/thread; also arbitrates the single-identity election via atomic `tryAcquireRoot()` |
+| `shared/wake-launch-role.ts` | Decides whether an MCP child registers a peer identity (`standalone` / `root` / `secondary`) — the duplicate-identity gate |
 | `shared/codex-inbox.ts` | Durable on-disk inbox **plus bodyless metadata** the daemon reads |
 | `shared/wake-daemon.ts` → `wake-daemon.ts` | The wake engine: one pass over the registry + metadata, with backoff/cap + GC |
 | `codex-server.ts` | Registers the wakeable session and writes bodyless metadata when mail arrives |
@@ -85,6 +86,11 @@ Codex. The wake only causes a turn; it never *is* the message.
 
 ## Token-cost characteristics
 
+- **Launching a peer costs zero model tokens.** The rollout is materialized with
+  `thread/name/set`, which persists the session metadata record without running a
+  turn. Before 2026-08-06 every launch ran (and then deleted) a real model turn just
+  to force the rollout file into existence — measured at 5.3s–29.4s of latency plus
+  its tokens, on every single launch.
 - **Idle with no mail = zero model tokens.** The idle TUI runs no inference. The
   wake daemon's poll is local-only (read metadata files + local WebSocket JSON-RPC
   to the app-server) and never calls the model. A model turn (`turn/start`) fires
@@ -122,40 +128,79 @@ Codex. The wake only causes a turn; it never *is* the message.
 - **Confirm-on-next-call delivery.** Messages stay in the durable inbox until the
   *next* tool call proves the prior response reached the model, so a dropped wake
   response re-delivers instead of silently losing mail.
-- **One agent-peers identity per session (two-app-server launch).** In `--remote`
-  mode the visible `codex resume --remote` TUI is a thin client — it spawns **no**
-  MCP itself; the **app-server** spawns the agent-peers MCP for *every* conversation
-  it hosts, using the **app-server process's** `-c` config (verified via `ps eww`:
-  the MCP child's env exactly mirrors the app-server's `-c mcp_servers.agent-peers.env.*`,
-  and the resume command's own `-c` is ignored). So a single shared app-server
-  registers **both** the materialize conversation and the resume conversation
-  (name + `-2`); mail addressed to `name` lands in the materialize twin's inbox while
-  the daemon wakes the resume twin → split delivery. Per-conversation config can't
-  fix it, and disabling agent-peers on the one shared app-server disables the whole
-  session (the 2026-06-25 first attempt, reverted in `d1fb58c`). **The fix splits the
-  launch across two app-servers:** phase 1 runs the materialize setup turn on a
-  throwaway app-server with agent-peers **disabled** (so it registers nothing) and
-  kills it; phase 2 brings up a fresh app-server that hosts **only** the visible
-  resume session, so its single MCP registers under the canonical name and is the
-  wake target. Cross-app-server resume is safe because the thread store is shared on
-  disk — the phase-2 app-server re-opens the thread via `thread/resume` (verified:
-  `thread/resume` + `turn/start` succeed on a fresh app-server after the creator
-  died). The codex-server registration/delivery path is untouched. Verify with
-  `codexpeer live`: a healthy session shows exactly **one** wakeable identity per repo
-  (no `-2`). See `.specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md`.
+- **One agent-peers identity per launch (claim election).** In `--remote` mode the
+  visible `codex resume --remote` TUI is a thin client — it spawns **no** MCP
+  itself. The **app-server** spawns the agent-peers MCP, and it spawns **one per
+  Codex thread**, using the **app-server process's** `-c` config. `thread/start`, a
+  cold `thread/resume`, `thread/fork`, a spawned subagent and a detached review each
+  create a Session, and each Session launches its own stdio MCP child; the
+  app-server also keeps unsubscribed threads loaded for **30 minutes**, so children
+  accumulate. Ordinary turns and compaction reuse the existing child.
+
+  The earlier two-app-server split (2026-06-25) fixed only the *materialize vs
+  resume* case. It was written believing the phase-2 app-server hosts exactly one
+  conversation and therefore registers exactly one identity. **That was wrong**, and
+  it stayed wrong until measured: two live app-servers were each running **four**
+  agent-peers MCPs, 15 MCP processes across 9 app-servers, and one terminal
+  (`ttys023`) held `ccr-codex-2`, `ccr-codex-3-2-2-2`, `ccr-codex-4-2-2` and
+  `ccr-codex-5-2-2`. Every child called broker `register()` unconditionally. The
+  damage is worse than cosmetic naming: mail addressed to the peer's **name** can
+  land in a twin the wake daemon is not watching, so it is neither delivered nor
+  reported undelivered — and each child also runs a 1s `/dev/tty` tab-title
+  keepalive, so an idle terminal had four processes writing escape sequences into it
+  every second.
+
+  **There is no spawn-time signal identifying the owning thread.** The stdio child
+  gets a cleared environment, so `AGENT_PEERS_WAKE_THREAD_ID` — app-server *process*
+  config — is copied identically into every child; `cwd`, `ppid` and tty do not
+  disambiguate. Codex stamps an authoritative `_meta.threadId` on `tools/call`, but
+  **not** on the startup `tools/list`, so it cannot gate registration without
+  leaving a peer undiscoverable until it happens to call a tool — which defeats the
+  entire point of a network that wakes idle peers.
+
+  **So the launcher elects a root instead:**
+  1. The resume app-server sets `AGENT_PEERS_WAKE_LAUNCH=1`, inherited by every MCP
+     child it spawns. This is the discriminator that lets a losing child tell *"I am
+     a secondary thread — go inert"* from *"I am an ordinary `codex` session with no
+     claim — register normally"*. Without it the two are indistinguishable and
+     gating would silently remove every plain Codex session from the network.
+  2. Children race `WakeLaunchClaimStore.tryAcquireRoot()`, which arbitrates by
+     exclusive create (`wx`, atomic on POSIX). `consume()` cannot arbitrate — it is a
+     read-modify-write, and two children can both observe the claim as unconsumed. A
+     lock whose owner process is dead is reclaimable, so a crashed root cannot
+     strand the launch.
+  3. The winner registers as today. Losers serve an **empty** MCP so their thread can
+     still start, and take no identity: no broker connection, no inbox, no polling,
+     no tab-title write. The election runs *before* `setTabTitle`/`ensureBroker`
+     precisely so a secondary never touches the shared terminal.
+  4. The app-server also sets `mcp_servers.agent-peers.required=true`, which makes
+     Codex await agent-peers initialization before `Session::spawn`/`resume`
+     completes. The root thread is constructed first and no descendant runtime is
+     auto-opened during resume, so the root deterministically claims before any
+     secondary can exist. **Scoped to this app-server only** — plain `codex` sessions
+     keep agent-peers optional and still degrade gracefully when the broker is down.
+
+  Phase 1 (materialize) remains a separate throwaway app-server with agent-peers
+  fully **disabled**, so it never joins the election and cannot steal the claim.
+  Verify with `codexpeer live`: a healthy launch shows exactly **one** wakeable
+  identity per repo (no `-2`). See
+  `.specs/2026-06-25-wakeable-codex-peer-delivery-fix-spec.md` for the original
+  two-app-server work and `bd-di5` for the election.
 - **Launcher plumbing stays out of the session window.** Both app-servers send
   stdout/stderr to a private, per-peer bounded log under
-  `~/.agent-peers-codex/logs/`; the launcher uses the normal alternate screen;
-  and the materialization turn is removed with `thread/rollback` before the
-  visible TUI attaches. The raw rollout retains its append-only audit events,
-  but the logical thread has zero visible turns. Set `CODEX_PEER_VERBOSE=1` to
-  restore the normally-hidden launcher status lines while debugging.
+  `~/.agent-peers-codex/logs/`, and the launcher uses the normal alternate screen.
+  Materialization itself is now invisible by construction rather than by cleanup:
+  `thread/name/set` persists the rollout without running a turn, so there is no
+  bootstrap turn to hide and the session opens at a clean prompt. Set
+  `CODEX_PEER_VERBOSE=1` to restore the normally-hidden launcher status lines while
+  debugging.
 - **An MCP exits when its owning app-server dies.** The Codex MCP watches its
   original direct parent and exits if it is reparented to launchd. This closes
   the Bun stdio edge case that left dead sessions heartbeating as live peers.
 - **The TUI "working" spinner can lie — trust `thread_status=` in `codexpeer live`.**
-  The materialize handshake and every daemon wake are injected into the thread by an
-  *external* client (the launcher / wake daemon), not the TUI. The `--remote` TUI
+  Every daemon wake is injected into the thread by an *external* client (the wake
+  daemon), not the TUI. (Materialization no longer contributes: it runs no turn at
+  all now — see the launcher-plumbing note above.) The `--remote` TUI
   renders a "working" animation for turns it didn't initiate and **does not clear it**
   when such a turn finishes — so an idle, ready-to-wake session can *look* hung
   ("working" forever; Esc does nothing). It isn't hung: the thread is `idle`.
@@ -262,7 +307,11 @@ The wake path is covered by focused tests:
 - `tests/wake-registry.test.ts` — persistence, dedupe, liveness filtering, perms, GC
 - `tests/wake-launch-claims.test.ts` — claim matching, consumed-claim reuse, ambiguity surfacing, GC
 - `tests/wakeable-launcher.test.ts` — arg/env/config construction and full-screen defaults (no secret leakage into env)
-- `tests/app-server-client.test.ts` — connect/request timeouts and bootstrap rollback
+- `tests/app-server-client.test.ts` — connect/request timeouts, and that materialization
+  uses `thread/name/set` and issues **no** `turn/start` or `thread/rollback`
+- `tests/wake-launch-role.test.ts` — single-identity election: a standalone `codex`
+  session still registers, exactly one of N concurrent live children wins the root
+  lock, and a lock held by a dead process is reclaimable
 - `tests/bounded-log.test.ts` — private log paths, permissions, and rotation
 - `tests/process-lifecycle.test.ts` — orphan-parent detection safety boundary
 - `tests/codex-inbox-store.test.ts` — durable queue + bodyless metadata + fail-closed perms
