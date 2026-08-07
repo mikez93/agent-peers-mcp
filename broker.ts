@@ -630,14 +630,20 @@ export interface ProtectionQueryEntry {
   start_time?: string | null;
 }
 
-/** `ps` start-time string for a pid, or null if it is gone. Both sides derive
- *  identity the same way (`ps -o lstart= -p <pid>`), so the strings compare. */
+/** Canonical `ps` start-time identity. macOS pads single-digit month days with
+ *  an extra space; callers may already have collapsed that presentation-only
+ *  whitespace. Normalize every whitespace run on both sides before comparing. */
+function canonicalStartTime(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+/** `ps` start-time string for a pid, or null if it is gone. */
 function processStartTime(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     const p = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
     if (p.exitCode !== 0) return null;
-    const s = new TextDecoder().decode(p.stdout).trim();
+    const s = canonicalStartTime(new TextDecoder().decode(p.stdout));
     return s.length > 0 ? s : null;
   } catch { return null; }
 }
@@ -770,7 +776,7 @@ export function checkProtection(db: Database, entries: ProtectionQueryEntry[]) {
     }
     // Identity fence against PID reuse: if the caller's start_time disagrees
     // with ours, the pid it classified is NOT the pid we are looking at.
-    if (entry.start_time && entry.start_time.trim() !== observedStart) {
+    if (entry.start_time && canonicalStartTime(entry.start_time) !== observedStart) {
       return { pid, protected: false, reason: "identity_mismatch", start_time: observedStart };
     }
     const isProtected = protectedPids.has(pid);

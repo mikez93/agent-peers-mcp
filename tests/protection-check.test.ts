@@ -55,6 +55,16 @@ test("identity fence passes when start_time matches the live process", () => {
   expect(res.results[0]!.protected).toBe(true);
 });
 
+test("identity fence treats macOS day-padding whitespace as presentation only", () => {
+  const collapsed = startTimeOf(process.pid).replace(/\s+/g, " ");
+  const res = checkProtection(handle.db, [
+    { pid: process.pid, start_time: collapsed },
+  ]);
+  expect(res.results[0]!.protected).toBe(true);
+  expect(res.results[0]!.reason).toBe("live_agent_session_tree");
+  expect(res.results[0]!.start_time).toBe(collapsed);
+});
+
 test("a pid that no longer exists is process_not_found, never protected", () => {
   const res = checkProtection(handle.db, [{ pid: 999_999 }]);
   expect(res.results[0]!.protected).toBe(false);
