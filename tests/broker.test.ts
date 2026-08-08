@@ -16,6 +16,8 @@ import {
   renamePeer,
   gcStalePeers,
   listOrphanedMessages,
+  DURABLE_RETENTION_MS,
+  MAX_QUEUED_PER_DURABLE_PEER,
 } from "../broker.ts";
 import type { Database } from "bun:sqlite";
 import { unlinkSync, existsSync } from "node:fs";
@@ -342,16 +344,109 @@ test("sendMessage with stale sender is rejected", () => {
   expect(res.error).toMatch(/sender stale/i);
 });
 
-test("sendMessage to stale target is rejected", () => {
+test("sendMessage to a stale EPHEMERAL target is rejected", () => {
   const a = reg({ name: "alpha" });
-  const b = reg({ name: "beta" });
+  // No requested name → generated adjective-noun → a session tab. When it goes
+  // stale it is gone for good, so a message to it really would orphan.
+  const b = reg({});
   db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
     .run("1970-01-01T00:00:00.000Z", b.id);
   const res = sendMessage(db, {
-    from_id: a.id, session_token: a.session_token, to_id_or_name: "beta", text: "hi",
+    from_id: a.id, session_token: a.session_token, to_id_or_name: b.name, text: "hi",
   });
   expect(res.ok).toBe(false);
   expect(res.error).toMatch(/target peer stale/i);
+});
+
+test("sendMessage to a stale DURABLE target is QUEUED, not rejected", () => {
+  // The regression that broke cross-agent messaging: a Hermes agent stops
+  // heartbeating between turns, so within 60s every message to it failed.
+  // A peer that asked for its own name is a named agent, not a tab.
+  const a = reg({ name: "alpha" });
+  const b = reg({ name: "ezra-hermes" });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("1970-01-01T00:00:00.000Z", b.id);
+
+  const res = sendMessage(db, {
+    from_id: a.id, session_token: a.session_token, to_id_or_name: "ezra-hermes", text: "hi",
+  });
+  expect(res.ok).toBe(true);
+
+  // And it is actually readable when the agent's next turn re-registers it.
+  const back = reg({ name: "ezra-hermes" });
+  expect(back.id).toBe(b.id); // identity preserved across the idle gap
+  const got = pollMessages(db, back.id, back.session_token);
+  expect(got.map((m) => m.text)).toEqual(["hi"]);
+});
+
+test("a durable peer survives GC across an idle gap; an ephemeral one does not", () => {
+  const named = reg({ name: "marco-hermes" });
+  const tab = reg({});
+  const tenMinutesAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+  db.query("UPDATE peers SET last_seen = ?").run(tenMinutesAgo);
+
+  gcStalePeers(db);
+
+  expect(getPeer(db, named.id)).not.toBeNull();
+  expect(getPeer(db, tab.id)).toBeNull();
+});
+
+test("a durable peer IS eventually collected, past DURABLE_RETENTION_MS", () => {
+  // Durable must mean "retained", not "immortal".
+  const named = reg({ name: "long-gone-agent" });
+  const past = new Date(Date.now() - DURABLE_RETENTION_MS - 60_000).toISOString();
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(past, named.id);
+
+  gcStalePeers(db);
+
+  expect(getPeer(db, named.id)).toBeNull();
+});
+
+test("a durable peer is still HIDDEN from discovery while idle", () => {
+  // Retention must not resurrect the ghost-peer UX bug: an idle agent is
+  // addressable by name but must not appear in the roster as if it were live.
+  const named = reg({ name: "idle-agent" });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run(new Date(Date.now() - 10 * 60_000).toISOString(), named.id);
+
+  const visible = listPeers(db, { scope: "machine", cwd: "/x", git_root: null })
+    .map((p) => p.name);
+  expect(visible).not.toContain("idle-agent");
+  // ...but still reachable, which is the whole point.
+  expect(getPeerByName(db, "idle-agent")).not.toBeNull();
+});
+
+test("a durable peer's mailbox is bounded", () => {
+  const a = reg({ name: "alpha" });
+  const b = reg({ name: "sink-agent" });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("1970-01-01T00:00:00.000Z", b.id);
+
+  const send = () => sendMessage(db, {
+    from_id: a.id, session_token: a.session_token, to_id_or_name: "sink-agent", text: "x",
+  });
+  for (let i = 0; i < MAX_QUEUED_PER_DURABLE_PEER; i++) {
+    expect(send().ok).toBe(true);
+  }
+  const overflow = send();
+  expect(overflow.ok).toBe(false);
+  expect(overflow.error).toMatch(/mailbox full/i);
+});
+
+test("the suffix-ladder fallback name is NOT durable", () => {
+  // Only a peer's own requested name is an identity worth retaining. A second
+  // concurrent Ezra that got renamed to `ezra-hermes-otter` is not the address
+  // anyone sends to, so it must not squat the registry for a week.
+  const first = reg({ name: "dup-agent" });
+  const second = reg({ name: "dup-agent" }); // first is LIVE → ladder renames
+  expect(second.name).not.toBe(first.name);
+
+  db.query("UPDATE peers SET last_seen = ?")
+    .run(new Date(Date.now() - 10 * 60_000).toISOString());
+  gcStalePeers(db);
+
+  expect(getPeer(db, first.id)).not.toBeNull();
+  expect(getPeer(db, second.id)).toBeNull();
 });
 
 // ---------- pollMessages ----------

@@ -24,6 +24,31 @@ export const STALE_THRESHOLD_MS = 60_000;
 export const STALE_RECLAIM_THRESHOLD_MS = 60_000;
 export const LEASE_DURATION_MS = 30_000;
 export const GC_INTERVAL_MS = 30_000;
+// How long a DURABLE peer's registry row (identity + mailbox) survives without
+// a heartbeat. Ephemeral peers are still deleted at STALE_THRESHOLD_MS.
+//
+// Why this exists: a Hermes agent starts its MCP servers per TURN and tears
+// them down afterwards, so it stops heartbeating the moment it finishes
+// replying. With a single 60s threshold governing both "hide from discovery"
+// and "delete the row", a named agent was deleted from the registry between
+// turns — observed 2026-08-08, when marco-hermes sent a message and was
+// unaddressable nine minutes later ("unknown peer: marco-hermes"). Worse,
+// STALE_RECLAIM_THRESHOLD_MS equalled the GC cutoff, so a row became
+// reclaimable and deletable at the same instant; with GC running every 30s AND
+// opportunistically inside every listPeers() call, GC essentially always won
+// and the reclaim-by-name fast path below was unreachable on a busy network.
+// That cost named agents their stable UUID, orphaned their queued mail, and
+// let them collide with their own not-yet-collected ghost (the observed
+// `ezra-hermes-2`).
+//
+// Discovery is unaffected: listPeers() still hides anything past
+// STALE_THRESHOLD_MS, so a closed tab never lingers as a visible ghost.
+export const DURABLE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+// Bound on undelivered messages held for a single durable peer that has not
+// come back. Without a cap, a permanently-departed named agent turns its
+// mailbox into an unbounded sink. Senders get a clear error rather than a
+// silent drop; the backlog stays visible via `bun cli.ts orphaned-messages`.
+export const MAX_QUEUED_PER_DURABLE_PEER = 500;
 export const SECRET_HEADER = "x-agent-peers-secret";
 
 function nowIso(): string { return new Date().toISOString(); }
@@ -99,7 +124,8 @@ export function initDb(path: string): Database {
       summary       TEXT DEFAULT '',
       session_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
-      last_seen     TEXT NOT NULL
+      last_seen     TEXT NOT NULL,
+      durable       INTEGER NOT NULL DEFAULT 0
     );
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`);
@@ -126,6 +152,13 @@ export function initDb(path: string): Database {
 
   migrate_peers_add_session_token(db);
   migrate_peers_add_hermes_peer_type(db);
+  // MUST stay last among the peers migrations. Both migrations above can
+  // rebuild the peers table through a shadow-table copy whose column list is
+  // written out literally, so either one would silently drop `durable` if it
+  // ran afterwards. Adding the column last means those rebuilds never see it.
+  // The migration is idempotent, so even if a future rebuild does drop it, the
+  // next startup re-adds it and peers re-flag themselves on re-registration.
+  migrate_peers_add_durable(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -252,6 +285,24 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_name ON peers(name);`);
 }
 
+function migrate_peers_add_durable(db: Database): void {
+  // Wrapped in BEGIN IMMEDIATE for the same reason as the session_token
+  // migration: concurrent broker startups must serialize the check + ALTER.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!columnExists(db, "peers", "durable")) {
+      // Default 0 — every pre-existing row is treated as ephemeral. That is the
+      // conservative direction: it preserves the old delete-at-60s behaviour
+      // until a peer re-registers under a requested name and re-flags itself.
+      db.exec(`ALTER TABLE peers ADD COLUMN durable INTEGER NOT NULL DEFAULT 0`);
+    }
+    db.exec("COMMIT");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
+  }
+}
+
 function migrate_peers_add_hermes_peer_type(db: Database): void {
   const row = db.query<{ sql: string | null }, []>(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'peers'"
@@ -294,13 +345,19 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   // boundary.
   const session_token = randomUUID();
 
+  // A peer that asked for a specific name (PEER_NAME) is a long-lived, named
+  // agent — Ezra, Marco, Vector — that reliably comes back under that name.
+  // A peer that took a generated adjective-noun name is a session tab: when it
+  // closes it is gone for good. Only the former earns durable retention.
+  const durable = req.name && isValidName(req.name) ? 1 : 0;
+
   // Reclaim fast-path: stale peer with matching name → UPDATE in place, preserve UUID.
   if (req.name && isValidName(req.name)) {
     const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
     const reclaim = db.query(
       `UPDATE peers
          SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
-             session_token = ?, last_seen = ?
+             session_token = ?, last_seen = ?, durable = 1
        WHERE name = ? AND last_seen < ?`
     ).run(
       req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
@@ -329,14 +386,19 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   // Fresh INSERT with suffix ladder.
   const id = randomUUID();
   const insert = db.query(
-    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen, durable)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   for (const candidate of nameCandidates(req.name)) {
     try {
       insert.run(
         id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
         session_token, ts, ts,
+        // Only the peer's OWN requested name is durable. If the suffix ladder
+        // had to rename it (a genuine concurrent duplicate — a second live
+        // Ezra), the fallback name is not the identity anyone addresses, so it
+        // stays ephemeral rather than being retained for a week.
+        candidate === req.name ? durable : 0,
       );
       return { id, name: candidate, session_token };
     } catch (e) {
@@ -485,28 +547,51 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
       return { ok: false, error: `sender stale: ${row.name}` };
     }
 
-    // 2. Target resolution + liveness + insert in ONE statement. The insert
-    //    only succeeds if the target resolves to a LIVE peer row. If the
-    //    target is unregistered or goes stale between the sender check and
-    //    the insert, we fail closed with ok=false rather than writing an
-    //    orphan.
+    // 2. Target resolution + deliverability + insert in ONE statement, so
+    //    nothing can unregister between the check and the write.
+    //
+    //    A target is deliverable if it is LIVE, or if it is DURABLE. The
+    //    original rule was live-only, to avoid writing a message no one would
+    //    ever read. That is still right for an ephemeral peer — a closed tab
+    //    never returns, so the message really would orphan. It is wrong for a
+    //    named agent: it is merely between turns, and refusing the write turns
+    //    "your colleague is idle" into "your colleague does not exist". The
+    //    message waits in its mailbox and the reclaim path hands it over on
+    //    the peer's next registration.
     const inserted = db.query<
       { id: number; to_id: string },
-      [string, string, string, string, string, string]
+      [string, string, string, string, string, string, string]
     >(
       `INSERT INTO messages (from_id, to_id, text, sent_at)
        SELECT ?, p.id, ?, ?
        FROM peers p
        WHERE (p.id = ? OR p.name = ?)
-         AND p.last_seen >= ?
+         AND (p.last_seen >= ? OR p.durable = 1)
+         AND (
+           p.last_seen >= ?
+           OR (SELECT COUNT(*) FROM messages m
+                WHERE m.to_id = p.id AND m.acked = 0) < ${MAX_QUEUED_PER_DURABLE_PEER}
+         )
        RETURNING id, to_id`
-    ).get(req.from_id, req.text, nowStr, req.to_id_or_name, req.to_id_or_name, staleCutoff);
+    ).get(
+      req.from_id, req.text, nowStr, req.to_id_or_name, req.to_id_or_name,
+      staleCutoff, staleCutoff,
+    );
 
     if (!inserted) {
-      // Either no peer matches the id-or-name, or the matched peer is stale.
-      // Distinguish for a better error.
+      // Distinguish the three failure modes for a usable error.
       const target = resolveTarget(db, req.to_id_or_name);
       if (!target) return { ok: false, error: `unknown peer: ${req.to_id_or_name}` };
+      const backlog = db.query<{ n: number }, [string]>(
+        "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND acked = 0"
+      ).get(target.id);
+      if ((backlog?.n ?? 0) >= MAX_QUEUED_PER_DURABLE_PEER) {
+        return {
+          ok: false,
+          error: `target peer mailbox full: ${target.name} ` +
+                 `(${backlog?.n} undelivered; it has not polled since ${target.last_seen})`,
+        };
+      }
       return { ok: false, error: `target peer stale: ${target.name}` };
     }
     return { ok: true, message_id: inserted.id };
@@ -620,8 +705,23 @@ export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResp
 // ----- GC -----
 
 export function gcStalePeers(db: Database): number {
-  const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
-  const info = db.query("DELETE FROM peers WHERE last_seen < ?").run(cutoff);
+  // Two-tier retention. Ephemeral peers (generated names — session tabs) are
+  // deleted as soon as they go stale, which is what keeps a closed tab from
+  // lingering. Durable peers (named agents) keep their row, and therefore
+  // their UUID and their undelivered mail, until DURABLE_RETENTION_MS.
+  //
+  // Deleting a durable peer at the staleness cutoff is what broke cross-agent
+  // messaging: a Hermes agent stops heartbeating between turns, so it was
+  // erased from the registry within 60s of finishing a reply and every message
+  // to it then failed with "unknown peer".
+  const now = Date.now();
+  const staleCutoff = new Date(now - STALE_THRESHOLD_MS).toISOString();
+  const durableCutoff = new Date(now - DURABLE_RETENTION_MS).toISOString();
+  const info = db.query(
+    `DELETE FROM peers
+      WHERE (durable = 0 AND last_seen < ?)
+         OR (durable = 1 AND last_seen < ?)`
+  ).run(staleCutoff, durableCutoff);
   return info.changes ?? 0;
 }
 

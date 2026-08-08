@@ -13,7 +13,7 @@
 // TELL the client what it actually did, and for the client to act on being told.
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { startBroker, heartbeatPeer, registerPeer, gcStalePeers } from "../broker.ts";
+import { startBroker, heartbeatPeer, registerPeer, gcStalePeers, DURABLE_RETENTION_MS } from "../broker.ts";
 import { unlinkSync, existsSync, readFileSync } from "node:fs";
 
 const TEST_DB = "/tmp/agent-peers-hb-evict-" + Date.now() + ".db";
@@ -47,10 +47,15 @@ test("a live peer's heartbeat is acknowledged as KNOWN", () => {
 test("THE BUG: a heartbeat from an evicted peer must report NOT-known, not silent success", () => {
   const me = enroll("hb-evicted");
 
-  // Simulate the real sequence: the broker was down >60s, so on its next sweep
-  // gcStalePeers deletes this peer. We backdate last_seen rather than sleeping.
+  // Simulate the real sequence: the peer is gone long enough for gcStalePeers
+  // to delete it on its next sweep. We backdate last_seen rather than sleeping.
+  // `enroll` requests a name, which makes this peer DURABLE, so it is retained
+  // across ordinary idle gaps — the eviction horizon here is
+  // DURABLE_RETENTION_MS, not STALE_THRESHOLD_MS. The subject of this test is
+  // what a heartbeat reports AFTER eviction, so what matters is only that the
+  // row is genuinely gone.
   handle.db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
-    .run(new Date(Date.now() - 10 * 60_000).toISOString(), me.id);
+    .run(new Date(Date.now() - DURABLE_RETENTION_MS - 60_000).toISOString(), me.id);
   expect(gcStalePeers(handle.db)).toBeGreaterThan(0);
 
   // The client has NO idea. It heartbeats exactly as before, with credentials
