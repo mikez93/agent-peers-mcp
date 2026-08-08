@@ -160,6 +160,15 @@ export function buildResumeMcpConfigArgs(peerName?: string): string[] {
   ];
 }
 
+export function buildFreshThreadModelConfigArgs(threadId?: string): string[] {
+  return threadId
+    ? []
+    : [
+        "-c", 'model="gpt-5.6-sol"',
+        "-c", 'model_reasoning_effort="high"',
+      ];
+}
+
 export function buildMaterializeMcpConfigArgs(peerName?: string): string[] {
   // Config for the SHORT-LIVED materialize app-server (phase 1 of the launch).
   // Its only job is to run one setup turn so the rollout exists on disk; its
@@ -245,6 +254,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
     const appServerUrl = `ws://127.0.0.1:${port}`;
     const appServer = spawnLoggedAppServer([
       "codex",
+      ...buildFreshThreadModelConfigArgs(opts.threadId),
       ...buildResumeMcpConfigArgs(opts.peerName),
       "app-server",
       "--listen",
@@ -281,7 +291,14 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
         rolloutPath: thread.path,
         peerName: opts.peerName,
         noAltScreen: opts.noAltScreen,
-        extraCodexArgs: opts.extraCodexArgs,
+        // Remote TUI resume sends its own thread settings to app-server. Give
+        // fresh sessions the same defaults here as phase 1/2, while keeping
+        // saved settings for an explicit `codexpeer resume`. Caller-provided
+        // args remain last so a one-off model choice still wins.
+        extraCodexArgs: [
+          ...buildFreshThreadModelConfigArgs(opts.threadId),
+          ...opts.extraCodexArgs,
+        ],
       });
       const env = buildWakeableEnv({
         baseEnv: process.env,
@@ -336,7 +353,11 @@ async function materializeThread(
     await waitForReadyz(matPort, appServerLog.path);
     const client = new CodexAppServerWsClient(matUrl);
     try {
-      const thread = await client.startThread({ cwd: opts.cwd });
+      const thread = await client.startThread({
+        cwd: opts.cwd,
+        model: "gpt-5.6-sol",
+        modelReasoningEffort: "high",
+      });
       if (opts.materialize) {
         // Naming the thread persists its rollout with no model turn. See
         // CodexAppServerWsClient.setThreadName for why this replaced the old

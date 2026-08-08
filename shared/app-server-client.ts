@@ -107,10 +107,18 @@ export class CodexAppServerWsClient implements AppServerClient {
     return Array.isArray(data) ? data.filter((id): id is string => typeof id === "string") : [];
   }
 
-  async startThread(params: { cwd: string }): Promise<AppServerThread> {
+  async startThread(params: {
+    cwd: string;
+    model?: string;
+    modelReasoningEffort?: string;
+  }): Promise<AppServerThread> {
     await this.connect();
     const result = await this.request("thread/start", {
       cwd: params.cwd,
+      ...(params.model ? { model: params.model } : {}),
+      ...(params.modelReasoningEffort
+        ? { config: { model_reasoning_effort: params.modelReasoningEffort } }
+        : {}),
     });
     const thread = (result as { thread?: AppServerThread }).thread;
     if (!thread || typeof thread.id !== "string") {

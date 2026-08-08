@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import {
   buildCodexResumeArgs,
+  buildFreshThreadModelConfigArgs,
   buildMaterializeMcpConfigArgs,
   buildMcpEnvConfigArgs,
   buildMcpPeerNameConfigArgs,
@@ -214,6 +215,16 @@ test("the resume app-server marks its MCPs as a wakeable launch and requires the
   expect(args).toContain(`mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_LAUNCH="1"`);
   expect(args).toContain("mcp_servers.agent-peers.required=true");
   expect(args).toContain(`mcp_servers.agent-peers.env.PEER_NAME="brisk-bison"`);
+});
+
+test("fresh wakeable threads start on Sol high while resumed threads keep saved settings", () => {
+  expect(buildFreshThreadModelConfigArgs()).toEqual([
+    "-c",
+    'model="gpt-5.6-sol"',
+    "-c",
+    'model_reasoning_effort="high"',
+  ]);
+  expect(buildFreshThreadModelConfigArgs("thread-existing")).toEqual([]);
 });
 
 test("the wake-launch marker is set even when no peer name was requested", () => {
