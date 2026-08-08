@@ -496,22 +496,30 @@ async function cmdOrphans() {
 }
 
 async function cmdKillBroker() {
-  const proc = Bun.spawn(["lsof", "-t", "-i", `:${BROKER_PORT}`], {
-    stdout: "pipe", stderr: "ignore",
-  });
-  const out = (await new Response(proc.stdout).text()).trim();
-  await proc.exited;
-  if (!out) {
+  let health: { pid?: unknown };
+  try {
+    const response = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2_000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    health = await response.json() as { pid?: unknown };
+  } catch {
     console.log("broker not running");
     return;
   }
-  for (const pid of out.split("\n")) {
-    try {
-      process.kill(Number(pid), "SIGTERM");
-      console.log(`killed pid=${pid}`);
-    } catch (e) {
-      console.error(`kill ${pid} failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+
+  const pid = health.pid;
+  if (!Number.isInteger(pid) || (pid as number) <= 1) {
+    throw new Error(`broker health returned an invalid pid: ${String(pid)}`);
+  }
+
+  // Do not use `lsof -i :PORT` here: it returns both the listener and every
+  // established MCP client connection. The old implementation therefore
+  // killed the broker AND every live peer. The broker's own health payload is
+  // the authoritative single target.
+  try {
+    process.kill(pid as number, "SIGTERM");
+    console.log(`killed broker pid=${pid}`);
+  } catch (e) {
+    console.error(`kill broker pid=${pid} failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 

@@ -139,3 +139,28 @@ test("setThreadName materializes via thread/name/set and never runs a turn", asy
   expect(methods).not.toContain("thread/rollback");
   client.close();
 });
+
+test("reloadMcpServers uses the app-server's in-place MCP reload method", async () => {
+  const seen: Array<{ method?: string; params?: unknown }> = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch(req, srv) {
+      if (srv.upgrade(req)) return undefined;
+      return new Response("not a websocket", { status: 400 });
+    },
+    websocket: {
+      message(ws, raw) {
+        const request = JSON.parse(String(raw)) as { id: number; method?: string; params?: unknown };
+        seen.push(request);
+        ws.send(JSON.stringify({ id: request.id, result: {} }));
+      },
+    },
+  });
+  stoppers.push(() => server.stop(true));
+
+  const client = new CodexAppServerWsClient(`ws://127.0.0.1:${server.port}`);
+  await client.reloadMcpServers();
+
+  expect(seen.find((request) => request.method === "config/mcpServer/reload")?.params).toBeNull();
+  client.close();
+});

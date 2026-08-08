@@ -153,6 +153,12 @@ export class CodexAppServerWsClient implements AppServerClient {
     await this.request("thread/name/set", { threadId, name });
   }
 
+  /** Restart configured MCP subprocesses without replacing the live thread. */
+  async reloadMcpServers(): Promise<void> {
+    await this.connect();
+    await this.request("config/mcpServer/reload", null);
+  }
+
   async startWakeTurn(params: {
     threadId: string;
     clientUserMessageId: string;

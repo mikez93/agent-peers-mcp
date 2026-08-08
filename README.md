@@ -244,7 +244,7 @@ bun cli.ts peers                         # Peers only
 bun cli.ts send frontend-tab "ship it"   # Send a message from the shell
 bun cli.ts rename calm-fox docs-writer   # Admin rename (operator action)
 bun cli.ts orphaned-messages             # Messages to peers that died
-bun cli.ts kill-broker                   # Stop the broker daemon
+bun cli.ts kill-broker                   # Stop only the broker daemon (peers stay running)
 ```
 
 Run these from inside the cloned `agent-peers-mcp/` directory.
