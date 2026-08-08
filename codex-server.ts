@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 // codex-server.ts
-// MCP stdio server for Codex CLI. Registers as peer_type="codex".
+// Durable polling MCP stdio server for Codex CLI and Hermes Agent.
+// Defaults to peer_type="codex"; hermes-server.ts selects peer_type="hermes".
 //
 // DELIVERY PIPELINE — two layers with a strict division of labor, driven
 // by one invariant: no message is acked to the broker (nor pruned from
@@ -82,7 +83,7 @@ import { planWaitForPeerMessages, waitForFreshPeerMessages as waitForFreshPeerMe
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
-import type { PeerId, LeasedMessage } from "./shared/types.ts";
+import type { PeerId, LeasedMessage, PeerType } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -91,9 +92,12 @@ const HEARTBEAT_INTERVAL_MS = parseInt(process.env.AGENT_PEERS_HEARTBEAT_MS ?? "
 const WAIT_FOR_MESSAGES_DEFAULT_MS = 300_000;
 const WAIT_FOR_MESSAGES_MAX_MS = 300_000;
 const WAIT_FOR_MESSAGES_POLL_MS = 500;
+const RUNTIME_PEER_TYPE: PeerType = process.env.AGENT_PEERS_RUNTIME === "hermes" ? "hermes" : "codex";
+const RUNTIME_DISPLAY_NAME = RUNTIME_PEER_TYPE === "hermes" ? "Hermes" : "Codex";
+const RUNTIME_IS_CODEX = RUNTIME_PEER_TYPE === "codex";
 
 function log(msg: string) {
-  console.error(`[agent-peers/codex] ${msg}`);
+  console.error(`[agent-peers/${RUNTIME_PEER_TYPE}] ${msg}`);
 }
 
 let client: ReturnType<typeof createClient>;
@@ -135,9 +139,9 @@ const mcp = new Server(
     capabilities: { logging: {}, tools: {} },
     instructions: `${COLLEAGUE_PROTOCOL}
 
-DELIVERY ON THIS SIDE (Codex) — READ CAREFULLY, THIS IS LOAD-BEARING:
+DELIVERY ON THIS SIDE (${RUNTIME_DISPLAY_NAME}) — READ CAREFULLY, THIS IS LOAD-BEARING:
 
-The current Codex CLI does NOT surface mid-task MCP push notifications
+${RUNTIME_IS_CODEX ? "The current Codex CLI does NOT surface mid-task MCP push notifications" : "Do not assume this Hermes session will surface MCP messages while the agent is idle"}
 to the model. That means you do not see peer messages the instant they
 arrive — you only see them when YOU call an agent-peers tool. A peer
 can send you a DM at 10:00; if you don't touch agent-peers until 10:20,
@@ -164,7 +168,8 @@ session, call \`wait_for_peer_messages\` with a bounded timeout. It keeps
 this same Codex turn alive until messages arrive or the timeout expires; it
 is not the same as waking a fully idle session.
 
-If this is a WAKEABLE session (launched via \`codex-peer\` — an external
+If this is a WAKEABLE Codex session (launched through the transparent
+app-server-backed Codex path — an external
 daemon starts a fresh turn the instant a peer message arrives), do NOT call
 \`wait_for_peer_messages\` to await a reply: just finish your turn and go
 idle. The daemon wakes you on arrival. Blocking would only pin this turn
@@ -180,9 +185,9 @@ DELIVERY CHANNELS:
      rules above.
 
   2. A best-effort MCP \`notifications/message\` log push also fires
-     on each background poll tick, but current Codex CLI does not
-     expose these to the model. Treat the [PEER INBOX] block as your
-     only input. Path (2) is future-compatible plumbing.`,
+     on each background poll tick. Treat the [PEER INBOX] block as the
+     authoritative input regardless of whether ${RUNTIME_DISPLAY_NAME}
+     surfaces that notification.`,
   },
 );
 
@@ -194,7 +199,7 @@ const TOOLS = [
       type: "object" as const,
       properties: {
         scope: { type: "string" as const, enum: ["machine", "directory", "repo"] },
-        peer_type: { type: "string" as const, enum: ["claude", "codex"] },
+        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes"] },
       },
       required: ["scope"],
     },
@@ -223,13 +228,13 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Surface peer messages waiting in the inbox. Call this at the START of every user turn — Codex only sees peer messages on the response of an agent-peers tool call, so without this habit, messages sent while you were idle (or working on non-peer tools) wait invisibly. One cheap call.",
+      `Surface peer messages waiting in the inbox. Call this at the START of every user turn — ${RUNTIME_DISPLAY_NAME} receives authoritative message content through an agent-peers tool response. One cheap call.`,
     inputSchema: { type: "object" as const, properties: {} },
   },
   {
     name: "wait_for_peer_messages",
     description:
-      "Stand by for incoming peer messages for up to timeout_ms, then surface them through the normal [PEER INBOX] tool-response path. This keeps this same Codex turn alive; it is not a fully idle wake mechanism. NOTE: in a wakeable session (one launched via `codex-peer`, where a wake daemon starts a fresh turn on message arrival) this returns IMMEDIATELY without blocking — you do not need to wait, just end your turn and go idle. Only use this to block the current turn in a non-wakeable session.",
+      `Stand by for incoming peer messages for up to timeout_ms, then surface them through the normal [PEER INBOX] tool-response path. This keeps this same ${RUNTIME_DISPLAY_NAME} turn alive; it is not a fully idle wake mechanism. In a wakeable Codex session this returns immediately; otherwise it performs a bounded wait.`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -554,7 +559,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "list_peers": {
         const { scope, peer_type } = args as {
           scope: "machine" | "directory" | "repo";
-          peer_type?: "claude" | "codex";
+          peer_type?: PeerType;
         };
         const peers = await client.listPeers({
           scope, cwd: myCwd, git_root: myGitRoot, exclude_id: myId!, peer_type,
@@ -714,7 +719,7 @@ async function main() {
   // See shared/wake-launch-role.ts for why no spawn-time thread id exists.
   const electionCwd = process.cwd();
   const electionTty = getTty();
-  const wakeLaunch = isWakeLaunchEnv(process.env);
+  const wakeLaunch = RUNTIME_IS_CODEX && isWakeLaunchEnv(process.env);
   if (wakeLaunch) {
     const claimStore = new WakeLaunchClaimStore();
     const claim = await claimStore.findMatching({
@@ -780,7 +785,7 @@ async function main() {
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
   const reg = await client.register({
-    peer_type: "codex",
+    peer_type: RUNTIME_PEER_TYPE,
     name: process.env.PEER_NAME,
     pid: process.pid,
     cwd: myCwd,
@@ -793,14 +798,16 @@ async function main() {
   mySession = reg.session_token;
   inboxStore = new CodexInboxStore({ peerId: myId });
   await inboxStore.init();
-  await registerWakeableSessionIfEnabled({
-    peerId: myId,
-    peerName: myName,
-    sessionToken: mySession,
-    cwd: myCwd,
-    gitRoot: myGitRoot,
-    tty,
-  });
+  if (RUNTIME_IS_CODEX) {
+    await registerWakeableSessionIfEnabled({
+      peerId: myId,
+      peerName: myName,
+      sessionToken: mySession,
+      cwd: myCwd,
+      gitRoot: myGitRoot,
+      tty,
+    });
+  }
   setTabTitle(`peer:${myName}`);
   // Note: keepalive was already armed earlier in main(), before register().
   // The setTabTitle above just updates `lastTitle`; the running keepalive
@@ -857,7 +864,7 @@ async function main() {
       try {
         log(`Broker no longer knows us (id=${myId}) — evicted, most likely a broker outage >60s. Re-registering as ${myName}.`);
         const again = await client.register({
-          peer_type: "codex",
+          peer_type: RUNTIME_PEER_TYPE,
           name: myName ?? process.env.PEER_NAME,
           pid: process.pid,
           cwd: myCwd,
@@ -868,14 +875,16 @@ async function main() {
         myId = again.id;
         myName = again.name;
         mySession = again.session_token;
-        await registerWakeableSessionIfEnabled({
-          peerId: myId,
-          peerName: myName,
-          sessionToken: mySession,
-          cwd: myCwd,
-          gitRoot: myGitRoot,
-          tty,
-        });
+        if (RUNTIME_IS_CODEX) {
+          await registerWakeableSessionIfEnabled({
+            peerId: myId,
+            peerName: myName,
+            sessionToken: mySession,
+            cwd: myCwd,
+            gitRoot: myGitRoot,
+            tty,
+          });
+        }
         log(`Rejoined the network as ${myName} (id=${myId})`);
       } catch (e) {
         // Broker still down, or refusing. Stay evicted and try again next tick —

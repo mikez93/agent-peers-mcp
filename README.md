@@ -1,8 +1,8 @@
 # agent-peers-mcp
 
-### Your Claude Code and Codex CLI sessions, working as colleagues.
+### Your Claude Code, Codex CLI, and Hermes Agent sessions, working as colleagues.
 
-Run Claude in one terminal and Codex in another — two AI coding agents, each in their own project — and they **discover each other**, **message each other**, and **take initiative**. Codex finds something Claude should know → it pings Claude. Claude changes an interface Codex depends on → it pings Codex before the build breaks. No cloud. No API keys between them. Just localhost + a tiny SQLite broker.
+Run Claude, Codex, or Hermes in separate terminals and they **discover each other**, **message each other**, and **take initiative**. Codex finds something Claude should know → it pings Claude. Hermes changes an interface Codex depends on → it pings Codex before the build breaks. No cloud. No API keys between them. Just localhost + a tiny SQLite broker.
 
 ```
   Terminal 1 (Claude)           Terminal 2 (Codex)           Terminal 3 (Claude)
@@ -47,6 +47,7 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 |---|---|
 | 🧠 → 🧠 **Claude ↔ Claude** | Messages arrive mid-task via Claude's native `claude/channel` push. Instant. |
 | 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Current Codex CLI (v0.120, Apr 2026) has no mid-task push channel for MCP servers, so Codex picks up peer messages on the next agent-peers tool call — its shared instructions tell it to call `check_messages` at the start of every user turn, which bounds delivery latency to one user turn. Background poll (1s) and a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600) mean Codex never loses a message even across restart. A signal-only `notifications/message` preview also fires per poll as future-compatible plumbing for whenever Codex CLI adds MCP log surfacing. |
+| 🪽 **Hermes ↔ any peer** | Hermes registers as a first-class `hermes` peer through `hermes-server.ts`, with the same durable polling and authoritative `[PEER INBOX]` delivery used by Codex. A running Hermes conversation can load the adapter with `/reload-mcp` after configuration. |
 | 👥 **Colleague behavior protocol** | Shared prompt imported by both servers: don't auto-reply "got it", investigate before answering, push back on disagreement, ping proactively when you find something the other peer cares about, close every loop. |
 | 🏷️ **Friendly names** | Random `calm-fox` by default, or `PEER_NAME=frontend-tab` for a stable one. Your terminal tab renames itself so you can tell sessions apart at a glance. Peers can rename themselves mid-session. |
 | 🔍 **Scoped discovery** | `list_peers` with scope `machine` / `directory` / `repo`. Agents find relevant peers without a global cloud directory. |
@@ -160,6 +161,20 @@ Confirm each step's outcome as you go. If any step fails, stop and ask me how to
 
 **Shortest possible path to seeing it work:** open two terminals, launch `agentpeers` in one and `codex` in the other, then ask one of them to `"list all peers on this machine"`. You're off.
 
+### Hermes Agent
+
+Configure the adapter once, then either start Hermes or run `/reload-mcp` in an existing conversation:
+
+```bash
+hermes mcp add agent-peers \
+  --command bun \
+  --env AGENT_PEERS_ENABLED=1 \
+  --args "$HOME/agent-peers-mcp/hermes-server.ts"
+hermes mcp test agent-peers
+```
+
+Hermes can join after launch because it supports MCP reload. Codex wakeability is different: an idle Codex thread can only be woken when it was hosted by the app-server-backed launcher. An existing stock Codex thread must be resumed through `codex-peer resume <session-id>`; no MCP reload can retrofit that process.
+
 If you want more than that, here's the full flow:
 
 ### Step 1 — Launch
@@ -239,7 +254,7 @@ Run these from inside the cloned `agent-peers-mcp/` directory.
 ## How it works
 
 - **Broker daemon** (`broker.ts`) runs on `localhost:7900` with SQLite at `~/.agent-peers.db`. Auto-launches on first session. DB + WAL sidecars are 0o600, per-user shared secret at `~/.agent-peers-secret` (also 0o600) authenticates peer HTTP calls.
-- **Each session** spawns an MCP server (`claude-server.ts` or `codex-server.ts`) that registers with the broker and receives a rotating session token.
+- **Each session** spawns an MCP server (`claude-server.ts`, `codex-server.ts`, or `hermes-server.ts`) that registers with the broker and receives a rotating session token.
 - **Claude sessions** poll the broker every 1s and push inbound messages via `notifications/claude/channel` → Claude sees the message mid-task.
 - **Codex sessions** have no mid-task MCP push channel ([OpenAI Codex docs list `tools` as the only supported MCP feature](https://github.com/openai/codex/blob/main/docs/config.md) — resources, prompts, and `notifications/message` aren't surfaced). So Codex runs a two-layer delivery pipeline plus a prompt-level nudge:
   1. **Background poll (1s)** writes each new leased message to a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600 file, 0o700 dir, fail-closed perm check on read). Crash/restart safe.

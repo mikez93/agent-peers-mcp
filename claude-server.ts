@@ -33,7 +33,7 @@ import { formatInboxBlock } from "./shared/piggyback.ts";
 import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
-import type { PeerId } from "./shared/types.ts";
+import type { PeerId, PeerType } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -111,12 +111,12 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other AI agent peers on this machine. Returns id, human name, peer_type (claude|codex), cwd, summary.",
+      "List other AI agent peers on this machine. Returns id, human name, peer_type (claude|codex|hermes), cwd, summary.",
     inputSchema: {
       type: "object" as const,
       properties: {
         scope: { type: "string" as const, enum: ["machine", "directory", "repo"] },
-        peer_type: { type: "string" as const, enum: ["claude", "codex"], description: "optional filter" },
+        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes"], description: "optional filter" },
       },
       required: ["scope"],
     },
@@ -176,7 +176,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "list_peers": {
       const { scope, peer_type } = args as {
         scope: "machine" | "directory" | "repo";
-        peer_type?: "claude" | "codex";
+        peer_type?: PeerType;
       };
       const peers = await client.listPeers({
         scope, cwd: myCwd, git_root: myGitRoot, exclude_id: myId, peer_type,

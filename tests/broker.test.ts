@@ -35,7 +35,7 @@ afterEach(() => {
 // Helper: register and return a full auth handle.
 function reg(opts: {
   name?: string;
-  peer_type?: "claude" | "codex";
+  peer_type?: "claude" | "codex" | "hermes";
   cwd?: string;
   git_root?: string | null;
   tty?: string | null;
@@ -80,6 +80,11 @@ test("registerPeer creates peer with UUID + name + session_token", () => {
 test("registerPeer honors explicit name if unique", () => {
   const { name } = reg({ name: "frontend-tab", peer_type: "codex" });
   expect(name).toBe("frontend-tab");
+});
+
+test("registerPeer accepts Hermes as a first-class peer", () => {
+  const { id } = reg({ name: "hermes-tab", peer_type: "hermes" });
+  expect(getPeer(db, id)?.peer_type).toBe("hermes");
 });
 
 test("registerPeer appends -2 on name collision with live peer", () => {

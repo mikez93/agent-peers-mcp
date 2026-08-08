@@ -91,7 +91,7 @@ export function initDb(path: string): Database {
     CREATE TABLE IF NOT EXISTS peers (
       id            TEXT PRIMARY KEY,
       name          TEXT NOT NULL UNIQUE,
-      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex')),
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes')),
       pid           INTEGER,
       cwd           TEXT,
       git_root      TEXT,
@@ -125,6 +125,7 @@ export function initDb(path: string): Database {
   // and backfill sensible defaults.
 
   migrate_peers_add_session_token(db);
+  migrate_peers_add_hermes_peer_type(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -227,7 +228,7 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
     CREATE TABLE peers_new (
       id            TEXT PRIMARY KEY,
       name          TEXT NOT NULL UNIQUE,
-      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex')),
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes')),
       pid           INTEGER,
       cwd           TEXT,
       git_root      TEXT,
@@ -249,6 +250,23 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
   // Rebuild the indices that lived on the old table.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_name ON peers(name);`);
+}
+
+function migrate_peers_add_hermes_peer_type(db: Database): void {
+  const row = db.query<{ sql: string | null }, []>(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'peers'"
+  ).get();
+  if (row?.sql?.includes("'hermes'")) return;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    rebuildPeersTableWithNotNullSessionToken(db);
+    db.exec("COMMIT");
+    console.error("[broker] migration: expanded peer_type constraint to include hermes");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
+  }
 }
 
 // ----- Peer CRUD -----
@@ -538,7 +556,7 @@ export function pollMessages(db: Database, id: string, session_token: string): L
         id: row.id,
         from_id: row.from_id,
         from_name: sender?.name ?? "(gone)",
-        from_peer_type: (sender?.peer_type ?? "claude") as "claude" | "codex",
+        from_peer_type: sender?.peer_type ?? "claude",
         from_cwd: sender?.cwd ?? "",
         from_summary: sender?.summary ?? "",
         to_id: row.to_id,
@@ -688,7 +706,7 @@ function isGuiApp(command: string | undefined): boolean {
 function findAgentMcpServers(table: ProcTable): number[] {
   const pids: number[] = [];
   for (const [pid, command] of table.commandOf) {
-    if (/agent-peers-mcp\/(claude|codex)-server\.ts/.test(command)) pids.push(pid);
+    if (/agent-peers-mcp\/(claude|codex|hermes)-server\.ts/.test(command)) pids.push(pid);
   }
   return pids;
 }

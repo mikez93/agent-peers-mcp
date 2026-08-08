@@ -221,3 +221,49 @@ test("initDb self-heals NULL session_token rows from a crashed partial migration
     db.close();
   }
 });
+
+test("initDb expands an existing peer_type constraint to Hermes without dropping peers", () => {
+  TEST_DB = `/tmp/agent-peers-migration-hermes-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  const setup = new Database(TEST_DB);
+  setup.exec("PRAGMA journal_mode = WAL;");
+  setup.exec(`
+    CREATE TABLE peers (
+      id            TEXT PRIMARY KEY,
+      name          TEXT NOT NULL UNIQUE,
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex')),
+      pid           INTEGER,
+      cwd           TEXT,
+      git_root      TEXT,
+      tty           TEXT,
+      summary       TEXT DEFAULT '',
+      session_token TEXT NOT NULL,
+      registered_at TEXT NOT NULL,
+      last_seen     TEXT NOT NULL
+    );
+  `);
+  const ts = new Date().toISOString();
+  setup.query(
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run("existing-codex-id", "existing-codex", "codex", 7, "/existing", null, null, "working", "existing-token", ts, ts);
+  setup.close();
+
+  const db = initDb(TEST_DB);
+  try {
+    expect(db.query<{ name: string }, []>("SELECT name FROM peers WHERE id = 'existing-codex-id'").get()?.name)
+      .toBe("existing-codex");
+    const hermes = registerPeer(db, {
+      name: "hermes-first",
+      peer_type: "hermes",
+      pid: 8,
+      cwd: "/existing",
+      git_root: null,
+      tty: null,
+      summary: "",
+    });
+    expect(db.query<{ peer_type: string }, [string]>("SELECT peer_type FROM peers WHERE id = ?").get(hermes.id)?.peer_type)
+      .toBe("hermes");
+  } finally {
+    db.close();
+  }
+});

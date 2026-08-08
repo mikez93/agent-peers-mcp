@@ -50,7 +50,8 @@ function cloneMessages(messages: LeasedMessage[]): LeasedMessage[] {
 }
 
 function defaultRootDir(): string {
-  return join(homedir(), ".agent-peers-codex");
+  const runtime = process.env.AGENT_PEERS_RUNTIME === "hermes" ? "hermes" : "codex";
+  return join(homedir(), `.agent-peers-${runtime}`);
 }
 
 async function atomicWriteJson<T>(path: string, value: T): Promise<void> {
@@ -94,7 +95,10 @@ export class CodexInboxStore {
     persistMetadata?: (path: string, value: CodexInboxMetadataState) => Promise<void>;
     onMetadataError?: (error: unknown) => void;
   }) {
-    const rootDir = opts.rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? defaultRootDir();
+    const rootDir = opts.rootDir
+      ?? process.env.AGENT_PEERS_STATE_DIR
+      ?? process.env.AGENT_PEERS_CODEX_STATE_DIR
+      ?? defaultRootDir();
     const safePeerId = encodeURIComponent(opts.peerId);
     this.filePath = join(rootDir, `${safePeerId}.json`);
     this.metadataFilePath = join(rootDir, `${safePeerId}.metadata.json`);
