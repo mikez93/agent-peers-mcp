@@ -755,15 +755,23 @@ function canonicalStartTime(value: string): string {
   return value.trim().replace(/\s+/g, " ");
 }
 
-/** `ps` start-time string for a pid, or null if it is gone. */
-function processStartTime(pid: number): string | null {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
+/** One `ps` snapshot of every process's start time. Replaces the old
+ *  per-entry `ps -o lstart= -p <pid>` (one subprocess spawn per queried pid,
+ *  up to PROTECTION_MAX_ENTRIES+1 spawns per request — a local-DoS lever on an
+ *  unauthenticated endpoint). An empty map means inspection failed, which must
+ *  read as "we can see nothing", never "everything is gone". */
+function readStartTimeTable(): Map<number, string> {
+  const startOf = new Map<number, string>();
   try {
-    const p = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
-    if (p.exitCode !== 0) return null;
-    const s = canonicalStartTime(new TextDecoder().decode(p.stdout));
-    return s.length > 0 ? s : null;
-  } catch { return null; }
+    const p = Bun.spawnSync(["ps", "-axo", "pid=,lstart="]);
+    if (p.exitCode !== 0) return startOf;
+    for (const line of new TextDecoder().decode(p.stdout).split("\n")) {
+      const m = line.trim().match(/^(\d+)\s+(.+)$/);
+      if (!m?.[1] || !m[2]) continue;
+      startOf.set(parseInt(m[1], 10), canonicalStartTime(m[2]));
+    }
+  } catch { /* fall through with empty map */ }
+  return startOf;
 }
 
 interface ProcTable {
@@ -882,10 +890,13 @@ export function buildProtectedPidSet(db: Database): Set<number> {
 export function checkProtection(db: Database, entries: ProtectionQueryEntry[]) {
   const protectedPids = buildProtectedPidSet(db);
   const leaseUntil = new Date(Date.now() + PROTECTION_LEASE_MS).toISOString();
+  // Exactly one start-time snapshot per request, shared by every entry.
+  const startTimeOf = readStartTimeTable();
 
   const results = entries.slice(0, PROTECTION_MAX_ENTRIES).map((entry) => {
     const pid = Number(entry.pid);
-    const observedStart = processStartTime(pid);
+    const observedStart =
+      Number.isInteger(pid) && pid > 0 ? (startTimeOf.get(pid) ?? null) : null;
 
     if (observedStart === null) {
       // Gone between the caller's snapshot and now. We cannot vouch for a pid
@@ -1118,7 +1129,44 @@ export function ensureSharedSecret(path: string): string {
   return persisted;
 }
 
-export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_SECRET_PATH) {
+// One value per broker process. Lets clients (and the reaper, via
+// PROTECTION_GENERATION) distinguish "the broker restarted underneath me" from
+// "I was evicted for cause". Surfaced on /health, /ready, and (Phase 2)
+// register/heartbeat responses.
+export const BROKER_EPOCH = randomUUID();
+
+export type BrokerOwner = "launchd" | "client";
+
+// Sliding-window throttle for the unauthenticated protection endpoint: its
+// answer can only spare processes, so a 429 is always safe for the caller
+// (the reaper treats any non-200 as "broker unusable" and reaps nothing in
+// broker-dependent classes). 4 requests per 10s is ~10× the scheduled
+// reaper's real cadence.
+const PROTECTION_THROTTLE_MAX = 4;
+const PROTECTION_THROTTLE_WINDOW_MS = 10_000;
+const protectionRequestTimes: number[] = [];
+
+function protectionThrottled(now: number): boolean {
+  while (protectionRequestTimes.length > 0 && now - protectionRequestTimes[0]! > PROTECTION_THROTTLE_WINDOW_MS) {
+    protectionRequestTimes.shift();
+  }
+  if (protectionRequestTimes.length >= PROTECTION_THROTTLE_MAX) return true;
+  protectionRequestTimes.push(now);
+  return false;
+}
+
+/** Short non-secret identity for the DB this broker serves — lets a client
+ *  detect "a broker answered, but it is not serving the DB I expect". */
+function dbIdentityHash(dbPath: string): string {
+  return Bun.hash(resolve(dbPath)).toString(16).slice(0, 12);
+}
+
+export function startBroker(
+  port: number,
+  dbPath: string,
+  secretPath = DEFAULT_SECRET_PATH,
+  owner: BrokerOwner = "client",
+) {
   const db = initDb(dbPath);
   const sharedSecret = ensureSharedSecret(secretPath);
 
@@ -1148,7 +1196,26 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
       const url = new URL(req.url);
       try {
         if (req.method === "GET" && url.pathname === "/health") {
-          return json({ ok: true, pid: process.pid });
+          // Unauthenticated liveness only. epoch/owner are non-secret and let
+          // the eviction path and diagnostics identify the responder.
+          return json({ ok: true, pid: process.pid, epoch: BROKER_EPOCH, owner });
+        }
+        if (req.method === "GET" && url.pathname === "/ready") {
+          // Authenticated readiness: a client that can read the shared secret
+          // can verify it is talking to a compatible broker serving the
+          // expected DB, not just "something answering on the port".
+          const presented = req.headers.get(SECRET_HEADER);
+          if (presented !== sharedSecret) {
+            return json({ error: "missing or invalid " + SECRET_HEADER }, { status: 401 });
+          }
+          return json({
+            ok: true,
+            pid: process.pid,
+            epoch: BROKER_EPOCH,
+            owner,
+            protocol: 1,
+            db_id: dbIdentityHash(dbPath),
+          });
         }
         if (req.method !== "POST") return json({ error: "method not allowed" }, { status: 405 });
 
@@ -1162,6 +1229,11 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
         // secret, so this cannot be used to launder protection onto a hostile
         // process.
         if (url.pathname === "/v1/protection/check") {
+          if (protectionThrottled(Date.now())) {
+            // Safe by contract: the caller treats any non-200 as "broker
+            // unusable" and spares everything in broker-dependent classes.
+            return json({ error: "throttled" }, { status: 429 });
+          }
           const body = await readJson<{ entries?: ProtectionQueryEntry[] } | ProtectionQueryEntry[]>(req);
           const entries = Array.isArray(body) ? body : (body?.entries ?? []);
           return json(checkProtection(db, entries));
@@ -1214,13 +1286,67 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
   // ignore it and stay up for the sessions that outlive the spawner.
   process.on("SIGHUP", () => {});
 
-  console.error(`[broker] listening on http://127.0.0.1:${port}, db=${dbPath}, pid=${process.pid}`);
+  console.error(`[broker] listening on http://127.0.0.1:${port}, db=${dbPath}, pid=${process.pid}, owner=${owner}, epoch=${BROKER_EPOCH}`);
   return { server, db, gcTimer };
+}
+
+function isAddrInUse(e: unknown): boolean {
+  const msg = e instanceof Error ? `${e.message} ${(e as { code?: string }).code ?? ""}` : String(e);
+  return /EADDRINUSE|address already in use/i.test(msg);
+}
+
+/** Production entry: bind with ownership arbitration.
+ *
+ *  launchd owner: launchd is the sole legitimate owner of the port. If a rogue
+ *  broker (a legacy client-spawned one) holds it, identify it via /health,
+ *  SIGTERM it, wait for the port to free, and retry — up to 3 attempts.
+ *
+ *  client owner (legacy spawn path / manual `bun broker.ts`): EADDRINUSE means
+ *  somebody else already serves this machine. Yield with exit 0 — never
+ *  crash-loop, never fight. */
+async function startBrokerMain(owner: BrokerOwner): Promise<void> {
+  const port = DEFAULT_PORT;
+  const dbPath = process.env.AGENT_PEERS_DB || DEFAULT_DB_PATH;
+  const secretPath = process.env.AGENT_PEERS_SECRET_PATH || DEFAULT_SECRET_PATH;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      startBroker(port, dbPath, secretPath, owner);
+      return;
+    } catch (e) {
+      if (!isAddrInUse(e)) throw e;
+      if (owner !== "launchd") {
+        console.error(`[broker] port ${port} already served and owner=${owner}; yielding to the incumbent (exit 0)`);
+        process.exit(0);
+      }
+      // launchd owner: evict the squatter.
+      let squatterPid: number | null = null;
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) });
+        const body = (await res.json()) as { pid?: number };
+        if (typeof body.pid === "number" && body.pid > 1 && body.pid !== process.pid) squatterPid = body.pid;
+      } catch { /* squatter is not a broker or not answering; nothing to evict */ }
+      if (squatterPid === null) {
+        console.error(`[broker] attempt ${attempt}: port ${port} busy but no identifiable broker on /health; retrying in 2s`);
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+      console.error(`[broker] owner=launchd evicting rogue broker pid=${squatterPid} from port ${port}`);
+      try { process.kill(squatterPid, "SIGTERM"); } catch { /* already gone */ }
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 250));
+        try { process.kill(squatterPid, 0); } catch { break; } // ESRCH → dead
+      }
+    }
+  }
+  console.error(`[broker] FATAL: could not acquire port ${port} after 3 attempts`);
+  process.exit(1);
 }
 
 // Re-exports for consumers.
 export { NAME_REGEX, NAME_MAX_LEN, isValidName };
 
 if (import.meta.main) {
-  startBroker(DEFAULT_PORT, process.env.AGENT_PEERS_DB || DEFAULT_DB_PATH);
+  const owner: BrokerOwner = process.argv.includes("--owner=launchd") ? "launchd" : "client";
+  await startBrokerMain(owner);
 }
