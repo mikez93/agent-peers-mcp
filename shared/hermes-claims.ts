@@ -19,7 +19,7 @@
 // reclaimable, and winners release on shutdown so the next turn's surface can
 // win.
 
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -56,24 +56,40 @@ export class HermesNameClaims {
   async tryAcquire(peerName: string, ownerPid: number): Promise<boolean> {
     await mkdir(this.dir, { recursive: true, mode: DIR_MODE });
     const lockPath = lockPathFor(this.dir, peerName);
-    try {
-      await writeFile(
-        lockPath,
-        JSON.stringify({ owner_pid: ownerPid, acquired_at: new Date().toISOString() }),
-        { encoding: "utf8", mode: FILE_MODE, flag: "wx" },
-      );
-      return true;
-    } catch {
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const held = JSON.parse(await readFile(lockPath, "utf8")) as { owner_pid?: number };
+        await writeFile(
+          lockPath,
+          JSON.stringify({ owner_pid: ownerPid, acquired_at: new Date().toISOString() }),
+          { encoding: "utf8", mode: FILE_MODE, flag: "wx" },
+        );
+        return true;
+      } catch {
+        let held: { owner_pid?: number };
+        try {
+          held = JSON.parse(await readFile(lockPath, "utf8")) as { owner_pid?: number };
+        } catch (e) {
+          const gone = e instanceof Error && "code" in e && (e as { code?: string }).code === "ENOENT";
+          if (gone) continue; // lock vanished between wx and read — retry wx
+          return false; // unreadable/corrupt lock: fail closed
+        }
         if (held?.owner_pid === ownerPid) return true;
         if (isProcessAlive(held?.owner_pid)) return false;
-        await unlink(lockPath);
-        return await this.tryAcquire(peerName, ownerPid);
-      } catch {
-        return false;
+        // Dead owner. A plain unlink+retry races a concurrent reclaimer:
+        // after SIGKILL of the old winner, gateway and serve boot together,
+        // both read the dead pid — one unlinks and re-creates via wx, the
+        // other then unlinks the FRESH winner's lock, and both win. rename()
+        // is the atomic claim on the STALE file: exactly one renamer
+        // succeeds; the loser gets ENOENT and loops back to a plain wx
+        // attempt against whatever the winner wrote.
+        try {
+          const tomb = `${lockPath}.reclaim.${ownerPid}.${Date.now()}`;
+          await rename(lockPath, tomb);
+          await unlink(tomb).catch(() => {});
+        } catch { /* lost the reclaim race — loop back to wx */ }
       }
     }
+    return false;
   }
 
   /** Release only if we own it — a loser must never delete the winner's lock. */

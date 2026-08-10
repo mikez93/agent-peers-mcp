@@ -65,20 +65,25 @@ test("gcOldMessages prunes rows past retention, keeps recent ones", () => {
     from_id: a.id, session_token: a.session_token, to_id_or_name: b.id, text: "recent",
   });
   expect(send.ok).toBe(true);
-  // Fabricate an ancient acked row and an ancient unacked row.
+  // Acked past 7d: pruned. Unacked past 7d: a still-live delivery obligation,
+  // KEPT until the 30d hard cap; unacked past 30d: pruned.
   handle.db.query(
     "INSERT INTO messages (from_id, to_id, text, sent_at, acked, message_uid) VALUES (?, ?, 'old-acked', ?, 1, ?)"
   ).run(a.id, b.id, new Date(Date.now() - 8 * 24 * 3600_000).toISOString(), crypto.randomUUID());
   handle.db.query(
     "INSERT INTO messages (from_id, to_id, text, sent_at, acked, message_uid) VALUES (?, ?, 'old-unacked', ?, 0, ?)"
   ).run(a.id, b.id, new Date(Date.now() - 9 * 24 * 3600_000).toISOString(), crypto.randomUUID());
+  handle.db.query(
+    "INSERT INTO messages (from_id, to_id, text, sent_at, acked, message_uid) VALUES (?, ?, 'ancient-unacked', ?, 0, ?)"
+  ).run(a.id, b.id, new Date(Date.now() - 31 * 24 * 3600_000).toISOString(), crypto.randomUUID());
 
   const pruned = gcOldMessages(handle.db);
   expect(pruned).toBe(2);
   const texts = handle.db.query<{ text: string }, []>("SELECT text FROM messages").all().map((r) => r.text);
   expect(texts).toContain("recent");
   expect(texts).not.toContain("old-acked");
-  expect(texts).not.toContain("old-unacked");
+  expect(texts).toContain("old-unacked");
+  expect(texts).not.toContain("ancient-unacked");
 });
 
 test("ackMessages reports typed per-token outcomes", () => {
@@ -102,7 +107,7 @@ test("ackMessages reports typed per-token outcomes", () => {
   expect(res.stale).toBe(1);
   const byToken = new Map(res.results!.map((r) => [r.token, r.status]));
   expect(byToken.get(goodToken)).toBe("expired");
-  expect(byToken.get("no-such-token")).toBe("acked"); // untraceable token: cleared-or-never-existed
+  expect(byToken.get("no-such-token")).toBe("unknown"); // never existed — pre-UPDATE snapshot proves it
 
   // wrong_session: someone else's live lease.
   sendMessage(handle.db, { from_id: a.id, session_token: a.session_token, to_id_or_name: b.id, text: "m2" });

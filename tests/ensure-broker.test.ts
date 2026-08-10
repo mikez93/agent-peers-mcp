@@ -3,7 +3,8 @@
 // The ownership contract: clients never spawn the broker in production. They
 // ask launchd (kickstart) and wait. Self-spawn survives only behind
 // AGENT_PEERS_SPAWN_BROKER=1 / allowSpawn, and pins the child env so a
-// client's AGENT_PEERS_DB or PEER_NAME can never leak into a machine-global
+// client's session identity (PEER_NAME etc.) can never leak into a machine-
+// global broker; machine config (PORT/DB/SECRET_PATH) forwards deliberately
 // broker (the root cause of the 2026-08 crash-loop: a Hermes MCP child owned
 // port 7900 with its spawner's env).
 
@@ -63,7 +64,9 @@ test("allowSpawn: spawns with pinned env — session vars never reach the child"
   // performs (it serves /health on AGENT_PEERS_PORT).
   const port = 7947;
   process.env.AGENT_PEERS_PORT = String(port);
-  process.env.AGENT_PEERS_DB = "/tmp/should-never-leak.db";
+  // Machine config (PORT/DB/SECRET_PATH) forwards; session identity
+  // (PEER_NAME and everything else) is stripped.
+  process.env.AGENT_PEERS_DB = "/tmp/machine-config-forwards.db";
   process.env.PEER_NAME = "should-never-leak";
   process.env.AGENT_PEERS_TEST_OUT = `/tmp/ensure-broker-leak-${Date.now()}.json`;
   const leakPath = process.env.AGENT_PEERS_TEST_OUT;

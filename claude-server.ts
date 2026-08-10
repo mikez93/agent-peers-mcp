@@ -72,6 +72,7 @@ let myGitRoot: string | null = null;
 let inboxStore: CodexInboxStore | null = null;
 const CLAUDE_INBOX_ROOT = process.env.AGENT_PEERS_STATE_DIR ?? join(homedir(), ".agent-peers-claude");
 const INBOX_TTL_MS = 15 * 60 * 1000; // matches the ring buffer + tool contract
+const SEEN_WATERMARK_SLACK = 10_000; // same bound as codex-server's watermark
 
 // The recent-delivered ring buffer is the backfill surface for check_messages.
 // See shared/recent-delivered.ts for the full rationale. Extracted out of this
@@ -383,6 +384,11 @@ async function main() {
   myName = reg.name;
   mySession = reg.session_token;
   inboxStore = new CodexInboxStore({ peerId: myId, rootDir: CLAUDE_INBOX_ROOT });
+  // init() loads any state a previous incarnation persisted. Without it the
+  // store starts empty-but-writable, and the first queueLeasedMessages()
+  // atomically overwrites the on-disk file — destroying already-acked mail
+  // the durable inbox exists to protect.
+  await inboxStore.init();
   setTabTitle(`peer:${myName}`);
   // Note: keepalive was already armed earlier in main(), before register().
   // The setTabTitle above just updates `lastTitle`; the running keepalive
@@ -470,6 +476,13 @@ async function main() {
           log(`push failed (message persisted; check_messages will surface it): ${e instanceof Error ? e.message : String(e)}`);
         }
       }
+      // Watermark prune (same shape as codex-server's pruneSeenWatermark):
+      // ids far below the newest are long-acked and can never re-offer, so
+      // the dedupe set stays bounded across a long-lived session.
+      if (seen.size > 0) {
+        const watermark = Math.max(...seen) - SEEN_WATERMARK_SLACK;
+        for (const id of seen) if (id < watermark) seen.delete(id);
+      }
       // TTL prune: the durable store mirrors the 15-minute check_messages
       // window; anything older is no longer surfaced anywhere and can go.
       try {
@@ -543,13 +556,29 @@ async function main() {
           // re-points our unacked mail to the new incarnation.
           prev_id: myId,
         });
+        const prevStore = inboxStore;
         myId = again.id;
         myName = again.name;
         mySession = again.session_token;
         // The mailbox follows the peer id — rebind the durable store so a
         // re-registration that minted a new UUID doesn't strand the inbox
-        // under the dead one.
+        // under the dead one, and migrate the old incarnation's unread
+        // entries into the new store (they were already acked at the broker,
+        // so nothing will ever re-offer them).
         inboxStore = new CodexInboxStore({ peerId: myId, rootDir: CLAUDE_INBOX_ROOT });
+        await inboxStore.init();
+        if (prevStore) {
+          try {
+            const carried = await prevStore.getUnreadMessages();
+            if (carried.length > 0) {
+              await inboxStore.queueLeasedMessages(carried);
+              await prevStore.removeByIds(carried.map((m) => m.id));
+              log(`Migrated ${carried.length} unread durable message(s) to new incarnation ${myId}`);
+            }
+          } catch (e) {
+            log(`Durable-inbox migration failed (old entries remain on disk): ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
         setTabTitle(`peer:${myName}`);
         log(`Rejoined the network as ${myName} (id=${myId})`);
       } catch (e) {

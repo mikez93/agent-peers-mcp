@@ -576,10 +576,17 @@ async function readAllInboxFiles(): Promise<InboxFileInfo[]> {
   const { homedir } = await import("node:os");
   const { join } = await import("node:path");
   const out: InboxFileInfo[] = [];
+  const seenDirs = new Set<string>();
   for (const root of INBOX_ROOTS) {
-    const dir = (root.env && process.env[root.env])
-      || process.env.AGENT_PEERS_STATE_DIR
+    // Same precedence as the WRITERS (codex-inbox.ts / hermes-server.ts):
+    // generic AGENT_PEERS_STATE_DIR beats the runtime-specific var. If the
+    // CLI resolved these the other way around, it would inspect a different
+    // directory than the servers write and report clean while mail strands.
+    const dir = process.env.AGENT_PEERS_STATE_DIR
+      || (root.env && process.env[root.env])
       || join(homedir(), root.dirname);
+    if (seenDirs.has(dir)) continue; // shared STATE_DIR: scan once
+    seenDirs.add(dir);
     let files: string[];
     try { files = await readdir(dir); } catch { continue; }
     for (const file of files) {
@@ -676,8 +683,12 @@ async function cmdGcInboxes(apply: boolean, minAgeDays: number) {
       candidates++;
       if (apply) {
         // Archive, never delete — bodies stay recoverable.
-        await rename(box.path, `${box.path}.archived`);
-        try { await rename(box.path.replace(/\.json$/, ".metadata.json"), `${box.path.replace(/\.json$/, ".metadata.json")}.archived`); } catch { /* no metadata file */ }
+        // Timestamped suffix: a bare `.archived` would clobber a previous
+        // archive of the same peer-UUID inbox, silently destroying bodies —
+        // the one thing this command promises never to do.
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        await rename(box.path, `${box.path}.archived-${stamp}`);
+        try { await rename(box.path.replace(/\.json$/, ".metadata.json"), `${box.path.replace(/\.json$/, ".metadata.json")}.archived-${stamp}`); } catch { /* no metadata file */ }
         console.log(`archived ${box.path} (unread=${box.unread.length})`);
       } else {
         console.log(`would archive ${box.path} (unread=${box.unread.length}, mtime age ${(Math.round((Date.now() - box.mtimeMs) / 86_400_000))}d)`);

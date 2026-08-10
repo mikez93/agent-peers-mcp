@@ -476,7 +476,14 @@ function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse
  *  the dead UUID — permanently unreachable under the old behavior (5,202
  *  orphaned messages accumulated this way). Re-point it to the new
  *  incarnation. Guard: only when the previous row is GONE — never rob a live
- *  peer — and never self-referentially. */
+ *  peer — and never self-referentially.
+ *
+ *  ACCEPTED RISK: prev_id is client-asserted with no proof of prior
+ *  ownership — the old row is gone, so there is no token left to check
+ *  against. Any authenticated peer could claim a dead UUID's unacked mail at
+ *  register time. This is the one place mail changes addressee without the
+ *  addressee's token, and it is accepted because every client on this broker
+ *  is inside the same single-user trust boundary (the shared secret file). */
 function repointOrphanedMail(db: Database, prevId: string | undefined, newId: string): void {
   if (!prevId || prevId === newId) return;
   const prevRow = db.query("SELECT id FROM peers WHERE id = ?").get(prevId);
@@ -757,8 +764,20 @@ export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesR
                  AND acked = 0
                  AND lease_expires_at IS NOT NULL
                  AND lease_expires_at >= ?`;
-  const info = db.query(sql).run(...req.lease_tokens, req.id, req.session_token, now);
-  const acked = info.changes ?? 0;
+  // Snapshot which submitted tokens exist BEFORE the UPDATE clears them —
+  // afterwards a token cleared by this call and a token that never existed
+  // both read back as no-row, and "never existed" must report `unknown`,
+  // not `acked`. One transaction so no third party interleaves.
+  const ackTx = db.transaction(() => {
+    const existing = new Set(
+      db.query<{ lease_token: string }, string[]>(
+        `SELECT lease_token FROM messages WHERE lease_token IN (${placeholders})`
+      ).all(...req.lease_tokens).map((r) => r.lease_token),
+    );
+    const info = db.query(sql).run(...req.lease_tokens, req.id, req.session_token, now);
+    return { existing, changes: info.changes ?? 0 };
+  });
+  const { existing, changes: acked } = ackTx();
 
   // Typed per-token outcomes (2026-08-10, kills the success-shaped
   // `{ok:true, acked:0}` blind spot): a caller that acked fewer tokens than it
@@ -769,28 +788,22 @@ export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesR
   let results: NonNullable<AckMessagesResponse["results"]> | undefined;
   if (acked < req.lease_tokens.length) {
     results = req.lease_tokens.map((token) => {
+      if (!existing.has(token)) return { token, status: "unknown" as const };
       const row = db.query<{ acked: number; lease_expires_at: string | null; to_id: string }, [string]>(
         "SELECT acked, lease_expires_at, to_id FROM messages WHERE lease_token = ?"
       ).get(token);
-      if (!row) {
-        // Token cleared by a successful ack this call, or never existed.
-        // Distinguish by whether the UPDATE above could have cleared it —
-        // cheapest correct answer: a token we just acked is `acked`.
-        return { token, status: "acked" as const };
-      }
+      // Existed pre-UPDATE, no longer holds the token → this call acked it.
+      if (!row) return { token, status: "acked" as const };
       if (row.acked === 1) return { token, status: "acked" as const };
       const owner = db.query<{ id: string }, [string, string]>(
         "SELECT id FROM peers WHERE id = ? AND session_token = ?"
       ).get(req.id, req.session_token);
       if (!owner || row.to_id !== owner.id) return { token, status: "wrong_session" as const };
       if (row.lease_expires_at !== null && row.lease_expires_at < now) {
-        stale++;
         return { token, status: "expired" as const };
       }
       return { token, status: "unknown" as const };
     });
-    // Anything the map couldn't classify as acked but the UPDATE did clear:
-    // the `!row` branch above already reports it as acked.
     stale = results.filter((r) => r.status === "expired").length;
   }
   return { ok: true, acked, stale, results };
@@ -861,11 +874,19 @@ export function shouldSkipGcSweep(elapsedMs: number): boolean {
   return elapsedMs > GC_INTERVAL_MS * 3;
 }
 
+export const UNACKED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
 export function gcOldMessages(db: Database): number {
-  const cutoff = new Date(Date.now() - MESSAGE_RETENTION_MS).toISOString();
+  // Acked mail is done — 7 days is plenty for forensics. UNACKED mail is a
+  // delivery obligation: it may be addressed to a durable peer with a broken
+  // ack pipeline, so it gets a much longer window (30d) instead of riding
+  // the same cutoff. It still expires eventually — mail to a UUID nobody
+  // will ever reclaim must not accumulate forever (5,202 orphans did).
+  const ackedCutoff = new Date(Date.now() - MESSAGE_RETENTION_MS).toISOString();
+  const unackedCutoff = new Date(Date.now() - UNACKED_RETENTION_MS).toISOString();
   const info = db.query(
-    `DELETE FROM messages WHERE sent_at < ?`
-  ).run(cutoff);
+    `DELETE FROM messages WHERE (acked = 1 AND sent_at < ?) OR (acked = 0 AND sent_at < ?)`
+  ).run(ackedCutoff, unackedCutoff);
   return info.changes ?? 0;
 }
 
@@ -1471,7 +1492,15 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
   const port = DEFAULT_PORT;
   const dbPath = process.env.AGENT_PEERS_DB || DEFAULT_DB_PATH;
   const secretPath = process.env.AGENT_PEERS_SECRET_PATH || DEFAULT_SECRET_PATH;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // The /health pid is SELF-REPORTED by an unauthenticated endpoint; a
+  // squatter can point it at an arbitrary same-user process. We SIGTERM a
+  // given pid at most once — if the port is still busy afterwards, the
+  // report was a lie (or the squatter respawned) and re-killing the same
+  // number would only harm whoever actually owns it now.
+  const alreadySignaled = new Set<number>();
+  // 4 bind attempts for 3 evictions: the final eviction deserves a final
+  // bind attempt, otherwise a successful eviction on the last loop is wasted.
+  for (let attempt = 1; attempt <= 4; attempt++) {
     try {
       startBroker(port, dbPath, secretPath, owner);
       return;
@@ -1481,6 +1510,7 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
         console.error(`[broker] port ${port} already served and owner=${owner}; yielding to the incumbent (exit 0)`);
         process.exit(0);
       }
+      if (attempt === 4) break;
       // launchd owner: evict the squatter.
       let squatterPid: number | null = null;
       try {
@@ -1488,11 +1518,12 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
         const body = (await res.json()) as { pid?: number };
         if (typeof body.pid === "number" && body.pid > 1 && body.pid !== process.pid) squatterPid = body.pid;
       } catch { /* squatter is not a broker or not answering; nothing to evict */ }
-      if (squatterPid === null) {
-        console.error(`[broker] attempt ${attempt}: port ${port} busy but no identifiable broker on /health; retrying in 2s`);
+      if (squatterPid === null || alreadySignaled.has(squatterPid)) {
+        console.error(`[broker] attempt ${attempt}: port ${port} busy, no NEW evictable pid via /health; retrying in 2s`);
         await new Promise((r) => setTimeout(r, 2000));
         continue;
       }
+      alreadySignaled.add(squatterPid);
       console.error(`[broker] owner=launchd evicting rogue broker pid=${squatterPid} from port ${port}`);
       try { process.kill(squatterPid, "SIGTERM"); } catch { /* already gone */ }
       const deadline = Date.now() + 5000;
@@ -1502,7 +1533,7 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
       }
     }
   }
-  console.error(`[broker] FATAL: could not acquire port ${port} after 3 attempts`);
+  console.error(`[broker] FATAL: could not acquire port ${port} after 4 attempts`);
   process.exit(1);
 }
 

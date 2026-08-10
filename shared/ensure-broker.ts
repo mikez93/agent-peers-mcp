@@ -64,11 +64,17 @@ export async function ensureBroker(
     const proc = Bun.spawn(["bun", scriptPath], {
       stdio: ["ignore", "ignore", "inherit"],
       // Pinned env: the broker is machine-global state. Whatever session
-      // happens to spawn it first must not define its DB path or identity.
+      // happens to spawn it first must not define its identity (PEER_NAME,
+      // AGENT_PEERS_CWD, etc. are all stripped). PORT/DB/SECRET_PATH forward
+      // because they are machine config, not session config — a dev box that
+      // sets a custom secret path must not spawn a broker provisioning the
+      // default secret while the client waits on the custom one (hang/401).
       env: {
         PATH: process.env.PATH ?? "",
         HOME: process.env.HOME ?? "",
         ...(process.env.AGENT_PEERS_PORT ? { AGENT_PEERS_PORT: process.env.AGENT_PEERS_PORT } : {}),
+        ...(process.env.AGENT_PEERS_DB ? { AGENT_PEERS_DB: process.env.AGENT_PEERS_DB } : {}),
+        ...(process.env.AGENT_PEERS_SECRET_PATH ? { AGENT_PEERS_SECRET_PATH: process.env.AGENT_PEERS_SECRET_PATH } : {}),
       },
     });
     proc.unref();

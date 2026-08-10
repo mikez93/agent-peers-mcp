@@ -87,6 +87,7 @@ export class CodexInboxStore {
   private readonly onMetadataError: (error: unknown) => void;
   private state: CodexInboxState = { unread: [] };
   private queue: Promise<void> = Promise.resolve();
+  private loaded = false;
 
   constructor(opts: {
     peerId: PeerId;
@@ -114,19 +115,40 @@ export class CodexInboxStore {
   async init(): Promise<void> {
     await this.withLock(async () => {
       this.state = await this.readStateFromDisk();
+      this.loaded = true;
     });
   }
 
+  // Lazy-load guard (2026-08-10 review finding): a constructed-but-never-
+  // init()ed store used to start empty-but-WRITABLE, so the first
+  // queueLeasedMessages() atomically overwrote the on-disk file and destroyed
+  // a previous incarnation's persisted unread mail — the exact loss the store
+  // exists to prevent. Every accessor now loads disk state on first touch, so
+  // forgetting init() can no longer clobber; an explicit init() stays the
+  // preferred, cheaper path.
+  private async ensureLoaded(): Promise<void> {
+    if (this.loaded) return;
+    this.state = await this.readStateFromDisk();
+    this.loaded = true;
+  }
+
   async getUnreadMessages(): Promise<LeasedMessage[]> {
-    return this.withLock(async () => cloneMessages(this.state.unread));
+    return this.withLock(async () => {
+      await this.ensureLoaded();
+      return cloneMessages(this.state.unread);
+    });
   }
 
   async getUnreadMessageMetadata(): Promise<CodexInboxMessageMetadata[]> {
-    return this.withLock(async () => metadataForMessages(this.state.unread));
+    return this.withLock(async () => {
+      await this.ensureLoaded();
+      return metadataForMessages(this.state.unread);
+    });
   }
 
   async queueLeasedMessages(messages: LeasedMessage[]): Promise<void> {
     await this.withLock(async () => {
+      await this.ensureLoaded();
       const unreadById = new Map(this.state.unread.map((message) => [message.id, { ...message }]));
       for (const message of messages) unreadById.set(message.id, { ...message });
       const nextState = { unread: Array.from(unreadById.values()).sort((a, b) => a.id - b.id) };
@@ -138,6 +160,7 @@ export class CodexInboxStore {
 
   async consumeUnreadMessages(): Promise<LeasedMessage[]> {
     return this.withLock(async () => {
+      await this.ensureLoaded();
       const unread = cloneMessages(this.state.unread);
       const nextState = { unread: [] };
       await this.persistState(this.filePath, nextState);
@@ -156,6 +179,7 @@ export class CodexInboxStore {
   async removeByIds(ids: number[]): Promise<void> {
     if (ids.length === 0) return;
     await this.withLock(async () => {
+      await this.ensureLoaded();
       const drop = new Set(ids);
       const nextState = {
         unread: this.state.unread.filter((m) => !drop.has(m.id)),
