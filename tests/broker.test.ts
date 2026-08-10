@@ -34,7 +34,10 @@ afterEach(() => {
   if (existsSync(TEST_DB)) unlinkSync(TEST_DB);
 });
 
-// Helper: register and return a full auth handle.
+// Helper: register and return a full auth handle. Durability is explicit in
+// the protocol now; the helper defaults it to "named ⇒ durable" because that
+// is what real servers send for a PEER_NAME identity — tests that want a
+// named-but-ephemeral peer pass `durable: false`.
 function reg(opts: {
   name?: string;
   peer_type?: "claude" | "codex" | "hermes";
@@ -43,6 +46,8 @@ function reg(opts: {
   tty?: string | null;
   summary?: string;
   pid?: number;
+  durable?: boolean;
+  prev_id?: string;
 }) {
   return registerPeer(db, {
     peer_type: opts.peer_type ?? "claude",
@@ -51,6 +56,8 @@ function reg(opts: {
     git_root: opts.git_root ?? null,
     tty: opts.tty ?? null,
     summary: opts.summary ?? "",
+    durable: opts.durable ?? (opts.name ? true : false),
+    ...(opts.prev_id ? { prev_id: opts.prev_id } : {}),
     ...(opts.name ? { name: opts.name } : {}),
   });
 }

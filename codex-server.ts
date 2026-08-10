@@ -81,6 +81,7 @@ import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { planWaitForPeerMessages, waitForFreshPeerMessages as waitForFreshPeerMessagesLoop } from "./shared/wait-for-peer-messages.ts";
 import { createAsyncLock } from "./shared/async-lock.ts";
+import { HermesNameClaims } from "./shared/hermes-claims.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
@@ -825,9 +826,34 @@ async function main() {
   const sharedSecret = await waitForSharedSecret();
   client = createClient(BROKER_URL, sharedSecret);
 
-  myCwd = process.cwd();
+  // Hermes profiles set AGENT_PEERS_CWD in their MCP config; without it a
+  // Hermes surface inherits whatever cwd its host process happened to have
+  // (observed: `/`, the profile dir, and a workdir — three "identities" for
+  // one agent).
+  myCwd = process.env.AGENT_PEERS_CWD || process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+
+  // ---- One peer per logical Hermes agent (name-claim election) ----------
+  // Gateway and serve both load this server with the same PEER_NAME. Exactly
+  // one surface may own that name; the loser keeps full tooling but registers
+  // an ephemeral generated name (it may be the surface the user is talking
+  // through — it must be able to SEND — it just isn't the address peers use).
+  let requestedName: string | undefined = process.env.PEER_NAME;
+  let requestDurable = !!requestedName && process.env.AGENT_PEERS_EPHEMERAL !== "1";
+  let hermesClaims: HermesNameClaims | null = null;
+  let hermesClaimedName: string | null = null;
+  if (RUNTIME_PEER_TYPE === "hermes" && requestedName) {
+    hermesClaims = new HermesNameClaims();
+    if (await hermesClaims.tryAcquire(requestedName, process.pid)) {
+      hermesClaimedName = requestedName;
+      log(`hermes name-claim won: this surface owns "${requestedName}"`);
+    } else {
+      log(`hermes name-claim lost: "${requestedName}" is owned by another live surface; registering ephemeral`);
+      requestedName = undefined;
+      requestDurable = false;
+    }
+  }
 
   let initialSummary = "";
   const summaryPromise = (async () => {
@@ -847,12 +873,13 @@ async function main() {
 
   const reg = await client.register({
     peer_type: RUNTIME_PEER_TYPE,
-    name: process.env.PEER_NAME,
+    name: requestedName,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    durable: requestDurable,
   });
   myId = reg.id;
   myName = reg.name;
@@ -926,12 +953,16 @@ async function main() {
         log(`Broker no longer knows us (id=${myId}) — evicted, most likely a broker outage >60s. Re-registering as ${myName}.`);
         const again = await client.register({
           peer_type: RUNTIME_PEER_TYPE,
-          name: myName ?? process.env.PEER_NAME,
+          name: myName ?? requestedName,
           pid: process.pid,
           cwd: myCwd,
           git_root: myGitRoot,
           tty,
           summary: initialSummary,
+          durable: requestDurable,
+          // Mailbox follows the agent: if our old row is gone, the broker
+          // re-points our unacked mail to the new incarnation.
+          prev_id: myId,
         });
         myId = again.id;
         myName = again.name;
@@ -965,6 +996,11 @@ async function main() {
     clearInterval(hb);
     pollStopped = true;
     if (pollTickTimer) clearTimeout(pollTickTimer);
+    // Release the hermes name claim so the next surface (next turn's process)
+    // can win it. Release is owner-checked; a loser releasing is a no-op.
+    if (hermesClaims && hermesClaimedName) {
+      try { await hermesClaims.release(hermesClaimedName, process.pid); } catch { /* best effort */ }
+    }
   };
   // Note: all signal handlers + 'exit' handler are already armed at the top
   // of main(), before any setTabTitle() call — so a terminal close during

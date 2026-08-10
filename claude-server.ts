@@ -377,6 +377,7 @@ async function main() {
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    durable: !!process.env.PEER_NAME && process.env.AGENT_PEERS_EPHEMERAL !== "1",
   });
   myId = reg.id;
   myName = reg.name;
@@ -537,6 +538,10 @@ async function main() {
           git_root: myGitRoot,
           tty,
           summary: initialSummary,
+          durable: !!process.env.PEER_NAME && process.env.AGENT_PEERS_EPHEMERAL !== "1",
+          // Mailbox follows the agent: if our old row is gone, the broker
+          // re-points our unacked mail to the new incarnation.
+          prev_id: myId,
         });
         myId = again.id;
         myName = again.name;

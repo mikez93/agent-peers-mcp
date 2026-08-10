@@ -41,6 +41,17 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  /** Durable retention is now EXPLICIT (2026-08-10): merely requesting a name
+   *  no longer reserves it for 7 days (throwaway `hermes mcp test` spawns and
+   *  crashed cli-operator peers were squatting names). Servers send true only
+   *  for a real long-lived identity (PEER_NAME set and not ephemeral). Absent
+   *  → ephemeral, the conservative direction. */
+  durable?: boolean;
+  /** Id of this client's previous incarnation, if it is re-registering after
+   *  eviction. When that row is GONE, the broker atomically re-points its
+   *  unacked mail to the new row — the mailbox survives the incarnation
+   *  without reusing the session token (which stays the auth boundary). */
+  prev_id?: string;
 }
 
 export interface RegisterResponse {

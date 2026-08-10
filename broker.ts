@@ -4,7 +4,7 @@
 // Spec: docs/superpowers/specs/2026-04-13-agent-peers-mcp-design.md
 
 import { Database } from "bun:sqlite";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync, renameSync, statSync } from "node:fs";
@@ -161,6 +161,7 @@ export function initDb(path: string): Database {
   // next startup re-adds it and peers re-flag themselves on re-registration.
   migrate_peers_add_durable(db);
   migrate_messages_add_message_uid(db);
+  migrate_peers_add_host(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -287,6 +288,24 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_name ON peers(name);`);
 }
 
+function migrate_peers_add_host(db: Database): void {
+  // Forward-compat groundwork for the (deferred) cross-machine federation
+  // workstream: identity will be (name, host), with `id` as mailbox identity
+  // and `session_token` as incarnation. NULL means "this machine" for rows
+  // written by pre-host brokers; new registrations fill os.hostname().
+  // Schema-only — no routing behavior reads it yet.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!columnExists(db, "peers", "host")) {
+      db.exec(`ALTER TABLE peers ADD COLUMN host TEXT`);
+    }
+    db.exec("COMMIT");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
+  }
+}
+
 function migrate_messages_add_message_uid(db: Database): void {
   // Globally unique message identity (2026-08-10). The AUTOINCREMENT integer
   // is broker-local: two machines' brokers both mint id=1, so the moment
@@ -370,30 +389,41 @@ function* nameCandidates(requested: string | undefined): Generator<string> {
 }
 
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
+  // The whole register — reclaim-or-insert plus prev_id mailbox re-pointing —
+  // runs as ONE transaction so a crash can never leave a new row without its
+  // migrated mail (or vice versa).
+  return db.transaction(() => registerPeerInner(db, req))();
+}
+
+function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse {
   const ts = nowIso();
   // Every register (fresh or reclaim) issues a new session_token. Reclaim
   // rotates the token so the previous session's client (if it's still alive
   // elsewhere) can no longer act as this peer — the token is the session
   // boundary.
   const session_token = randomUUID();
+  const host = hostname();
 
-  // A peer that asked for a specific name (PEER_NAME) is a long-lived, named
-  // agent — Ezra, Marco, Vector — that reliably comes back under that name.
-  // A peer that took a generated adjective-noun name is a session tab: when it
-  // closes it is gone for good. Only the former earns durable retention.
-  const durable = req.name && isValidName(req.name) ? 1 : 0;
+  // Durable retention is EXPLICIT (2026-08-10). The old rule — "asked for a
+  // name, therefore durable" — let every `hermes mcp test` spawn and crashed
+  // cli-operator peer reserve a name for 7 days. Absent field → ephemeral.
+  const durable = req.durable === true && req.name && isValidName(req.name) ? 1 : 0;
 
-  // Reclaim fast-path: stale peer with matching name → UPDATE in place, preserve UUID.
+  // Reclaim fast-path: stale peer with matching name AND TYPE → UPDATE in
+  // place, preserve UUID. The type guard (2026-08-10) stops a claude process
+  // from inheriting `ezra-hermes`'s UUID — and therefore its queued mailbox —
+  // just by asking for the name. A name-match with a type mismatch falls
+  // through to the suffix ladder instead.
   if (req.name && isValidName(req.name)) {
     const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
     const reclaim = db.query(
       `UPDATE peers
-         SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
-             session_token = ?, last_seen = ?, durable = 1
-       WHERE name = ? AND last_seen < ?`
+         SET pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+             session_token = ?, last_seen = ?, durable = ?, host = ?
+       WHERE name = ? AND peer_type = ? AND last_seen < ?`
     ).run(
-      req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
-      session_token, ts, req.name, cutoff,
+      req.pid, req.cwd, req.git_root, req.tty, req.summary,
+      session_token, ts, durable, host, req.name, req.peer_type, cutoff,
     );
     if ((reclaim.changes ?? 0) > 0) {
       const row = db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE name = ?").get(req.name);
@@ -403,13 +433,12 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
         // worthless (the old session_token is gone), so the broker would
         // otherwise hold those messages for up to LEASE_DURATION_MS before
         // re-offering them. Clearing on reclaim makes the new session's
-        // first poll return the backlog immediately. Orphan observability
-        // is unaffected (acked=0 rows still show up in cli.ts orphaned-messages
-        // if the reclaimed peer dies again before reading).
+        // first poll return the backlog immediately.
         db.query(
           `UPDATE messages SET lease_token = NULL, lease_expires_at = NULL
            WHERE to_id = ? AND acked = 0`
         ).run(row.id);
+        repointOrphanedMail(db, req.prev_id, row.id);
         return { id: row.id, name: req.name, session_token };
       }
     }
@@ -418,8 +447,8 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   // Fresh INSERT with suffix ladder.
   const id = randomUUID();
   const insert = db.query(
-    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen, durable)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen, durable, host)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   for (const candidate of nameCandidates(req.name)) {
     try {
@@ -431,13 +460,34 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
         // Ezra), the fallback name is not the identity anyone addresses, so it
         // stays ephemeral rather than being retained for a week.
         candidate === req.name ? durable : 0,
+        host,
       );
+      repointOrphanedMail(db, req.prev_id, id);
       return { id, name: candidate, session_token };
     } catch (e) {
       if (!isUniqueViolation(e)) throw e;
     }
   }
   throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
+}
+
+/** Mailbox-follows-the-agent (2026-08-10): when a client re-registers after
+ *  eviction and its OLD row is gone, its unacked mail is still addressed to
+ *  the dead UUID — permanently unreachable under the old behavior (5,202
+ *  orphaned messages accumulated this way). Re-point it to the new
+ *  incarnation. Guard: only when the previous row is GONE — never rob a live
+ *  peer — and never self-referentially. */
+function repointOrphanedMail(db: Database, prevId: string | undefined, newId: string): void {
+  if (!prevId || prevId === newId) return;
+  const prevRow = db.query("SELECT id FROM peers WHERE id = ?").get(prevId);
+  if (prevRow) return; // previous incarnation's row still exists — not ours to move
+  const moved = db.query(
+    `UPDATE messages SET to_id = ?, lease_token = NULL, lease_expires_at = NULL
+     WHERE to_id = ? AND acked = 0`
+  ).run(newId, prevId);
+  if ((moved.changes ?? 0) > 0) {
+    console.error(`[broker] re-pointed ${moved.changes} unacked message(s) from dead incarnation ${prevId} to ${newId}`);
+  }
 }
 
 // NOTE: authPeer() was removed after Codex round-C audit. Every mutating
