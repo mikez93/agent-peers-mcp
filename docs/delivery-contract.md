@@ -32,17 +32,20 @@ does anything.
 
 - **Push-ish**: a background poll (1s) pushes into the session's channel and
   ring buffer, *after* persisting to the durable store
-  (`~/.agent-peers-claude/<peer-uuid>.json`). Durable entries live until
-  `check_messages` surfaces them (consume-on-read), with a 24h backstop TTL
-  for sessions that never check — an unread entry is never expired inside a
-  window a normal working session would hit.
+  (`~/.agent-peers-claude/<peer-uuid>.json`). Durable entries are removed
+  ONLY by confirm-on-next-call: a `check_messages` response draws them, and
+  the next tool call arriving is the evidence that response reached the
+  model. There is NO TTL on unread durable mail — a dead session's file is
+  archived (never deleted) by `gc-inboxes`.
 - Channel push only renders when the session redraws; messages that arrive
   while the session sits idle at the prompt queue invisibly. **`check_messages`
   at the start of a turn is the only reliable read** — it unions the ring
-  buffer (last 15 min) with ALL unread durable mail at any age, and consumes
-  the durable entries it returns.
+  buffer (last 15 min) with ALL unread durable mail at any age. Entries it
+  surfaces are removed only after a LATER call confirms the response landed;
+  an aborted/dropped response leaves them in place for re-delivery.
 - Durable registration requires `PEER_NAME` set and
-  `AGENT_PEERS_EPHEMERAL != "1"`.
+  `AGENT_PEERS_EPHEMERAL != "1"` (the same guard applies to Codex/Hermes:
+  a requested name registers durable unless `AGENT_PEERS_EPHEMERAL=1`).
 
 ### Codex CLI (`codex-server.ts`)
 
@@ -53,10 +56,13 @@ does anything.
   `from` — a non-matching message ends nothing and is never consumed by the
   filter.
 - All inbox steps (ack-flush, confirm-promote, poll, read/mark) run under a
-  per-process mutex; parallel/batched tool calls cannot double-deliver. A
-  message drawn into one call's response becomes confirm-eligible only after
-  that response is fully built — a concurrent call is never treated as
-  evidence that a still-running call's response reached the model.
+  per-process mutex; parallel/batched tool calls cannot double-deliver.
+  Delivery lifecycle (shared/delivery-state.ts): a message drawn into one
+  call's response becomes confirm-eligible only when that exact response is
+  fully built and un-aborted (an aborted request rolls its draws back
+  re-dealable), and its broker ack is enqueued only at the NEXT call's
+  confirm — never at draw time. A concurrent call is never treated as
+  evidence about a still-running call.
 
 ### Hermes (`hermes-server.ts` → codex transport)
 
@@ -68,7 +74,7 @@ does anything.
   PEER_NAME-keyed file-lock election (`~/.agent-peers-hermes/name-claims/`);
   the winner registers durable and owns the name, losers register under an
   ephemeral generated name and age out in 60s once their process dies. Losers
-  keep the FULL tool surface (list/send/check) — they can still act as the
+  keep the same configured tool allowlist as the winner — they can still act as the
   user's live surface; they just never own the canonical name. Duplicate
   ephemeral rows next to a durable one are election losers, not a bug.
 - Config contract per profile: `PEER_NAME`, `AGENT_PEERS_CWD`,
@@ -83,7 +89,9 @@ does anything.
   "confirmed".
 - Observability CLI: `bun cli.ts inboxes [--stranded]` (unread mail matched to
   live/dead broker rows), `stranded-messages` (unacked to peers idle >24h),
-  `gc-inboxes [--apply]` (archives dead inbox files by rename — never deletes).
+  `gc-inboxes [--min-age-days N]` (dry-run by default; add `--apply` to archive
+  dead inbox files by timestamped rename — never deletes; default 7d mtime gate
+  announces skips).
 - On re-registration, `prev_id` re-points unacked mail to the new incarnation
   only when the old row is gone; a live row is never robbed.
 - Broker restarts stamp a new `BROKER_EPOCH` (returned on register/heartbeat)

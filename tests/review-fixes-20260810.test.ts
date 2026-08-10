@@ -106,3 +106,33 @@ test("concurrent dead-owner reclaim: exactly one winner per round", async () => 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("PID reuse: a live pid started AFTER lock acquisition does not hold the claim", async () => {
+  const { mkdtempSync: mkdtemp, rmSync: rm, writeFileSync: writeF } = await import("node:fs");
+  const { tmpdir: tmp } = await import("node:os");
+  const { join: j } = await import("node:path");
+  const dir = mkdtemp(j(tmp(), "claims-pidreuse-"));
+  try {
+    // Simulate post-reboot pid reuse: the lock's owner_pid is a LIVE process
+    // (this one), but the lock claims it was acquired long before this
+    // process started — impossible for the true owner, so it must be
+    // reclaimable by another claimant.
+    writeF(
+      j(dir, "reused-agent.lock"),
+      JSON.stringify({ owner_pid: process.pid, acquired_at: new Date(Date.now() - 365 * 24 * 3600_000).toISOString() }),
+      { mode: 0o600 },
+    );
+    const rival = new HermesNameClaims(dir);
+    expect(await rival.tryAcquire("reused-agent", 1)).toBe(true); // pid 1 = launchd, alive
+
+    // Control: a lock acquired NOW by this live process is genuinely held.
+    writeF(
+      j(dir, "held-agent.lock"),
+      JSON.stringify({ owner_pid: process.pid, acquired_at: new Date().toISOString() }),
+      { mode: 0o600 },
+    );
+    expect(await rival.tryAcquire("held-agent", 1)).toBe(false);
+  } finally {
+    rm(dir, { recursive: true, force: true });
+  }
+});

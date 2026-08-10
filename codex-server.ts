@@ -35,29 +35,17 @@
 //   any dedupe state — the [PEER INBOX] block (Layer 2) is the one and
 //   only "this was shown to the model" trigger.
 //
-// DEDUPE STATE MACHINE (three sets, confirm-on-next-call):
-//
-//   - `drawnPendingReturn` — message_ids dealt to a response that is
-//     STILL BEING BUILT. Blocks concurrent calls from re-dealing, but is
-//     NOT confirm-eligible: with parallel tool calls, another call
-//     arriving is no evidence this response ever completed.
-//
-//   - `presentedPendingConfirm` — message_ids in a FULLY BUILT response
-//     handed back to the transport. Populated at the end of withPiggyback.
-//
-//   - `seen` — message_ids we're SURE reached the model. Populated at
-//     the START of the NEXT tool call (Codex calling us again is the
-//     evidence that the previous fully-built response cycle landed). Once
-//     a message is `seen`, we ack its lease, prune it from the durable
-//     queue, and ignore any future re-delivery of the same id.
-//
-// This splits what was previously a single `seen` set that conflated
-// "about to be shown" with "known shown." The earlier code could ack +
-// prune a message whose response was aborted before reaching Codex —
-// silent loss. The split closes that race: a dropped response leaves the
-// message in the durable queue AND outside the `seen` set, so on the
-// next tool call (or the next session after a restart) it re-surfaces.
-// At-least-once per spec §5.4.
+// DEDUPE STATE MACHINE: see shared/delivery-state.ts (drawn → presented →
+// confirmed, per-call draw tracking, abort rollback). The load-bearing rules:
+//   - broker acks are enqueued ONLY at confirm time — never at draw. A
+//     message's lease deliberately stays open (and re-offers) while it sits
+//     drawn/presented; triage refreshes the stored token on re-offer.
+//   - draws promote to confirm-eligible only when THEIR OWN response is
+//     fully built and un-aborted; an aborted request rolls its draws back.
+//   - the NEXT call arriving confirms presented ids: freshest token read →
+//     durable-store prune → ack enqueue → confirmed.
+// A dropped response or dead process therefore leaves messages unacked at
+// the broker and present in the durable store: at-least-once per spec §5.4.
 //
 // Shutdown: clear timers and exit. Deliberately do NOT flush pendingAcks
 // (those messages may not have reached Codex yet — flushing on exit would
@@ -85,6 +73,7 @@ import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { planWaitForPeerMessages, waitForFreshPeerMessages as waitForFreshPeerMessagesLoop } from "./shared/wait-for-peer-messages.ts";
 import { createAsyncLock } from "./shared/async-lock.ts";
+import { DeliveryState } from "./shared/delivery-state.ts";
 import { HermesNameClaims } from "./shared/hermes-claims.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
@@ -279,24 +268,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 const MAX_PENDING_ACKS = 500;
 const pendingAcks: string[] = [];
 
-// Dedupe state (see top-of-file state-machine comment):
-//   - `drawnPendingReturn`: messages drawn into a response that is STILL
-//     BEING BUILT (handler running). Blocks concurrent calls from re-dealing
-//     the same items, but is NOT confirm-eligible: with parallel tool calls,
-//     call B entering the lock is no evidence that call A's response ever
-//     reached the model (2026-08-10 codex-review high #1 — B used to
-//     confirm+delete what A had drawn while A was still running).
-//   - `presentedPendingConfirm`: messages in a FULLY BUILT response handed
-//     back to the transport. Promoted to `seen` at the START of the next
-//     call — the same "Codex called us again" evidence the serial design
-//     used, now scoped to responses that actually completed.
-//   - `seen`: messages we are SURE reached the model. Only these get their
-//     lease acked + are pruned from the durable queue.
-// A process that dies mid-handler leaves ids in drawnPendingReturn — never
-// confirmed, so the durable store re-offers them on the next incarnation.
-const drawnPendingReturn = new Set<number>();
-const presentedPendingConfirm = new Set<number>();
-const seen = new Set<number>();
+// Dedupe/delivery state machine — extracted to shared/delivery-state.ts so
+// its concurrency + cancellation semantics are deterministically testable
+// (2026-08-10 second review). Key invariants enforced there:
+//   - a drawn message blocks re-deal but is neither ack- nor confirm-eligible
+//   - draws promote only when THEIR response is fully built and un-aborted;
+//     an aborted call rolls its draws back to re-dealable
+//   - broker acks are enqueued ONLY at confirm time (the next call arriving
+//     after a fully-built response) — never at draw. Lease expiry/re-offer in
+//     the interim is handled by token refresh in the triage below.
+const delivery = new DeliveryState();
 
 function enqueueAck(token: string) {
   pendingAcks.push(token);
@@ -318,8 +299,7 @@ async function waitForFreshPeerMessages(timeoutMs: number, from?: string): Promi
     // it is never consumed by a wait it didn't satisfy (known-issues
     // 2026-08-08 §1: Marco's wait for Kepler ate an unrelated Vector message).
     isFresh: (m) =>
-      !seen.has(m.id) &&
-      !presentedPendingConfirm.has(m.id) &&
+      !delivery.isBlocked(m.id) &&
       (!from || m.from_id === from || m.from_name === from),
     onError: (message) => log(`wait_for_peer_messages ${message}`),
   });
@@ -346,23 +326,20 @@ async function pollBrokerIntoQueue(): Promise<void> {
     // Triage leased messages by dedupe state.
     const freshlyUnread: LeasedMessage[] = [];
     for (const message of leased) {
-      if (seen.has(message.id)) {
+      if (delivery.isConfirmed(message.id)) {
         // We're certain the model saw this one already (previous tool
         // call's piggyback, confirmed by the call after). The lease just
         // got re-offered because our earlier ack was lost or the lease
         // expired before ack. Close it now — this is safe because the
         // model-delivery evidence is already in hand.
         enqueueAck(message.lease_token);
-      } else if (presentedPendingConfirm.has(message.id)) {
-        // We drew this into the CURRENT response's [PEER INBOX] block but
-        // haven't yet seen the next tool call that would confirm
-        // delivery. DO NOT ack (would silently drop if the response was
-        // lost). DO NOT re-queue in the durable inbox (would make the
-        // piggyback double-surface it within the same call). Just stash
-        // the new lease token so next-call confirm-flush closes both old
-        // + new leases atomically.
-        enqueueAck(message.lease_token);
       } else {
+        // Fresh, drawn, or presented: upsert into the durable store. For
+        // drawn/presented ids this REFRESHES the stored lease token (the
+        // draw filter blocks re-surfacing), so the confirm-time ack always
+        // uses the freshest token. NEVER enqueue an ack here — an unacked
+        // lease on an undelivered message is the broker's re-offer safety,
+        // and acking it early was exactly the second-review H1 race.
         freshlyUnread.push(message);
       }
     }
@@ -372,9 +349,12 @@ async function pollBrokerIntoQueue(): Promise<void> {
     // Authoritative persistence FIRST — if this fails, we do not push and
     // do not ack; next poll tick retries because the lease will expire at
     // the broker and the message will be re-leased.
+    const genuinelyNew = freshlyUnread.filter((m) => !delivery.isBlocked(m.id));
     try {
       await inboxStore.queueLeasedMessages(freshlyUnread);
-      log(`queued ${freshlyUnread.length} unread peer message(s): ${freshlyUnread.map((msg) => `#${msg.id} from ${msg.from_name}`).join(", ")}`);
+      if (genuinelyNew.length > 0) {
+        log(`queued ${genuinelyNew.length} unread peer message(s): ${genuinelyNew.map((msg) => `#${msg.id} from ${msg.from_name}`).join(", ")}`);
+      }
     } catch (e) {
       log(`failed to persist unread peer messages: ${e instanceof Error ? e.message : String(e)}`);
       return;
@@ -390,7 +370,7 @@ async function pollBrokerIntoQueue(): Promise<void> {
     // same message twice (once via log, once via piggyback) and send two
     // replies. Failures are non-fatal — the authoritative path still
     // delivers on the next tool call.
-    for (const m of freshlyUnread) {
+    for (const m of genuinelyNew) {
       try {
         await mcp.notification({
           method: "notifications/message",
@@ -436,7 +416,7 @@ const withPiggybackLock = createAsyncLock();
 
 async function withPiggyback(
   handler: () => Promise<{ text: string; isError?: boolean }>,
-  opts: { beforeReadQueue?: () => Promise<void> } = {},
+  opts: { beforeReadQueue?: () => Promise<void>; signal?: AbortSignal } = {},
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
   if (!myId || !mySession) {
     return {
@@ -444,6 +424,7 @@ async function withPiggyback(
       isError: true,
     };
   }
+  const callId = crypto.randomUUID();
 
   // Pre-draw hook OUTSIDE the lock: wait_for_peer_messages can block for
   // minutes, and holding the lock across it would freeze every other
@@ -456,7 +437,7 @@ async function withPiggyback(
     log(`before-read hook failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  const fresh = await withPiggybackLock(async () => acquireInboxBatch());
+  const fresh = await withPiggybackLock(async () => acquireInboxBatch(callId));
 
   // Serving-identity delivery breadcrumb (delivery-fix spec §6.4). This is the
   // ONE place a message is handed to the model, so logging the serving identity
@@ -482,34 +463,64 @@ async function withPiggyback(
 
   const inbox = formatInboxBlock(fresh);
   const finalText = inbox + toolText;
-  // The response is fully built and about to be handed to the transport:
-  // THIS call's drawn messages become confirm-eligible for the next call.
-  for (const m of fresh) {
-    drawnPendingReturn.delete(m.id);
-    presentedPendingConfirm.add(m.id);
+  if (opts.signal?.aborted) {
+    // The request was cancelled: this response will never reach the model.
+    // Roll the draws back to re-dealable — nothing was acked, nothing was
+    // pruned, so the messages surface intact in the next call's inbox.
+    delivery.rollback(callId);
+    if (fresh.length > 0) log(`request aborted; rolled back ${fresh.length} drawn message(s) for re-delivery`);
+  } else {
+    // The response is fully built and about to be handed to the transport:
+    // THIS call's drawn messages become confirm-eligible for the next call.
+    delivery.promote(callId);
   }
   return { content: [{ type: "text", text: finalText }], isError: toolError };
 }
 
-// The locked critical section: ack-flush, confirm-promote, poll, and the
+// The locked critical section: confirm-promote, ack-flush, poll, and the
 // read-filter-mark draw. Exactly one concurrent tool call can be in here.
-async function acquireInboxBatch(): Promise<LeasedMessage[]> {
+async function acquireInboxBatch(callId: string): Promise<LeasedMessage[]> {
   // ------------------------------------------------------------------------
-  // STEP 1a — Unconditional ack flush.
+  // STEP 1a — Confirm-promote FIRST: items drawn into a FULLY BUILT previous
+  // response are now (with Codex calling us again as evidence) known to have
+  // reached the model. Sequence per the delivery contract:
+  //   1. read the FRESHEST lease tokens for the confirming ids from the
+  //      durable store (re-offers refresh them via the triage upsert)
+  //   2. prune the ids from the durable store
+  //   3. only then enqueue their acks — a broker ack is never sent for a
+  //      message without model-delivery evidence (2026-08-10 second-review
+  //      H1: acks used to enqueue at DRAW, so a concurrent call's flush
+  //      acked messages a cancelled call never delivered)
+  // Prune failure keeps everything confirm-pending and retries next call.
+  // Running confirm before the flush means these acks go out in THIS call.
+  const confirmable = delivery.confirmable();
+  if (confirmable.length > 0 && inboxStore) {
+    try {
+      const confirmingSet = new Set(confirmable);
+      const tokens = (await inboxStore.getUnreadMessages())
+        .filter((m) => confirmingSet.has(m.id))
+        .map((m) => m.lease_token);
+      await inboxStore.removeByIds(confirmable);
+      for (const t of tokens) enqueueAck(t);
+      delivery.markConfirmed(confirmable);
+    } catch (e) {
+      log(`confirm-flush queue-prune failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // STEP 1b — Unconditional ack flush.
   //
-  // We always attempt to ack every token in pendingAcks, even when
-  // presentedPendingConfirm is empty. pollBrokerIntoQueue's seen-branch
-  // stashes re-lease tokens for messages we already confirmed delivered
-  // — those must be flushed even in tool calls that don't draw any new
-  // inbox items, otherwise the broker re-leases the row forever and it
-  // never transitions to acked=1 (perpetually-unacked zombie row per
-  // codex review PR #2 round 2).
+  // Flushes confirm-time acks from step 1a plus re-lease tokens the triage
+  // stashed for already-confirmed messages — those must go out even in tool
+  // calls that don't draw new inbox items, otherwise the broker re-leases
+  // the row forever and it never transitions to acked=1.
   //
   // Tokens are removed from pendingAcks only on HTTP success; an
   // exception leaves them for the next call to retry. HTTP success with
   // `acked: 0` at the broker (stale tokens) still counts — the next
-  // re-lease will land new tokens in pendingAcks via the seen-branch,
-  // and this flush will eventually succeed against the current lease.
+  // re-lease refreshes the stored token and the confirm/triage paths
+  // re-enqueue against the current lease.
   if (pendingAcks.length > 0) {
     const toFlush = pendingAcks.slice();
     try {
@@ -536,27 +547,6 @@ async function acquireInboxBatch(): Promise<LeasedMessage[]> {
   }
 
   // ------------------------------------------------------------------------
-  // STEP 1b — Confirm-promote: items drawn into the PREVIOUS response
-  // are now (with Codex calling us again as evidence) known to have
-  // reached the model. Prune them from the durable queue and move their
-  // ids into `seen`. Pruning can fail independently of the ack above
-  // (disk I/O vs broker HTTP); if it does we keep the items in
-  // presentedPendingConfirm and retry next call. Partial promotion is
-  // not allowed — would re-open the silent-loss window.
-  if (presentedPendingConfirm.size > 0) {
-    const confirming = [...presentedPendingConfirm];
-    try {
-      if (inboxStore) await inboxStore.removeByIds(confirming);
-      for (const id of confirming) {
-        seen.add(id);
-        presentedPendingConfirm.delete(id);
-      }
-    } catch (e) {
-      log(`confirm-flush queue-prune failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
-  // ------------------------------------------------------------------------
   // STEP 2 — Inline poll so we pick up anything that arrived in the last
   // POLL_INTERVAL_MS window. Background loop does the same thing on a
   // timer; calling it here collapses the worst-case "message landed 0.99s
@@ -569,7 +559,7 @@ async function acquireInboxBatch(): Promise<LeasedMessage[]> {
 
   // ------------------------------------------------------------------------
   // STEP 3 — Read (do NOT consume) the durable queue. Items stay on disk
-  // until the NEXT call's confirm-flush promotes them to `seen` and
+  // until a LATER call's confirm-flush marks them confirmed and
   // removes them. A dropped response thus leaves the message in place
   // for re-delivery, fixing the silent-loss race the codex-reviewer bot
   // flagged on PR #2 round 1.
@@ -581,37 +571,31 @@ async function acquireInboxBatch(): Promise<LeasedMessage[]> {
   }
 
   // Filter out anything already confirmed delivered (defensive — the
-  // durable queue shouldn't contain `seen` ids, but pollBrokerIntoQueue's
-  // seen-branch guarantees it) and anything we already drew into an
+  // durable queue shouldn't contain confirmed ids, but the confirm step
+  // prunes them) and anything we already drew into an
   // earlier-but-unconfirmed response (presentedPendingConfirm). The
   // latter can happen if the previous call's confirm-flush partially
   // failed above; we want to keep showing the same items until flush
   // succeeds, not start dealing duplicates.
   const fresh: LeasedMessage[] = [];
   for (const m of queued) {
-    if (seen.has(m.id)) continue;
-    if (presentedPendingConfirm.has(m.id) || drawnPendingReturn.has(m.id)) {
-      // Already dealt to a response that is in flight or awaiting confirm.
-      // Skip re-drawing — that presentation is the one we're waiting on.
-      continue;
-    }
+    // Blocked = confirmed, or dealt to a response that is in flight or
+    // awaiting confirm — that presentation is the one we're waiting on.
+    if (delivery.isBlocked(m.id)) continue;
     fresh.push(m);
   }
 
-  // Mark fresh items as drawn-into-an-in-flight-response and stash their
-  // lease tokens. This is the single write point where a message
-  // transitions from "sitting in queue" to "dealt to a response". It
-  // becomes confirm-ELIGIBLE only when withPiggyback finishes building
-  // that response (drawnPendingReturn → presentedPendingConfirm).
-  for (const m of fresh) {
-    drawnPendingReturn.add(m.id);
-    enqueueAck(m.lease_token);
-  }
+  // Mark fresh items as drawn into THIS call's response. This is the single
+  // write point where a message transitions from "sitting in queue" to
+  // "dealt to a response". No ack is enqueued here — draws become
+  // confirm-eligible only when withPiggyback finishes building this exact
+  // response (promote), and ack-eligible only at the NEXT call's confirm.
+  delivery.draw(callId, fresh.map((m) => m.id));
 
-  // Watermark-prune the `seen` dedupe set (it previously grew forever).
+  // Watermark-prune the confirmed set (it previously grew forever).
   // Message ids are AUTOINCREMENT-monotonic: anything far below the newest id
   // AND below everything still in the durable queue can never be re-offered
-  // in a way this set still needs to dedupe.
+  // in a way this state still needs to dedupe.
   pruneSeenWatermark(queued);
 
   return fresh;
@@ -620,16 +604,14 @@ async function acquireInboxBatch(): Promise<LeasedMessage[]> {
 const SEEN_WATERMARK_SLACK = 10_000;
 
 function pruneSeenWatermark(queued: LeasedMessage[]): void {
-  if (seen.size === 0) return;
-  let maxSeen = 0;
-  for (const id of seen) if (id > maxSeen) maxSeen = id;
+  const maxConfirmed = delivery.maxConfirmed();
+  if (!Number.isFinite(maxConfirmed)) return;
   let minQueued = Infinity;
   for (const m of queued) if (m.id < minQueued) minQueued = m.id;
-  const watermark = Math.min(minQueued, maxSeen - SEEN_WATERMARK_SLACK);
-  for (const id of seen) if (id < watermark) seen.delete(id);
+  delivery.pruneConfirmedBelow(Math.min(minQueued, maxConfirmed - SEEN_WATERMARK_SLACK));
 }
 
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   const { name, arguments: args } = req.params;
   let waitResult: { didWait: boolean; found: boolean; timeoutMs: number; skippedWakeable?: boolean } | null = null;
 
@@ -719,6 +701,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { text: `Unknown tool: ${name}`, isError: true };
     }
   }, {
+    signal: extra?.signal,
     beforeReadQueue: name === "wait_for_peer_messages"
       ? async () => {
           const plan = planWaitForPeerMessages({

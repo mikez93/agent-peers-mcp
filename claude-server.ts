@@ -32,6 +32,7 @@ import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive }
 import { formatInboxBlock } from "./shared/piggyback.ts";
 import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
+import { DeliveryState } from "./shared/delivery-state.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -71,13 +72,11 @@ let myGitRoot: string | null = null;
 // BEFORE the channel push, and acked only after the write lands.
 let inboxStore: CodexInboxStore | null = null;
 const CLAUDE_INBOX_ROOT = process.env.AGENT_PEERS_STATE_DIR ?? join(homedir(), ".agent-peers-claude");
-// Backstop only. check_messages consumes durable entries when it surfaces
-// them; this TTL exists so a session that NEVER calls check_messages doesn't
-// grow its store forever. It must be generous: pruning an unread entry is
-// destroying mail the model never saw (the broker already acked it), so the
-// old 15-minute value was a silent-loss window for any session idle longer.
-const INBOX_TTL_MS = 24 * 60 * 60 * 1000;
 const SEEN_WATERMARK_SLACK = 10_000; // same bound as codex-server's watermark
+// Delivery lifecycle for durable entries surfaced via check_messages:
+// draw → promote (response fully built) → confirm+remove on the NEXT call.
+// See shared/delivery-state.ts. There is NO TTL on unread durable mail.
+const delivery = new DeliveryState();
 
 // The recent-delivered ring buffer is the backfill surface for check_messages.
 // See shared/recent-delivered.ts for the full rationale. Extracted out of this
@@ -108,9 +107,10 @@ to use both:
      prompt, Claude Code queues the channel push — the model doesn't
      see it until the next turn begins, and it may not render
      visibly even then. Calling \`check_messages\` returns a
-     [PEER INBOX] block containing every peer message received in
-     the last 15 minutes plus ALL unread durable mail at any age, so
-     nothing gets lost to idle-queue silence.
+     [PEER INBOX] block containing recent ring-buffer messages plus
+     ALL unread durable mail at any age, so nothing gets lost to
+     idle-queue silence. Durable entries are removed only after a
+     later call confirms the response reached you.
 
 RULE: Call \`check_messages\` as the FIRST thing you do at the START of
 every user turn. This is the same rule Codex uses. It's one cheap
@@ -182,13 +182,27 @@ const TOOLS = [
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   const { name, arguments: args } = req.params;
   if (!myId || !mySession) {
     return {
       content: [{ type: "text" as const, text: "Not registered with broker yet" }],
       isError: true,
     };
+  }
+
+  // Confirm-on-next-call (same machine as codex-server, shared/delivery-state):
+  // durable entries surfaced by an earlier FULLY BUILT check_messages response
+  // are removed only now — this call arriving is the evidence that response
+  // reached the model. A dropped/aborted response leaves them in the store.
+  const confirmable = delivery.confirmable();
+  if (confirmable.length > 0 && inboxStore) {
+    try {
+      await inboxStore.removeByIds(confirmable);
+      delivery.markConfirmed(confirmable);
+    } catch (e) {
+      log(`durable-inbox confirm failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   switch (name) {
@@ -256,16 +270,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // Durable unread is included at ANY age — an unread message is an
       // undelivered obligation, and hiding it behind the ring buffer's
       // 15-minute display window was a silent-loss path for sessions idle
-      // longer than the TTL (2026-08-10 codex-review high #2).
-      const surfacedDurable: number[] = [];
+      // longer than the TTL (2026-08-10 codex-review high #2). Entries stay
+      // in the store until a LATER call confirms this response landed —
+      // never removed in the same response that surfaces them (second
+      // review: consume-before-return loses mail on a dropped response).
+      const callId = crypto.randomUUID();
+      const drawnIds: number[] = [];
       try {
         if (inboxStore) {
           const have = new Set(recent.map((m) => m.id));
           for (const m of await inboxStore.getUnreadMessages()) {
+            if (delivery.isBlocked(m.id)) continue; // dealt to an in-flight/unconfirmed response
             if (!have.has(m.id)) recent.push(m);
-            // Every durable entry this response surfaces is consumed below —
-            // whether it ALSO sat in the ring buffer or not.
-            surfacedDurable.push(m.id);
+            drawnIds.push(m.id);
           }
           recent.sort((a, b) => a.id - b.id);
         }
@@ -276,24 +293,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return {
           content: [{
             type: "text" as const,
-            text: "No peer messages pending (ring buffer covers the last 15 minutes; anything older that you never saw would appear here from the durable inbox). Messages also arrive live mid-turn via the agent-peers channel while you're active — this tool is the fallback for idle-at-prompt arrivals.",
+            text: "No peer messages pending (ring buffer covers the last 15 minutes; unread durable mail at any age would appear here). Messages also arrive live mid-turn via the agent-peers channel while you're active — this tool is the fallback for idle-at-prompt arrivals.",
           }],
         };
       }
-      // Consume-on-surface: the durable copies just went into this response,
-      // so remove them — the next check_messages should not re-deal them, and
-      // the backstop TTL can no longer expire something the model never saw.
-      try {
-        if (surfacedDurable.length > 0 && inboxStore) await inboxStore.removeByIds(surfacedDurable);
-      } catch (e) {
-        log(`durable-inbox consume failed (entries will re-surface): ${e instanceof Error ? e.message : String(e)}`);
-      }
-      return {
+      delivery.draw(callId, drawnIds);
+      const response = {
         content: [{
           type: "text" as const,
           text: formatInboxBlock(recent),
         }],
       };
+      if (extra?.signal?.aborted) {
+        delivery.rollback(callId); // response won't reach the model; re-deal later
+      } else {
+        delivery.promote(callId); // removal happens at the NEXT call's confirm
+      }
+      return response;
     }
 
     case "rename_peer": {
@@ -504,17 +520,13 @@ async function main() {
         const watermark = Math.max(...seen) - SEEN_WATERMARK_SLACK;
         for (const id of seen) if (id < watermark) seen.delete(id);
       }
-      // Backstop TTL prune (24h): check_messages consumes what it surfaces;
-      // this only catches sessions that never check at all.
-      try {
-        if (inboxStore) {
-          const cutoff = Date.now() - INBOX_TTL_MS;
-          const expired = (await inboxStore.getUnreadMessages())
-            .filter((q) => Date.parse(q.sent_at) < cutoff)
-            .map((q) => q.id);
-          if (expired.length > 0) await inboxStore.removeByIds(expired);
-        }
-      } catch { /* prune is housekeeping; next tick retries */ }
+      // NO TTL prune of unread durable mail (2026-08-10 second review):
+      // an unread entry is mail the model has never seen, and the broker
+      // already acked it — deleting it on a timer is silent loss, full stop.
+      // Entries leave the store ONLY via confirm-on-next-call after a fully
+      // built check_messages response, or via the rejoin migration. A dead
+      // session's file is archived (never deleted) by `cli.ts gc-inboxes`.
+      delivery.pruneConfirmedBelow(delivery.maxConfirmed() - SEEN_WATERMARK_SLACK);
       if (toAck.length > 0 && mySession) {
         try {
           await client.ackMessages({ id: myId, session_token: mySession, lease_tokens: toAck });

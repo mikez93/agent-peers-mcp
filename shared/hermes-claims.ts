@@ -48,7 +48,7 @@ function isProcessAlive(pid: number | null | undefined): boolean {
  *  process can be assigned the lock owner's old pid, making a genuinely dead
  *  claim look held forever and stranding the canonical name. A pid only
  *  vouches for the lock if its process STARTED BEFORE the lock was acquired
- *  (with 30s tolerance for clock/parse skew). If `ps` can't answer (EPERM'd
+ *  (2s tolerance — ps lstart has 1s precision). If `ps` can't answer (EPERM'd
  *  zombie, race), fall back to pid-liveness alone — the conservative side. */
 function ownerStillHoldsClaim(pid: number | null | undefined, acquiredAt: string | undefined): boolean {
   if (!isProcessAlive(pid)) return false;
@@ -59,7 +59,7 @@ function ownerStillHoldsClaim(pid: number | null | undefined, acquiredAt: string
     const proc = Bun.spawnSync(["ps", "-p", String(pid), "-o", "lstart="]);
     const started = Date.parse(proc.stdout.toString().trim());
     if (!Number.isFinite(started)) return true;
-    return started <= acquired + 30_000;
+    return started <= acquired + 2_000;
   } catch {
     return true;
   }
