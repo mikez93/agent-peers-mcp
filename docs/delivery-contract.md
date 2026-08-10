@@ -34,8 +34,10 @@ does anything.
   ring buffer, *after* persisting to the durable store
   (`~/.agent-peers-claude/<peer-uuid>.json`). Durable entries are removed
   ONLY by confirm-on-next-call: a `check_messages` response draws them, and
-  the next tool call arriving is the evidence that response reached the
-  model. There is NO TTL on unread durable mail — a dead session's file is
+  a tool call that was ISSUED AFTER that response finished building is the
+  evidence it reached the model. Eligibility is snapshotted at request
+  entry — a call issued before or concurrently with a response (however
+  late it runs) confirms nothing. There is NO TTL on unread durable mail — a dead session's file is
   archived (never deleted) by `gc-inboxes`.
 - Channel push only renders when the session redraws; messages that arrive
   while the session sits idle at the prompt queue invisibly. **`check_messages`
@@ -61,8 +63,12 @@ does anything.
   call's response becomes confirm-eligible only when that exact response is
   fully built and un-aborted (an aborted request rolls its draws back
   re-dealable), and its broker ack is enqueued only at the NEXT call's
-  confirm — never at draw time. A concurrent call is never treated as
-  evidence about a still-running call.
+  confirm — never at draw time. Confirmation carries an arrival-causality
+  barrier: each request snapshots confirm eligibility at entry (before any
+  pre-read wait), so only responses fully built BEFORE the request was
+  issued are confirmable by it. A concurrent or earlier-issued call —
+  including one parked for minutes in `wait_for_peer_messages` — is never
+  treated as evidence about a response built after it arrived.
 
 ### Hermes (`hermes-server.ts` → codex transport)
 

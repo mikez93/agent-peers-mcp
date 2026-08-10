@@ -305,25 +305,25 @@ async function waitForFreshPeerMessages(timeoutMs: number, from?: string): Promi
   });
 }
 
-async function pollBrokerIntoQueue(): Promise<void> {
-  if (!myId || !mySession || !inboxStore) return;
-  if (pollInFlight) {
-    await pollInFlight;
-    return;
-  }
+// Fetch leases from the broker. Pure HTTP — touches no local state, so it is
+// safe to run outside the piggyback lock (and MUST run outside it for the
+// background/wait-hook paths, where holding the lock across network I/O would
+// stall concurrent tool calls).
+async function fetchBrokerLeases(): Promise<LeasedMessage[]> {
+  return client.pollMessages({ id: myId!, session_token: mySession! });
+}
 
-  pollInFlight = (async () => {
-    let leased: LeasedMessage[] = [];
-    try {
-      leased = await client.pollMessages({ id: myId!, session_token: mySession! });
-    } catch (e) {
-      log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
-      return;
-    }
+// Classify + upsert leased messages into the durable queue. MUST run under
+// withPiggybackLock (or from code already inside that critical section): the
+// isConfirmed/isBlocked classification and the queue upsert have to be atomic
+// with respect to a concurrent confirm's read-token → remove → markConfirmed
+// sequence (2026-08-10 third review, Medium: an upsert interleaved inside that
+// window resurrects a just-confirmed row as unread, or the confirm ack reads a
+// token the upsert is about to replace).
+async function applyLeasedToQueue(leased: LeasedMessage[]): Promise<void> {
+  if (!inboxStore || leased.length === 0) return;
 
-    if (leased.length === 0) return;
-
-    // Triage leased messages by dedupe state.
+  // Triage leased messages by dedupe state.
     const freshlyUnread: LeasedMessage[] = [];
     for (const message of leased) {
       if (delivery.isConfirmed(message.id)) {
@@ -398,6 +398,31 @@ async function pollBrokerIntoQueue(): Promise<void> {
         log(`preview push failed for msg #${m.id} (non-fatal; tool-call will deliver): ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+}
+
+// Unlocked-caller entry point (background timer + wait-for-messages hook):
+// fetch outside the lock, then take the lock just for the classify/upsert.
+// Code that already HOLDS the piggyback lock (acquireInboxBatch STEP 2) must
+// NOT call this — createAsyncLock is not reentrant, and awaiting a pollInFlight
+// that is itself queued on our lock would deadlock; it calls
+// fetchBrokerLeases() + applyLeasedToQueue() directly instead.
+async function pollBrokerIntoQueue(): Promise<void> {
+  if (!myId || !mySession || !inboxStore) return;
+  if (pollInFlight) {
+    await pollInFlight;
+    return;
+  }
+
+  pollInFlight = (async () => {
+    let leased: LeasedMessage[] = [];
+    try {
+      leased = await fetchBrokerLeases();
+    } catch (e) {
+      log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    if (leased.length === 0) return;
+    await withPiggybackLock(() => applyLeasedToQueue(leased));
   })();
 
   try {
@@ -425,6 +450,13 @@ async function withPiggyback(
     };
   }
   const callId = crypto.randomUUID();
+  // Arrival-causality barrier: snapshot confirm eligibility NOW, at request
+  // entry — BEFORE the pre-read hook, which can park this call in a
+  // wait-for-messages loop for minutes. A response promoted while this call
+  // is parked was built AFTER this call was issued, so this call is no
+  // evidence the model received it (2026-08-10 third review, H1: the
+  // lock-entry sample let a parked call confirm a sibling's later promote).
+  const arrivalGen = delivery.newArrival();
 
   // Pre-draw hook OUTSIDE the lock: wait_for_peer_messages can block for
   // minutes, and holding the lock across it would freeze every other
@@ -437,7 +469,7 @@ async function withPiggyback(
     log(`before-read hook failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  const fresh = await withPiggybackLock(async () => acquireInboxBatch(callId));
+  const fresh = await withPiggybackLock(async () => acquireInboxBatch(callId, arrivalGen));
 
   // Serving-identity delivery breadcrumb (delivery-fix spec §6.4). This is the
   // ONE place a message is handed to the model, so logging the serving identity
@@ -479,7 +511,7 @@ async function withPiggyback(
 
 // The locked critical section: confirm-promote, ack-flush, poll, and the
 // read-filter-mark draw. Exactly one concurrent tool call can be in here.
-async function acquireInboxBatch(callId: string): Promise<LeasedMessage[]> {
+async function acquireInboxBatch(callId: string, arrivalGen: number): Promise<LeasedMessage[]> {
   // ------------------------------------------------------------------------
   // STEP 1a — Confirm-promote FIRST: items drawn into a FULLY BUILT previous
   // response are now (with Codex calling us again as evidence) known to have
@@ -493,7 +525,11 @@ async function acquireInboxBatch(callId: string): Promise<LeasedMessage[]> {
   //      acked messages a cancelled call never delivered)
   // Prune failure keeps everything confirm-pending and retries next call.
   // Running confirm before the flush means these acks go out in THIS call.
-  const confirmable = delivery.confirmable();
+  //
+  // Eligibility uses the ARRIVAL snapshot from withPiggyback entry, not
+  // lock-entry state: only responses fully built before this request was
+  // issued are confirmable by it.
+  const confirmable = delivery.confirmable(arrivalGen);
   if (confirmable.length > 0 && inboxStore) {
     try {
       const confirmingSet = new Set(confirmable);
@@ -551,8 +587,14 @@ async function acquireInboxBatch(callId: string): Promise<LeasedMessage[]> {
   // POLL_INTERVAL_MS window. Background loop does the same thing on a
   // timer; calling it here collapses the worst-case "message landed 0.99s
   // before this tool call" tail.
+  //
+  // We already HOLD the piggyback lock, so this calls fetch+apply directly.
+  // Going through pollBrokerIntoQueue() here would deadlock: it can await a
+  // background pollInFlight that is itself queued on the lock we hold. A
+  // concurrent background fetch is harmless — its apply serializes behind us
+  // and the id-keyed upsert/triage is re-offer-safe by design.
   try {
-    await pollBrokerIntoQueue();
+    await applyLeasedToQueue(await fetchBrokerLeases());
   } catch (e) {
     log(`inline poll failed: ${e instanceof Error ? e.message : String(e)}`);
   }

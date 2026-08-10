@@ -195,7 +195,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   // durable entries surfaced by an earlier FULLY BUILT check_messages response
   // are removed only now — this call arriving is the evidence that response
   // reached the model. A dropped/aborted response leaves them in the store.
-  const confirmable = delivery.confirmable();
+  // Eligibility is snapshotted at request entry (arrival-causality barrier):
+  // only responses promoted BEFORE this request was issued are confirmable.
+  const arrivalGen = delivery.newArrival();
+  const confirmable = delivery.confirmable(arrivalGen);
   if (confirmable.length > 0 && inboxStore) {
     try {
       await inboxStore.removeByIds(confirmable);

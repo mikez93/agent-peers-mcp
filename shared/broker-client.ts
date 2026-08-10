@@ -8,7 +8,6 @@ import type {
   HeartbeatRequest, HeartbeatResponse, UnregisterRequest, PollMessagesRequest,
   LeasedMessage, Peer,
 } from "./types.ts";
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
@@ -46,43 +45,48 @@ export function expectedDbIdentityHash(dbPath: string): string {
  *  when this process itself runs in the AGENT_PEERS_SPAWN_BROKER=1 dev
  *  escape), and the DB identity the client expects.
  *
- *  Secret handling is fail-closed where it matters: a MISSING secret file is
- *  the legitimate first-boot window (the broker provisions the secret), so
- *  /health liveness bootstraps and waitForSharedSecret() gates all real use.
- *  A PRESENT-but-unreadable/invalid secret file is not bootstrap — it is a
- *  broken trust anchor, and the probe reports not-ready rather than falling
- *  back to spoofable /health. */
+ *  Secret handling is fail-closed EVERYWHERE, including first boot: with no
+ *  readable secret there is no way to authenticate the responder, so the
+ *  probe reports not-ready — never falls back to spoofable /health (third
+ *  review H3: the bootstrap /health window let any squatter answer during
+ *  first boot). Bootstrap still converges without the fallback: not-ready
+ *  makes ensureBroker kickstart the launchd service, the real broker
+ *  provisions the secret file, and readSecret() is re-read on every probe
+ *  call, so the next poll authenticates against /ready. */
 export function createReadinessProbe(
   baseUrl: string,
   readSecret: () => string | null,
-  opts: { secretFileExists?: () => boolean; expectedDbPath?: () => string } = {},
+  opts: { expectedDbPath?: () => string } = {},
 ): () => Promise<boolean> {
-  const secretFileExists = opts.secretFileExists ?? (() => defaultSecretFileExists());
   return async () => {
     const secret = readSecret();
+    // No readable secret (missing file OR present-but-unreadable): nothing to
+    // authenticate with, so nothing on the port can be verified. Not ready.
+    if (!secret) return false;
     try {
-      if (secret) {
-        const res = await fetch(`${baseUrl}/ready`, {
-          headers: { [SECRET_HEADER]: secret },
-          signal: AbortSignal.timeout(2000),
-        });
-        // 401 = wrong secret (not our broker); 404 = pre-/ready build.
-        // Both mean "not the broker we require" — let ensureBroker kickstart
-        // the launchd service, whose startup evicts whatever is squatting.
-        if (!res.ok) return false;
-        const body = (await res.json()) as {
-          ok?: boolean; protocol?: number; owner?: string; db_id?: string;
-        };
-        if (body.ok !== true || body.protocol !== 1) return false;
-        const devMode = process.env.AGENT_PEERS_SPAWN_BROKER === "1";
-        if (body.owner !== "launchd" && !devMode) return false;
-        const expectedDb = opts.expectedDbPath?.() ?? defaultDbPath();
-        if (typeof body.db_id === "string" && body.db_id !== expectedDbIdentityHash(expectedDb)) return false;
-        return true;
-      }
-      if (secretFileExists()) return false; // present-but-invalid secret: fail closed
-      const res = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(2000) });
-      return res.ok;
+      const res = await fetch(`${baseUrl}/ready`, {
+        headers: { [SECRET_HEADER]: secret },
+        signal: AbortSignal.timeout(2000),
+      });
+      // 401 = wrong secret (not our broker); 404 = pre-/ready build.
+      // Both mean "not the broker we require" — let ensureBroker kickstart
+      // the launchd service, whose startup evicts whatever is squatting.
+      if (!res.ok) return false;
+      const body = (await res.json()) as {
+        ok?: boolean; protocol?: number; owner?: string; db_id?: string;
+      };
+      if (body.ok !== true || body.protocol !== 1) return false;
+      // Ownership: launchd always; a client-owned broker only under the
+      // explicit AGENT_PEERS_SPAWN_BROKER=1 dev escape — and then only
+      // owner="client" exactly, never an arbitrary/absent owner value.
+      const devMode = process.env.AGENT_PEERS_SPAWN_BROKER === "1";
+      const ownerOk = body.owner === "launchd" || (devMode && body.owner === "client");
+      if (!ownerOk) return false;
+      // DB identity is REQUIRED: an absent db_id is a broker we can't verify
+      // (or a responder that merely echoes ok/protocol), not a pass.
+      const expectedDb = opts.expectedDbPath?.() ?? defaultDbPath();
+      if (typeof body.db_id !== "string" || body.db_id !== expectedDbIdentityHash(expectedDb)) return false;
+      return true;
     } catch {
       return false;
     }
@@ -91,11 +95,6 @@ export function createReadinessProbe(
 
 function defaultDbPath(): string {
   return process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
-}
-
-function defaultSecretFileExists(): boolean {
-  const p = process.env.AGENT_PEERS_SECRET_PATH || resolve(homedir(), ".agent-peers-secret");
-  return existsSync(p);
 }
 
 export function createClient(baseUrl: string, sharedSecret: string): BrokerClient {
