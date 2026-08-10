@@ -23,9 +23,9 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { createClient } from "./shared/broker-client.ts";
+import { createClient, createReadinessProbe } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
-import { waitForSharedSecret } from "./shared/shared-secret.ts";
+import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
@@ -52,12 +52,12 @@ function log(msg: string) {
 // The shared secret is only known after the broker has provisioned it, so
 // we defer client construction until main() can read the secret file.
 let client: ReturnType<typeof createClient>;
-async function isBrokerAlive(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch { return false; }
-}
+// Authenticated readiness: once the shared secret exists, only a broker that
+// answers /ready with our secret + protocol counts as alive — a bare /health
+// 200 from a squatter must not satisfy startup (2026-08-10 review high #3).
+const isBrokerAlive = createReadinessProbe(BROKER_URL, () =>
+  readSharedSecret(process.env.AGENT_PEERS_SECRET_PATH ?? undefined),
+);
 
 let myId: PeerId | null = null;
 let myName: string | null = null;
@@ -71,7 +71,12 @@ let myGitRoot: string | null = null;
 // BEFORE the channel push, and acked only after the write lands.
 let inboxStore: CodexInboxStore | null = null;
 const CLAUDE_INBOX_ROOT = process.env.AGENT_PEERS_STATE_DIR ?? join(homedir(), ".agent-peers-claude");
-const INBOX_TTL_MS = 15 * 60 * 1000; // matches the ring buffer + tool contract
+// Backstop only. check_messages consumes durable entries when it surfaces
+// them; this TTL exists so a session that NEVER calls check_messages doesn't
+// grow its store forever. It must be generous: pruning an unread entry is
+// destroying mail the model never saw (the broker already acked it), so the
+// old 15-minute value was a silent-loss window for any session idle longer.
+const INBOX_TTL_MS = 24 * 60 * 60 * 1000;
 const SEEN_WATERMARK_SLACK = 10_000; // same bound as codex-server's watermark
 
 // The recent-delivered ring buffer is the backfill surface for check_messages.
@@ -104,7 +109,8 @@ to use both:
      see it until the next turn begins, and it may not render
      visibly even then. Calling \`check_messages\` returns a
      [PEER INBOX] block containing every peer message received in
-     the last 15 minutes, so nothing gets lost to idle-queue silence.
+     the last 15 minutes plus ALL unread durable mail at any age, so
+     nothing gets lost to idle-queue silence.
 
 RULE: Call \`check_messages\` as the FIRST thing you do at the START of
 every user turn. This is the same rule Codex uses. It's one cheap
@@ -159,7 +165,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Surface peer messages received in the last 15 minutes. Call this at the START of every user turn — it is the only reliable way to see messages that arrived while this session was idle at the prompt (Claude Code's channel push silently queues idle deliveries). One cheap call. Without this habit, peer DMs sent while you were idle wait invisibly until something else triggers a redraw.",
+      "Surface pending peer messages (recent ring buffer + ALL unread durable mail, any age). Call this at the START of every user turn — it is the only reliable way to see messages that arrived while this session was idle at the prompt (Claude Code's channel push silently queues idle deliveries). One cheap call. Without this habit, peer DMs sent while you were idle wait invisibly until something else triggers a redraw.",
     inputSchema: { type: "object" as const, properties: {} },
   },
   {
@@ -247,12 +253,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // restart cannot hide a message the previous incarnation persisted
       // but never surfaced.
       const recent = [...getRecentDelivered()];
+      // Durable unread is included at ANY age — an unread message is an
+      // undelivered obligation, and hiding it behind the ring buffer's
+      // 15-minute display window was a silent-loss path for sessions idle
+      // longer than the TTL (2026-08-10 codex-review high #2).
+      const surfacedDurable: number[] = [];
       try {
         if (inboxStore) {
-          const cutoff = Date.now() - INBOX_TTL_MS;
           const have = new Set(recent.map((m) => m.id));
           for (const m of await inboxStore.getUnreadMessages()) {
-            if (!have.has(m.id) && Date.parse(m.sent_at) >= cutoff) recent.push(m);
+            if (!have.has(m.id)) recent.push(m);
+            // Every durable entry this response surfaces is consumed below —
+            // whether it ALSO sat in the ring buffer or not.
+            surfacedDurable.push(m.id);
           }
           recent.sort((a, b) => a.id - b.id);
         }
@@ -263,9 +276,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return {
           content: [{
             type: "text" as const,
-            text: "No peer messages in the last 15 minutes. (Messages also arrive live mid-turn via the agent-peers channel when a peer sends something while you're active — this tool is the fallback for messages that arrived while this session was idle at the prompt.)",
+            text: "No peer messages pending (ring buffer covers the last 15 minutes; anything older that you never saw would appear here from the durable inbox). Messages also arrive live mid-turn via the agent-peers channel while you're active — this tool is the fallback for idle-at-prompt arrivals.",
           }],
         };
+      }
+      // Consume-on-surface: the durable copies just went into this response,
+      // so remove them — the next check_messages should not re-deal them, and
+      // the backstop TTL can no longer expire something the model never saw.
+      try {
+        if (surfacedDurable.length > 0 && inboxStore) await inboxStore.removeByIds(surfacedDurable);
+      } catch (e) {
+        log(`durable-inbox consume failed (entries will re-surface): ${e instanceof Error ? e.message : String(e)}`);
       }
       return {
         content: [{
@@ -483,8 +504,8 @@ async function main() {
         const watermark = Math.max(...seen) - SEEN_WATERMARK_SLACK;
         for (const id of seen) if (id < watermark) seen.delete(id);
       }
-      // TTL prune: the durable store mirrors the 15-minute check_messages
-      // window; anything older is no longer surfaced anywhere and can go.
+      // Backstop TTL prune (24h): check_messages consumes what it surfaces;
+      // this only catches sessions that never check at all.
       try {
         if (inboxStore) {
           const cutoff = Date.now() - INBOX_TTL_MS;

@@ -1492,12 +1492,22 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
   const port = DEFAULT_PORT;
   const dbPath = process.env.AGENT_PEERS_DB || DEFAULT_DB_PATH;
   const secretPath = process.env.AGENT_PEERS_SECRET_PATH || DEFAULT_SECRET_PATH;
-  // The /health pid is SELF-REPORTED by an unauthenticated endpoint; a
-  // squatter can point it at an arbitrary same-user process. We SIGTERM a
-  // given pid at most once — if the port is still busy afterwards, the
-  // report was a lie (or the squatter respawned) and re-killing the same
-  // number would only harm whoever actually owns it now.
+  // The eviction target comes from lsof — the pid that ACTUALLY holds the
+  // listening socket — never from the squatter's own /health response, which
+  // is unauthenticated and could name an arbitrary same-user victim
+  // (2026-08-10 review high #4). We still SIGTERM a given pid at most once:
+  // if the port is busy again afterwards, someone new owns it.
   const alreadySignaled = new Set<number>();
+  const portListenerPid = (): number | null => {
+    try {
+      const proc = Bun.spawnSync(["lsof", "-ti", `tcp:${port}`, "-sTCP:LISTEN"]);
+      const first = proc.stdout.toString().trim().split("\n")[0] ?? "";
+      const pid = parseInt(first, 10);
+      return Number.isInteger(pid) && pid > 1 && pid !== process.pid ? pid : null;
+    } catch {
+      return null;
+    }
+  };
   // 4 bind attempts for 3 evictions: the final eviction deserves a final
   // bind attempt, otherwise a successful eviction on the last loop is wasted.
   for (let attempt = 1; attempt <= 4; attempt++) {
@@ -1511,15 +1521,10 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
         process.exit(0);
       }
       if (attempt === 4) break;
-      // launchd owner: evict the squatter.
-      let squatterPid: number | null = null;
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) });
-        const body = (await res.json()) as { pid?: number };
-        if (typeof body.pid === "number" && body.pid > 1 && body.pid !== process.pid) squatterPid = body.pid;
-      } catch { /* squatter is not a broker or not answering; nothing to evict */ }
+      // launchd owner: evict whoever actually holds the listening socket.
+      const squatterPid = portListenerPid();
       if (squatterPid === null || alreadySignaled.has(squatterPid)) {
-        console.error(`[broker] attempt ${attempt}: port ${port} busy, no NEW evictable pid via /health; retrying in 2s`);
+        console.error(`[broker] attempt ${attempt}: port ${port} busy, no NEW evictable listener via lsof; retrying in 2s`);
         await new Promise((r) => setTimeout(r, 2000));
         continue;
       }

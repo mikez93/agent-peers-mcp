@@ -35,17 +35,21 @@
 //   any dedupe state — the [PEER INBOX] block (Layer 2) is the one and
 //   only "this was shown to the model" trigger.
 //
-// DEDUPE STATE MACHINE (two sets, confirm-on-next-call):
+// DEDUPE STATE MACHINE (three sets, confirm-on-next-call):
 //
-//   - `presentedPendingConfirm` — message_ids included in the CURRENT
-//     tool response's [PEER INBOX] block but not yet known-delivered.
-//     Populated inside withPiggyback just before return.
+//   - `drawnPendingReturn` — message_ids dealt to a response that is
+//     STILL BEING BUILT. Blocks concurrent calls from re-dealing, but is
+//     NOT confirm-eligible: with parallel tool calls, another call
+//     arriving is no evidence this response ever completed.
+//
+//   - `presentedPendingConfirm` — message_ids in a FULLY BUILT response
+//     handed back to the transport. Populated at the end of withPiggyback.
 //
 //   - `seen` — message_ids we're SURE reached the model. Populated at
 //     the START of the NEXT tool call (Codex calling us again is the
-//     evidence that the previous response cycle landed). Once a message
-//     is `seen`, we ack its lease, prune it from the durable queue, and
-//     ignore any future re-delivery of the same id.
+//     evidence that the previous fully-built response cycle landed). Once
+//     a message is `seen`, we ack its lease, prune it from the durable
+//     queue, and ignore any future re-delivery of the same id.
 //
 // This splits what was previously a single `seen` set that conflated
 // "about to be shown" with "known shown." The earlier code could ack +
@@ -68,9 +72,9 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { createClient } from "./shared/broker-client.ts";
+import { createClient, createReadinessProbe } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
-import { waitForSharedSecret } from "./shared/shared-secret.ts";
+import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
@@ -106,12 +110,12 @@ function log(msg: string) {
 }
 
 let client: ReturnType<typeof createClient>;
-async function isBrokerAlive(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch { return false; }
-}
+// Authenticated readiness: once the shared secret exists, only a broker that
+// answers /ready with our secret + protocol counts as alive — a bare /health
+// 200 from a squatter must not satisfy startup (2026-08-10 review high #3).
+const isBrokerAlive = createReadinessProbe(BROKER_URL, () =>
+  readSharedSecret(process.env.AGENT_PEERS_SECRET_PATH ?? undefined),
+);
 
 let myId: PeerId | null = null;
 let myName: string | null = null;
@@ -276,10 +280,21 @@ const MAX_PENDING_ACKS = 500;
 const pendingAcks: string[] = [];
 
 // Dedupe state (see top-of-file state-machine comment):
-//   - `presentedPendingConfirm`: messages in the CURRENT response's
-//     [PEER INBOX] block. Promoted to `seen` at the START of the NEXT call.
+//   - `drawnPendingReturn`: messages drawn into a response that is STILL
+//     BEING BUILT (handler running). Blocks concurrent calls from re-dealing
+//     the same items, but is NOT confirm-eligible: with parallel tool calls,
+//     call B entering the lock is no evidence that call A's response ever
+//     reached the model (2026-08-10 codex-review high #1 — B used to
+//     confirm+delete what A had drawn while A was still running).
+//   - `presentedPendingConfirm`: messages in a FULLY BUILT response handed
+//     back to the transport. Promoted to `seen` at the START of the next
+//     call — the same "Codex called us again" evidence the serial design
+//     used, now scoped to responses that actually completed.
 //   - `seen`: messages we are SURE reached the model. Only these get their
 //     lease acked + are pruned from the durable queue.
+// A process that dies mid-handler leaves ids in drawnPendingReturn — never
+// confirmed, so the durable store re-offers them on the next incarnation.
+const drawnPendingReturn = new Set<number>();
 const presentedPendingConfirm = new Set<number>();
 const seen = new Set<number>();
 
@@ -467,6 +482,12 @@ async function withPiggyback(
 
   const inbox = formatInboxBlock(fresh);
   const finalText = inbox + toolText;
+  // The response is fully built and about to be handed to the transport:
+  // THIS call's drawn messages become confirm-eligible for the next call.
+  for (const m of fresh) {
+    drawnPendingReturn.delete(m.id);
+    presentedPendingConfirm.add(m.id);
+  }
   return { content: [{ type: "text", text: finalText }], isError: toolError };
 }
 
@@ -569,21 +590,21 @@ async function acquireInboxBatch(): Promise<LeasedMessage[]> {
   const fresh: LeasedMessage[] = [];
   for (const m of queued) {
     if (seen.has(m.id)) continue;
-    if (presentedPendingConfirm.has(m.id)) {
-      // Already showed this in an earlier response whose confirm-flush
-      // hasn't completed yet. Skip re-drawing — the earlier presentation
-      // is still the one we're waiting to confirm.
+    if (presentedPendingConfirm.has(m.id) || drawnPendingReturn.has(m.id)) {
+      // Already dealt to a response that is in flight or awaiting confirm.
+      // Skip re-drawing — that presentation is the one we're waiting on.
       continue;
     }
     fresh.push(m);
   }
 
-  // Mark fresh items as "presented this call, awaiting confirm" and
-  // stash their lease tokens for the NEXT call's confirm-flush. This is
-  // the single write point where a message transitions from "sitting in
-  // queue" to "shown to the model."
+  // Mark fresh items as drawn-into-an-in-flight-response and stash their
+  // lease tokens. This is the single write point where a message
+  // transitions from "sitting in queue" to "dealt to a response". It
+  // becomes confirm-ELIGIBLE only when withPiggyback finishes building
+  // that response (drawnPendingReturn → presentedPendingConfirm).
   for (const m of fresh) {
-    presentedPendingConfirm.add(m.id);
+    drawnPendingReturn.add(m.id);
     enqueueAck(m.lease_token);
   }
 
@@ -936,11 +957,12 @@ async function main() {
   // `known === undefined` is NOT eviction. It means the broker predates the
   // field and cannot answer. Never re-register on silence — only on a "no".
   //
-  // inboxStore is deliberately NOT rebuilt: its peerId only names a local file
-  // and it never talks to the broker, so keeping it preserves the messages this
-  // session has already received but not yet read. The wake registry DOES cross
-  // the boundary — it hands the daemon a peerId and session token — so that one
-  // must be re-pointed at the new identity or the daemon would wake a ghost.
+  // inboxStore IS rebuilt on a rejoin that mints a new UUID, with the old
+  // store's unread migrated into the new file (2026-08-10 review medium:
+  // keeping the OLD UUID's file live meant `cli.ts gc-inboxes` classified an
+  // actively-used store as DEAD and could archive it out from under us). The
+  // wake registry also crosses the boundary — it hands the daemon a peerId
+  // and session token — so it too is re-pointed at the new identity.
   let rejoining = false;
   const hb = setInterval(async () => {
     if (!myId || !mySession || rejoining) return;
@@ -964,9 +986,24 @@ async function main() {
           // re-points our unacked mail to the new incarnation.
           prev_id: myId,
         });
+        const prevStore = myId !== again.id ? inboxStore : null;
         myId = again.id;
         myName = again.name;
         mySession = again.session_token;
+        if (prevStore) {
+          inboxStore = new CodexInboxStore({ peerId: myId });
+          await inboxStore.init();
+          try {
+            const carried = await prevStore.getUnreadMessages();
+            if (carried.length > 0) {
+              await inboxStore.queueLeasedMessages(carried);
+              await prevStore.removeByIds(carried.map((m) => m.id));
+              log(`Migrated ${carried.length} unread durable message(s) to new incarnation ${myId}`);
+            }
+          } catch (e) {
+            log(`Durable-inbox migration failed (old entries remain on disk): ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
         if (RUNTIME_IS_CODEX) {
           await registerWakeableSessionIfEnabled({
             peerId: myId,

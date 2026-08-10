@@ -27,6 +27,42 @@ export interface BrokerClient {
 
 export const SECRET_HEADER = "X-Agent-Peers-Secret";
 
+/** Authenticated readiness probe for ensureBroker() and startup gates.
+ *
+ *  A bare /health 200 proves only that SOMETHING answers on the port — the
+ *  exact spoof the launchd-ownership work exists to prevent (a squatter with
+ *  a /health endpoint used to satisfy clients indefinitely). When the shared
+ *  secret is provisioned, readiness means an authenticated /ready whose body
+ *  confirms protocol compatibility. Before the secret exists (first boot on a
+ *  fresh machine — the broker itself provisions it), a plain /health probe is
+ *  the only option; waitForSharedSecret() gates all real use right after. */
+export function createReadinessProbe(
+  baseUrl: string,
+  readSecret: () => string | null,
+): () => Promise<boolean> {
+  return async () => {
+    const secret = readSecret();
+    try {
+      if (secret) {
+        const res = await fetch(`${baseUrl}/ready`, {
+          headers: { [SECRET_HEADER]: secret },
+          signal: AbortSignal.timeout(2000),
+        });
+        // 401 = wrong secret (not our broker); 404 = pre-/ready build.
+        // Both mean "not the broker we require" — let ensureBroker kickstart
+        // the launchd service, whose startup evicts whatever is squatting.
+        if (!res.ok) return false;
+        const body = (await res.json()) as { ok?: boolean; protocol?: number };
+        return body.ok === true && body.protocol === 1;
+      }
+      const res = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(2000) });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  };
+}
+
 export function createClient(baseUrl: string, sharedSecret: string): BrokerClient {
   async function post<T>(path: string, body: unknown): Promise<T> {
     const res = await fetch(`${baseUrl}${path}`, {

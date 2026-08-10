@@ -17,7 +17,8 @@ import { join } from "node:path";
 function leased(id: number, text: string) {
   return {
     id, text,
-    from_id: "sender-uuid", from_name: "sender", from_peer_type: "claude" as const,
+    from_id: "sender-uuid", to_id: "recipient-uuid",
+    from_name: "sender", from_peer_type: "claude" as const,
     from_summary: "", from_cwd: "/x",
     sent_at: new Date().toISOString(),
     lease_token: `tok-${id}`,

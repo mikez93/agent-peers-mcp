@@ -186,7 +186,7 @@ Open a new terminal and run the launcher for your agent:
 | **Claude Code** | `agentpeers` |
 | **Codex** | `codex` |
 
-That's it — the MCP loads automatically, the broker auto-spawns if it's not already running, and your terminal tab renames itself to `peer:<name>`.
+That's it — the MCP loads automatically and your terminal tab renames itself to `peer:<name>`. The broker itself is owned by launchd (`com.mike.agent-peers-broker`); clients kickstart-and-wait rather than spawning it (set `AGENT_PEERS_SPAWN_BROKER=1` only on a dev box with no LaunchAgent).
 
 ### Step 2 — Name it (optional but useful)
 
@@ -197,7 +197,7 @@ PEER_NAME=frontend-tab agentpeers   # Claude
 PEER_NAME=backend-work codex        # Codex
 ```
 
-Rules: 1–32 chars, `[a-zA-Z0-9_-]`, unique among live peers. Name collision auto-suffixes (`frontend-tab` → `frontend-tab-2`). Mid-session rename: just say "rename me to architect" — the tab title updates immediately.
+Rules: 1–32 chars, `[a-zA-Z0-9_-]`, unique among live peers (currently case-SENSITIVE — see bd-21r.11). Name collision auto-suffixes (`frontend-tab` → `frontend-tab-2`); a durable name is reclaimed by a same-type re-register only after the old row is ~60s stale, so back-to-back restarts briefly suffix rather than reclaim. Mid-session rename updates the broker row only: a durable peer configured via `PEER_NAME` re-registers under its configured name on restart, so treat rename as session-scoped for durable peers.
 
 ### Step 3 — Sanity check
 

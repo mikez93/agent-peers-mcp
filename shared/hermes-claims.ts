@@ -44,6 +44,27 @@ function isProcessAlive(pid: number | null | undefined): boolean {
   }
 }
 
+/** PID-reuse guard (2026-08-10 review medium): after a reboot, an unrelated
+ *  process can be assigned the lock owner's old pid, making a genuinely dead
+ *  claim look held forever and stranding the canonical name. A pid only
+ *  vouches for the lock if its process STARTED BEFORE the lock was acquired
+ *  (with 30s tolerance for clock/parse skew). If `ps` can't answer (EPERM'd
+ *  zombie, race), fall back to pid-liveness alone — the conservative side. */
+function ownerStillHoldsClaim(pid: number | null | undefined, acquiredAt: string | undefined): boolean {
+  if (!isProcessAlive(pid)) return false;
+  if (!acquiredAt) return true;
+  const acquired = Date.parse(acquiredAt);
+  if (!Number.isFinite(acquired)) return true;
+  try {
+    const proc = Bun.spawnSync(["ps", "-p", String(pid), "-o", "lstart="]);
+    const started = Date.parse(proc.stdout.toString().trim());
+    if (!Number.isFinite(started)) return true;
+    return started <= acquired + 30_000;
+  } catch {
+    return true;
+  }
+}
+
 function lockPathFor(dir: string, peerName: string): string {
   return join(dir, `${encodeURIComponent(peerName)}.lock`);
 }
@@ -65,16 +86,16 @@ export class HermesNameClaims {
         );
         return true;
       } catch {
-        let held: { owner_pid?: number };
+        let held: { owner_pid?: number; acquired_at?: string };
         try {
-          held = JSON.parse(await readFile(lockPath, "utf8")) as { owner_pid?: number };
+          held = JSON.parse(await readFile(lockPath, "utf8")) as { owner_pid?: number; acquired_at?: string };
         } catch (e) {
           const gone = e instanceof Error && "code" in e && (e as { code?: string }).code === "ENOENT";
           if (gone) continue; // lock vanished between wx and read — retry wx
           return false; // unreadable/corrupt lock: fail closed
         }
         if (held?.owner_pid === ownerPid) return true;
-        if (isProcessAlive(held?.owner_pid)) return false;
+        if (ownerStillHoldsClaim(held?.owner_pid, held?.acquired_at)) return false;
         // Dead owner. A plain unlink+retry races a concurrent reclaimer:
         // after SIGKILL of the old winner, gateway and serve boot together,
         // both read the dead pid — one unlinks and re-creates via wx, the

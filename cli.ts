@@ -650,9 +650,16 @@ async function cmdStrandedMessages() {
   // seen in 24h.
   const db = await openDbReadonly();
   try {
-    type Row = { id: number; message_uid: string | null; to_id: string; name: string; last_seen: string; from_name: string | null; text: string; sent_at: string };
+    type Row = { id: number; message_uid: string | null; to_id: string; from_id: string | null; name: string; last_seen: string; from_name: string | null; text: string; sent_at: string };
+    // A pre-migration DB (broker never ran the new code) has no message_uid
+    // column, and this read-only CLI must not crash on it — recovery tooling
+    // is exactly what gets pointed at old snapshots.
+    const hasUid = db.query<{ n: number }, []>(
+      "SELECT COUNT(*) AS n FROM pragma_table_info('messages') WHERE name = 'message_uid'"
+    ).get()!.n > 0;
+    const uidCol = hasUid ? "m.message_uid" : "NULL AS message_uid";
     const rows = db.query<Row, [string]>(
-      `SELECT m.id, m.message_uid, m.to_id, p.name, p.last_seen, pf.name AS from_name, m.text, m.sent_at
+      `SELECT m.id, ${uidCol}, m.to_id, m.from_id, p.name, p.last_seen, pf.name AS from_name, m.text, m.sent_at
        FROM messages m
        JOIN peers p ON p.id = m.to_id
        LEFT JOIN peers pf ON pf.id = m.from_id
@@ -661,7 +668,7 @@ async function cmdStrandedMessages() {
     ).all(new Date(Date.now() - 24 * 3600_000).toISOString());
     if (rows.length === 0) { console.log("No stranded messages (unacked mail to peers idle >24h)."); return; }
     for (const r of rows) {
-      console.log(`#${r.id} uid=${r.message_uid ?? "-"} to=${r.name} (idle since ${r.last_seen}) from=${r.from_name ?? r.to_id}`);
+      console.log(`#${r.id} uid=${r.message_uid ?? "-"} to=${r.name} (idle since ${r.last_seen}) from=${r.from_name ?? r.from_id ?? "(unknown)"}`);
       console.log(`  sent_at=${r.sent_at}`);
       console.log(`  ${r.text.split("\n").join("\n  ")}`);
     }

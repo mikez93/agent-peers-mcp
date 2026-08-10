@@ -32,11 +32,15 @@ does anything.
 
 - **Push-ish**: a background poll (1s) pushes into the session's channel and
   ring buffer, *after* persisting to the durable store
-  (`~/.agent-peers-claude/<peer-uuid>.json`, 15-min TTL).
+  (`~/.agent-peers-claude/<peer-uuid>.json`). Durable entries live until
+  `check_messages` surfaces them (consume-on-read), with a 24h backstop TTL
+  for sessions that never check — an unread entry is never expired inside a
+  window a normal working session would hit.
 - Channel push only renders when the session redraws; messages that arrive
   while the session sits idle at the prompt queue invisibly. **`check_messages`
   at the start of a turn is the only reliable read** — it unions the ring
-  buffer and the durable store.
+  buffer (last 15 min) with ALL unread durable mail at any age, and consumes
+  the durable entries it returns.
 - Durable registration requires `PEER_NAME` set and
   `AGENT_PEERS_EPHEMERAL != "1"`.
 
@@ -49,7 +53,10 @@ does anything.
   `from` — a non-matching message ends nothing and is never consumed by the
   filter.
 - All inbox steps (ack-flush, confirm-promote, poll, read/mark) run under a
-  per-process mutex; parallel/batched tool calls cannot double-deliver.
+  per-process mutex; parallel/batched tool calls cannot double-deliver. A
+  message drawn into one call's response becomes confirm-eligible only after
+  that response is fully built — a concurrent call is never treated as
+  evidence that a still-running call's response reached the model.
 
 ### Hermes (`hermes-server.ts` → codex transport)
 
@@ -59,9 +66,11 @@ does anything.
   and survives MCP restarts, `/reload-mcp`, and process death.
 - **One durable peer per logical agent**: gateway and serve surfaces race a
   PEER_NAME-keyed file-lock election (`~/.agent-peers-hermes/name-claims/`);
-  the winner registers durable and owns the name, losers register ephemeral
-  send-only and age out in 60s. Duplicate ephemeral rows next to a durable one
-  are election losers, not a bug.
+  the winner registers durable and owns the name, losers register under an
+  ephemeral generated name and age out in 60s once their process dies. Losers
+  keep the FULL tool surface (list/send/check) — they can still act as the
+  user's live surface; they just never own the canonical name. Duplicate
+  ephemeral rows next to a durable one are election losers, not a bug.
 - Config contract per profile: `PEER_NAME`, `AGENT_PEERS_CWD`,
   `AGENT_PEERS_ENABLED: '1'`. Kill switches: flag file
   `~/.agent-peers-hermes/disabled` (all surfaces), or
