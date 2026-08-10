@@ -31,6 +31,10 @@ import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summariz
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
 import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.ts";
+import { CodexInboxStore } from "./shared/codex-inbox.ts";
+import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId, PeerType } from "./shared/types.ts";
@@ -60,6 +64,14 @@ let myName: string | null = null;
 let mySession: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// Durable inbox (2026-08-10): claude-server used to ack messages into a
+// process-local ring buffer only — a push queued while the session was idle
+// died with the process AFTER the broker had already marked it acked, the one
+// truly silent loss path on the Claude side. Messages are now persisted here
+// BEFORE the channel push, and acked only after the write lands.
+let inboxStore: CodexInboxStore | null = null;
+const CLAUDE_INBOX_ROOT = process.env.AGENT_PEERS_STATE_DIR ?? join(homedir(), ".agent-peers-claude");
+const INBOX_TTL_MS = 15 * 60 * 1000; // matches the ring buffer + tool contract
 
 // The recent-delivered ring buffer is the backfill surface for check_messages.
 // See shared/recent-delivered.ts for the full rationale. Extracted out of this
@@ -229,7 +241,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // already replied to." So repeated check_messages calls within
       // the 15-min TTL window are safe — they show the same messages,
       // Claude just won't re-respond to ones it already handled.
-      const recent = getRecentDelivered();
+      // The durable store is authoritative (survives restarts); the ring
+      // buffer is the in-process fast path. Union them by message id so a
+      // restart cannot hide a message the previous incarnation persisted
+      // but never surfaced.
+      const recent = [...getRecentDelivered()];
+      try {
+        if (inboxStore) {
+          const cutoff = Date.now() - INBOX_TTL_MS;
+          const have = new Set(recent.map((m) => m.id));
+          for (const m of await inboxStore.getUnreadMessages()) {
+            if (!have.has(m.id) && Date.parse(m.sent_at) >= cutoff) recent.push(m);
+          }
+          recent.sort((a, b) => a.id - b.id);
+        }
+      } catch (e) {
+        log(`durable-inbox read failed; serving ring buffer only: ${e instanceof Error ? e.message : String(e)}`);
+      }
       if (recent.length === 0) {
         return {
           content: [{
@@ -353,6 +381,7 @@ async function main() {
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
+  inboxStore = new CodexInboxStore({ peerId: myId, rootDir: CLAUDE_INBOX_ROOT });
   setTabTitle(`peer:${myName}`);
   // Note: keepalive was already armed earlier in main(), before register().
   // The setTabTitle above just updates `lastTitle`; the running keepalive
@@ -391,6 +420,22 @@ async function main() {
           toAck.push(m.lease_token);
           continue;
         }
+        // Durable persistence FIRST. If this write fails we neither push nor
+        // ack — the lease expires at the broker and the message re-offers.
+        // Acking before any durable record existed is what made a queued-
+        // while-idle push die with the process, already-acked and untraceable.
+        try {
+          await inboxStore?.queueLeasedMessages([m]);
+        } catch (e) {
+          log(`durable-inbox write failed for msg #${m.id} (will re-lease): ${e instanceof Error ? e.message : String(e)}`);
+          continue;
+        }
+        // The durable copy exists — the message can no longer be lost, so ack
+        // and dedupe regardless of what the (best-effort) push does next.
+        // check_messages reads the durable store, so even a session that dies
+        // mid-push leaves the message retrievable by the next session.
+        seen.add(m.id);
+        toAck.push(m.lease_token);
         try {
           // Per the channels reference, `meta` is Record<string, string> —
           // non-string values are silently dropped, and the `source` attribute
@@ -412,14 +457,8 @@ async function main() {
               },
             },
           });
-          // Mark delivered in seen BEFORE queueing the ack so a later ack
-          // failure cannot cause a re-push within this session. Also
-          // record in the recent-delivered ring buffer so check_messages
-          // can surface it if Claude Code silently queued the channel
-          // push (e.g. session was idle at the prompt).
-          seen.add(m.id);
+          // Ring-buffer record is the fast path for check_messages backfill.
           recordDelivered(m);
-          toAck.push(m.lease_token);
           // Visible proof-of-delivery in stderr so a live operator can
           // tell from the log alone whether the push fired. Claude Code's
           // rendering is opaque to us (especially in idle-at-prompt
@@ -427,9 +466,20 @@ async function main() {
           // stderr is the one debug signal that always works.
           log(`📬 pushed channel msg #${m.id} from ${m.from_name} (${m.from_peer_type}): ${m.text.slice(0, 80)}${m.text.length > 80 ? "…" : ""}`);
         } catch (e) {
-          log(`push failed (lease will expire + redeliver): ${e instanceof Error ? e.message : String(e)}`);
+          log(`push failed (message persisted; check_messages will surface it): ${e instanceof Error ? e.message : String(e)}`);
         }
       }
+      // TTL prune: the durable store mirrors the 15-minute check_messages
+      // window; anything older is no longer surfaced anywhere and can go.
+      try {
+        if (inboxStore) {
+          const cutoff = Date.now() - INBOX_TTL_MS;
+          const expired = (await inboxStore.getUnreadMessages())
+            .filter((q) => Date.parse(q.sent_at) < cutoff)
+            .map((q) => q.id);
+          if (expired.length > 0) await inboxStore.removeByIds(expired);
+        }
+      } catch { /* prune is housekeeping; next tick retries */ }
       if (toAck.length > 0 && mySession) {
         try {
           await client.ackMessages({ id: myId, session_token: mySession, lease_tokens: toAck });
@@ -491,6 +541,10 @@ async function main() {
         myId = again.id;
         myName = again.name;
         mySession = again.session_token;
+        // The mailbox follows the peer id — rebind the durable store so a
+        // re-registration that minted a new UUID doesn't strand the inbox
+        // under the dead one.
+        inboxStore = new CodexInboxStore({ peerId: myId, rootDir: CLAUDE_INBOX_ROOT });
         setTabTitle(`peer:${myName}`);
         log(`Rejoined the network as ${myName} (id=${myId})`);
       } catch (e) {
@@ -507,8 +561,20 @@ async function main() {
   // at the top of main(). When any fatal signal arrives now, earlyKillHandler
   // will call this to clean up timers + deliberately NOT unregister (to preserve
   // reclaim-by-name), then sync-clear the title, then exit.
+  // Orphan-parent watchdog (ported from codex-server): Bun's stdio transport
+  // can outlive its Claude Code parent, leaving an MCP that heartbeats a
+  // phantom peer forever. Once we reparent to launchd, this session is gone.
+  const initialParentPid = process.ppid;
+  const parentWatch = setInterval(() => {
+    if (parentProcessWasLost(initialParentPid, process.ppid)) {
+      log(`claude parent ${initialParentPid} exited; stopping orphaned MCP`);
+      void earlyKillHandler();
+    }
+  }, 1_000);
+
   lifecycleCleanup = async () => {
     clearInterval(hb);
+    clearInterval(parentWatch);
     pushStopped = true;
     if (pushTickTimer) clearTimeout(pushTickTimer);
   };

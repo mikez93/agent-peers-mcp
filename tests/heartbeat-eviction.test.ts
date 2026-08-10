@@ -88,14 +88,20 @@ test("the /heartbeat route surfaces known:false over HTTP — this is what the c
     body: JSON.stringify(body),
   }).then((r) => r.json());
 
-  expect(await hb({ id: me.id, session_token: me.session_token }))
-    .toEqual({ ok: true, known: true });
+  const alive = await hb({ id: me.id, session_token: me.session_token }) as { ok: boolean; known: boolean; epoch: string };
+  expect(alive.ok).toBe(true);
+  expect(alive.known).toBe(true);
+  // Broker epoch rides every heartbeat so a client seeing known:false can
+  // tell "broker restarted" apart from "evicted for cause".
+  expect(typeof alive.epoch).toBe("string");
 
   handle.db.query("DELETE FROM peers WHERE id = ?").run(me.id);
 
   // The whole bug, in one assertion: the broker used to say {ok: true} here.
-  expect(await hb({ id: me.id, session_token: me.session_token }))
-    .toEqual({ ok: true, known: false });
+  const gone = await hb({ id: me.id, session_token: me.session_token }) as { ok: boolean; known: boolean; epoch: string };
+  expect(gone.ok).toBe(true);
+  expect(gone.known).toBe(false);
+  expect(gone.epoch).toBe(alive.epoch);
 });
 
 test("RECOVERY: an evicted peer that re-registers under its own name gets back on the network", () => {

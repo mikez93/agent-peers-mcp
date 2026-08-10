@@ -94,9 +94,16 @@ export interface AckMessagesRequest {
   lease_tokens: string[];
 }
 
+export type AckTokenStatus = "acked" | "expired" | "unknown" | "wrong_session";
+
 export interface AckMessagesResponse {
   ok: boolean;
   acked: number;
+  /** Count of tokens whose lease expired before the ack arrived — the broker
+   *  will re-offer those messages; callers must not treat them as delivered. */
+  stale?: number;
+  /** Per-token outcomes, present whenever acked < tokens sent. */
+  results?: { token: string; status: AckTokenStatus }[];
 }
 
 export interface RenamePeerRequest {

@@ -80,6 +80,7 @@ import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { planWaitForPeerMessages, waitForFreshPeerMessages as waitForFreshPeerMessagesLoop } from "./shared/wait-for-peer-messages.ts";
+import { createAsyncLock } from "./shared/async-lock.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
@@ -89,12 +90,15 @@ const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.AGENT_PEERS_HEARTBEAT_MS ?? "15000", 10);
-const WAIT_FOR_MESSAGES_DEFAULT_MS = 300_000;
-const WAIT_FOR_MESSAGES_MAX_MS = 300_000;
-const WAIT_FOR_MESSAGES_POLL_MS = 500;
 const RUNTIME_PEER_TYPE: PeerType = process.env.AGENT_PEERS_RUNTIME === "hermes" ? "hermes" : "codex";
 const RUNTIME_DISPLAY_NAME = RUNTIME_PEER_TYPE === "hermes" ? "Hermes" : "Codex";
 const RUNTIME_IS_CODEX = RUNTIME_PEER_TYPE === "codex";
+// Hermes surfaces are per-turn processes that are never wakeable, so the
+// Codex-grade 5-minute wait is always wrong there: it pins the turn "working"
+// and the surface may be torn down before the wait ends. 60s is the ceiling.
+const WAIT_FOR_MESSAGES_DEFAULT_MS = RUNTIME_PEER_TYPE === "hermes" ? 60_000 : 300_000;
+const WAIT_FOR_MESSAGES_MAX_MS = RUNTIME_PEER_TYPE === "hermes" ? 60_000 : 300_000;
+const WAIT_FOR_MESSAGES_POLL_MS = 500;
 
 function log(msg: string) {
   console.error(`[agent-peers/${RUNTIME_PEER_TYPE}] ${msg}`);
@@ -242,7 +246,14 @@ const TOOLS = [
           type: "number" as const,
           minimum: 0,
           maximum: WAIT_FOR_MESSAGES_MAX_MS,
-          description: "Maximum time to wait, in milliseconds (default and max: 300000).",
+          description: `Maximum time to wait, in milliseconds (default and max: ${WAIT_FOR_MESSAGES_MAX_MS}).`,
+        },
+        from: {
+          type: "string" as const,
+          description:
+            "Optional sender filter: a peer name or id. The wait completes only when a message " +
+            "from THIS sender arrives; unrelated messages still surface in [PEER INBOX] but do " +
+            "not end the wait. Without this, the next message from ANY sender ends the wait.",
         },
       },
     },
@@ -280,13 +291,20 @@ function enqueueAck(token: string) {
   }
 }
 
-async function waitForFreshPeerMessages(timeoutMs: number): Promise<boolean> {
+async function waitForFreshPeerMessages(timeoutMs: number, from?: string): Promise<boolean> {
   return waitForFreshPeerMessagesLoop({
     timeoutMs,
     pollIntervalMs: WAIT_FOR_MESSAGES_POLL_MS,
     poll: pollBrokerIntoQueue,
     readUnread: async () => inboxStore ? inboxStore.getUnreadMessages() : [],
-    isFresh: (m) => !seen.has(m.id) && !presentedPendingConfirm.has(m.id),
+    // The sender filter governs only what ENDS the wait. Non-matching mail
+    // stays queued and still surfaces in this response's [PEER INBOX] block —
+    // it is never consumed by a wait it didn't satisfy (known-issues
+    // 2026-08-08 §1: Marco's wait for Kepler ate an unrelated Vector message).
+    isFresh: (m) =>
+      !seen.has(m.id) &&
+      !presentedPendingConfirm.has(m.id) &&
+      (!from || m.from_id === from || m.from_name === from),
     onError: (message) => log(`wait_for_peer_messages ${message}`),
   });
 }
@@ -393,6 +411,13 @@ async function pollBrokerIntoQueue(): Promise<void> {
   }
 }
 
+// Serializes the piggyback read-draw-mark critical section across concurrent
+// CallTool requests. Without it, two tools invoked in parallel both run the
+// queue read before either marks presentedPendingConfirm — the model sees the
+// same message twice in one turn and may reply twice, and both calls enqueue
+// the same lease token (bd-21r.3: parallel check_messages + list_peers).
+const withPiggybackLock = createAsyncLock();
+
 async function withPiggyback(
   handler: () => Promise<{ text: string; isError?: boolean }>,
   opts: { beforeReadQueue?: () => Promise<void> } = {},
@@ -404,6 +429,49 @@ async function withPiggyback(
     };
   }
 
+  // Pre-draw hook OUTSIDE the lock: wait_for_peer_messages can block for
+  // minutes, and holding the lock across it would freeze every other
+  // concurrent tool call. The hook only polls the broker into the durable
+  // queue and inspects dedupe sets — it never draws or marks, so running it
+  // unlocked cannot double-deliver.
+  try {
+    await opts.beforeReadQueue?.();
+  } catch (e) {
+    log(`before-read hook failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  const fresh = await withPiggybackLock(async () => acquireInboxBatch());
+
+  // Serving-identity delivery breadcrumb (delivery-fix spec §6.4). This is the
+  // ONE place a message is handed to the model, so logging the serving identity
+  // here makes the wakeable routing bet observable instead of silent. Gated on
+  // fresh.length so quiet tool calls stay silent.
+  if (fresh.length > 0) {
+    const wakeThread = process.env.AGENT_PEERS_WAKE_THREAD_ID;
+    log(`delivered ${fresh.length} inbox message(s) as peer=${myName} id=${myId} pid=${process.pid}${wakeThread ? ` wake_thread=${wakeThread}` : ""}`);
+  }
+
+  // STEP 4 — Run the tool handler + build the response. Outside the lock:
+  // handlers do their own broker I/O and can be slow.
+  let toolText = "";
+  let toolError: boolean | undefined;
+  try {
+    const r = await handler();
+    toolText = r.text;
+    toolError = r.isError;
+  } catch (e) {
+    toolText = `Tool error: ${e instanceof Error ? e.message : String(e)}`;
+    toolError = true;
+  }
+
+  const inbox = formatInboxBlock(fresh);
+  const finalText = inbox + toolText;
+  return { content: [{ type: "text", text: finalText }], isError: toolError };
+}
+
+// The locked critical section: ack-flush, confirm-promote, poll, and the
+// read-filter-mark draw. Exactly one concurrent tool call can be in here.
+async function acquireInboxBatch(): Promise<LeasedMessage[]> {
   // ------------------------------------------------------------------------
   // STEP 1a — Unconditional ack flush.
   //
@@ -423,12 +491,22 @@ async function withPiggyback(
   if (pendingAcks.length > 0) {
     const toFlush = pendingAcks.slice();
     try {
-      await client.ackMessages({
-        id: myId, session_token: mySession, lease_tokens: toFlush,
+      const res = await client.ackMessages({
+        id: myId!, session_token: mySession!, lease_tokens: toFlush,
       });
       for (const tok of toFlush) {
         const idx = pendingAcks.indexOf(tok);
         if (idx !== -1) pendingAcks.splice(idx, 1);
+      }
+      // Typed outcomes (no more success-shaped {ok, acked:0} blindness): an
+      // expired token means the broker will re-offer that message — expected,
+      // the seen-branch will close the re-lease — but it must be VISIBLE.
+      if (res.acked < toFlush.length) {
+        const stale = res.stale ?? 0;
+        const detail = res.results
+          ? res.results.filter((r) => r.status !== "acked").map((r) => r.status).join(",")
+          : "unreported";
+        log(`ack flush: ${res.acked}/${toFlush.length} acked (${stale} expired lease(s); statuses: ${detail}) — broker will re-offer unacked messages`);
       }
     } catch (e) {
       log(`ack flush failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
@@ -465,16 +543,6 @@ async function withPiggyback(
     await pollBrokerIntoQueue();
   } catch (e) {
     log(`inline poll failed: ${e instanceof Error ? e.message : String(e)}`);
-  }
-
-  // Optional pre-draw hook for tools that need to wait before the inbox
-  // snapshot is taken. In particular, wait_for_peer_messages must block here
-  // rather than inside its handler, otherwise messages arriving during the
-  // wait would miss this response's [PEER INBOX] block.
-  try {
-    await opts.beforeReadQueue?.();
-  } catch (e) {
-    log(`before-read hook failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
   // ------------------------------------------------------------------------
@@ -518,36 +586,25 @@ async function withPiggyback(
     enqueueAck(m.lease_token);
   }
 
-  // Serving-identity delivery breadcrumb (delivery-fix spec §6.4). This is the
-  // ONE place a message is handed to the model, so logging the serving identity
-  // here makes the wakeable routing bet observable instead of silent: on a
-  // daemon-woken turn the operator can correlate the wake daemon's "nudged
-  // thread T for peer Y" against this process's "delivered N as peer X (pid P,
-  // wake_thread T)". A match on the happy path confirms single-identity routing
-  // (Branch A); an ABSENT line on a wake whose rollout shows a turn fired is the
-  // Branch-B tell — the turn was served by a context without these tools. Gated
-  // on fresh.length so quiet tool calls stay silent.
-  if (fresh.length > 0) {
-    const wakeThread = process.env.AGENT_PEERS_WAKE_THREAD_ID;
-    log(`delivered ${fresh.length} inbox message(s) as peer=${myName} id=${myId} pid=${process.pid}${wakeThread ? ` wake_thread=${wakeThread}` : ""}`);
-  }
+  // Watermark-prune the `seen` dedupe set (it previously grew forever).
+  // Message ids are AUTOINCREMENT-monotonic: anything far below the newest id
+  // AND below everything still in the durable queue can never be re-offered
+  // in a way this set still needs to dedupe.
+  pruneSeenWatermark(queued);
 
-  // ------------------------------------------------------------------------
-  // STEP 4 — Run the tool handler + build the response.
-  let toolText = "";
-  let toolError: boolean | undefined;
-  try {
-    const r = await handler();
-    toolText = r.text;
-    toolError = r.isError;
-  } catch (e) {
-    toolText = `Tool error: ${e instanceof Error ? e.message : String(e)}`;
-    toolError = true;
-  }
+  return fresh;
+}
 
-  const inbox = formatInboxBlock(fresh);
-  const finalText = inbox + toolText;
-  return { content: [{ type: "text", text: finalText }], isError: toolError };
+const SEEN_WATERMARK_SLACK = 10_000;
+
+function pruneSeenWatermark(queued: LeasedMessage[]): void {
+  if (seen.size === 0) return;
+  let maxSeen = 0;
+  for (const id of seen) if (id > maxSeen) maxSeen = id;
+  let minQueued = Infinity;
+  for (const m of queued) if (m.id < minQueued) minQueued = m.id;
+  const watermark = Math.min(minQueued, maxSeen - SEEN_WATERMARK_SLACK);
+  for (const id of seen) if (id < watermark) seen.delete(id);
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -657,7 +714,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             waitResult = { didWait: false, found: false, timeoutMs: plan.timeoutMs, skippedWakeable: true };
             return;
           }
-          const found = await waitForFreshPeerMessages(plan.timeoutMs);
+          const from = (args as { from?: unknown } | undefined)?.from;
+          const found = await waitForFreshPeerMessages(
+            plan.timeoutMs,
+            typeof from === "string" && from.length > 0 ? from : undefined,
+          );
           waitResult = { didWait: true, found, timeoutMs: plan.timeoutMs };
         }
       : undefined,

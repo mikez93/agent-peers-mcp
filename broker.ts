@@ -140,7 +140,8 @@ export function initDb(path: string): Database {
       sent_at           TEXT NOT NULL,
       acked             INTEGER NOT NULL DEFAULT 0,
       lease_token       TEXT,
-      lease_expires_at  TEXT
+      lease_expires_at  TEXT,
+      message_uid       TEXT
     );
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_to_acked ON messages(to_id, acked);`);
@@ -159,6 +160,7 @@ export function initDb(path: string): Database {
   // The migration is idempotent, so even if a future rebuild does drop it, the
   // next startup re-adds it and peers re-flag themselves on re-registration.
   migrate_peers_add_durable(db);
+  migrate_messages_add_message_uid(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -283,6 +285,36 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
   // Rebuild the indices that lived on the old table.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_name ON peers(name);`);
+}
+
+function migrate_messages_add_message_uid(db: Database): void {
+  // Globally unique message identity (2026-08-10). The AUTOINCREMENT integer
+  // is broker-local: two machines' brokers both mint id=1, so the moment
+  // messages cross machines (deferred federation workstream) integer ids
+  // collide. Adding the UID now means every message written from today
+  // carries a stable global identity that recovery tooling and any future
+  // relay can dedupe on. The integer id remains the local ordering key.
+  // Backfill: existing rows get UIDs too, so recovery manifests can reference
+  // them uniformly.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!columnExists(db, "messages", "message_uid")) {
+      db.exec(`ALTER TABLE messages ADD COLUMN message_uid TEXT`);
+    }
+    const nulls = db.query<{ id: number }, []>(
+      "SELECT id FROM messages WHERE message_uid IS NULL"
+    ).all();
+    if (nulls.length > 0) {
+      const update = db.query("UPDATE messages SET message_uid = ? WHERE id = ?");
+      for (const row of nulls) update.run(randomUUID(), row.id);
+      console.error(`[broker] migration: backfilled message_uid on ${nulls.length} row(s)`);
+    }
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_uid ON messages(message_uid)");
+    db.exec("COMMIT");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
+  }
 }
 
 function migrate_peers_add_durable(db: Database): void {
@@ -465,9 +497,13 @@ export function getPeerByName(db: Database, name: string): Peer | null {
 // ----- Listing -----
 
 export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
-  // Opportunistic cleanup — run GC before listing so a user who just closed a
-  // session tab doesn't see their own ghost peer. Complements the 30s timer GC.
-  gcStalePeers(db);
+  // NO GC here (2026-08-10 fix for the sleep/wake mass eviction). The
+  // `last_seen >= cutoff` predicate below already hides stale rows from
+  // discovery, which is all a reader needs; deletion belongs exclusively to
+  // the suspend-aware GC timer. The old opportunistic gcStalePeers() call made
+  // the first list_peers after a laptop wake race ahead of every frozen
+  // client's first heartbeat and purge the entire registry (77 → 9 peers,
+  // 2026-07-14).
 
   const clauses: string[] = [];
   const params: (string | null)[] = [];
@@ -560,10 +596,10 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
     //    the peer's next registration.
     const inserted = db.query<
       { id: number; to_id: string },
-      [string, string, string, string, string, string, string]
+      [string, string, string, string, string, string, string, string]
     >(
-      `INSERT INTO messages (from_id, to_id, text, sent_at)
-       SELECT ?, p.id, ?, ?
+      `INSERT INTO messages (from_id, to_id, text, sent_at, message_uid)
+       SELECT ?, p.id, ?, ?, ?
        FROM peers p
        WHERE (p.id = ? OR p.name = ?)
          AND (p.last_seen >= ? OR p.durable = 1)
@@ -574,7 +610,7 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
          )
        RETURNING id, to_id`
     ).get(
-      req.from_id, req.text, nowStr, req.to_id_or_name, req.to_id_or_name,
+      req.from_id, req.text, nowStr, randomUUID(), req.to_id_or_name, req.to_id_or_name,
       staleCutoff, staleCutoff,
     );
 
@@ -659,7 +695,8 @@ export function pollMessages(db: Database, id: string, session_token: string): L
 // ----- Ack -----
 
 export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesResponse {
-  if (req.lease_tokens.length === 0) return { ok: true, acked: 0 };
+  if (req.lease_tokens.length === 0) return { ok: true, acked: 0, stale: 0, results: [] };
+  const now = nowIso();
   // Atomic auth via subquery: the UPDATE only affects messages whose to_id
   // belongs to a peer row with the matching session_token. No separate
   // pre-check → no TOCTOU window across reclaim-rotation.
@@ -670,8 +707,43 @@ export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesR
                  AND acked = 0
                  AND lease_expires_at IS NOT NULL
                  AND lease_expires_at >= ?`;
-  const info = db.query(sql).run(...req.lease_tokens, req.id, req.session_token, nowIso());
-  return { ok: true, acked: info.changes ?? 0 };
+  const info = db.query(sql).run(...req.lease_tokens, req.id, req.session_token, now);
+  const acked = info.changes ?? 0;
+
+  // Typed per-token outcomes (2026-08-10, kills the success-shaped
+  // `{ok:true, acked:0}` blind spot): a caller that acked fewer tokens than it
+  // sent can now tell WHY. `expired` means the lease outlived the caller's
+  // tool cycle and the broker will re-offer the message — the caller should
+  // expect a re-delivery, not assume the ack landed.
+  let stale = 0;
+  let results: NonNullable<AckMessagesResponse["results"]> | undefined;
+  if (acked < req.lease_tokens.length) {
+    results = req.lease_tokens.map((token) => {
+      const row = db.query<{ acked: number; lease_expires_at: string | null; to_id: string }, [string]>(
+        "SELECT acked, lease_expires_at, to_id FROM messages WHERE lease_token = ?"
+      ).get(token);
+      if (!row) {
+        // Token cleared by a successful ack this call, or never existed.
+        // Distinguish by whether the UPDATE above could have cleared it —
+        // cheapest correct answer: a token we just acked is `acked`.
+        return { token, status: "acked" as const };
+      }
+      if (row.acked === 1) return { token, status: "acked" as const };
+      const owner = db.query<{ id: string }, [string, string]>(
+        "SELECT id FROM peers WHERE id = ? AND session_token = ?"
+      ).get(req.id, req.session_token);
+      if (!owner || row.to_id !== owner.id) return { token, status: "wrong_session" as const };
+      if (row.lease_expires_at !== null && row.lease_expires_at < now) {
+        stale++;
+        return { token, status: "expired" as const };
+      }
+      return { token, status: "unknown" as const };
+    });
+    // Anything the map couldn't classify as acked but the UPDATE did clear:
+    // the `!row` branch above already reports it as acked.
+    stale = results.filter((r) => r.status === "expired").length;
+  }
+  return { ok: true, acked, stale, results };
 }
 
 // ----- Rename -----
@@ -722,6 +794,28 @@ export function gcStalePeers(db: Database): number {
       WHERE (durable = 0 AND last_seen < ?)
          OR (durable = 1 AND last_seen < ?)`
   ).run(staleCutoff, durableCutoff);
+  return info.changes ?? 0;
+}
+
+// Message-history retention. Acked rows are receipts; keep them 7 days for
+// recovery reconciliation, then prune. Unacked rows follow durable-peer
+// retention (7 days) — past that the recipient is gone for good and the row
+// is only reachable via the orphan/stranded tooling, which snapshots before
+// this runs (Phase-0 census + cli.ts stranded-messages).
+export const MESSAGE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** True when a GC tick observed far more wall-clock than its own interval —
+ *  the machine slept. Deleting on that tick would evict the entire registry
+ *  before any frozen client's heartbeat could land. */
+export function shouldSkipGcSweep(elapsedMs: number): boolean {
+  return elapsedMs > GC_INTERVAL_MS * 3;
+}
+
+export function gcOldMessages(db: Database): number {
+  const cutoff = new Date(Date.now() - MESSAGE_RETENTION_MS).toISOString();
+  const info = db.query(
+    `DELETE FROM messages WHERE sent_at < ?`
+  ).run(cutoff);
   return info.changes ?? 0;
 }
 
@@ -1170,8 +1264,24 @@ export function startBroker(
   const db = initDb(dbPath);
   const sharedSecret = ensureSharedSecret(secretPath);
 
+  // Suspend-aware GC. When the machine sleeps, every client's heartbeat timer
+  // freezes along with ours; on wake, wall-clock has jumped and every row
+  // looks stale at once. A tick that observes far more elapsed time than its
+  // own interval is the post-wake tick — deleting on it would evict the whole
+  // registry (77 → 9 peers, 2026-07-14). Grant exactly one grace sweep so the
+  // clients' 15s heartbeats can land first. A monotonic clock would NOT fix
+  // this: the elapsed gap is real; what's false is the inference of death.
+  let lastGcTick = Date.now();
   const gcTimer = setInterval(() => {
-    try { gcStalePeers(db); } catch (e) { console.error("[broker] GC error:", e); }
+    const now = Date.now();
+    const elapsed = now - lastGcTick;
+    lastGcTick = now;
+    if (shouldSkipGcSweep(elapsed)) {
+      console.error(`[broker] suspend detected (${Math.round(elapsed / 1000)}s since last GC tick, interval ${GC_INTERVAL_MS / 1000}s); granting one grace sweep`);
+    } else {
+      try { gcStalePeers(db); } catch (e) { console.error("[broker] GC error:", e); }
+      try { gcOldMessages(db); } catch (e) { console.error("[broker] message GC error:", e); }
+    }
     // Re-enforce 0600 on WAL/SHM sidecars — SQLite may recreate them on
     // checkpoint, and they'd come back with default umask-controlled perms.
     // We also set umask(0o077) at startup so freshly created sidecars start
@@ -1246,8 +1356,11 @@ export function startBroker(
         }
 
         switch (url.pathname) {
-          case "/register":      return json(registerPeer(db, await readJson(req)));
-          case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); return json({ ok: true, known: heartbeatPeer(db, b.id, b.session_token) }); }
+          // register/heartbeat carry the broker epoch so a client seeing
+          // `known: false` can distinguish "broker restarted under me — just
+          // re-register" from "I was evicted for cause" (log-only for now).
+          case "/register":      return json({ ...registerPeer(db, await readJson(req)), epoch: BROKER_EPOCH });
+          case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); return json({ ok: true, known: heartbeatPeer(db, b.id, b.session_token), epoch: BROKER_EPOCH }); }
           case "/unregister":    { const b = await readJson<{ id: string; session_token: string }>(req); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
           case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
           case "/list-peers":    return json(listPeers(db, await readJson(req)));
