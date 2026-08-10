@@ -548,6 +548,147 @@ async function cmdSuggestName(base: string) {
   console.log(pickAvailablePeerName(base, taken));
 }
 
+// ---- Inbox observability (2026-08-10, stranded-mail stabilization) --------
+// The on-disk inbox dirs (codex, hermes, claude) hold durable copies of
+// messages keyed by peer UUID. When a peer id dies (eviction + new-UUID
+// re-register before prev_id existed), its inbox file becomes unreachable —
+// 24 messages were sitting invisible in ~/.agent-peers-hermes at the time
+// this shipped. These commands make every inbox file visible, list stranded
+// broker rows the strict orphan view misses, and archive dead inbox files
+// without ever deleting bodies.
+
+const INBOX_ROOTS: { runtime: string; env?: string; dirname: string }[] = [
+  { runtime: "codex", env: "AGENT_PEERS_CODEX_STATE_DIR", dirname: ".agent-peers-codex" },
+  { runtime: "hermes", env: "AGENT_PEERS_HERMES_STATE_DIR", dirname: ".agent-peers-hermes" },
+  { runtime: "claude", dirname: ".agent-peers-claude" },
+];
+
+interface InboxFileInfo {
+  runtime: string;
+  path: string;
+  peerId: string;
+  unread: { id: number; from_name?: string; text?: string; sent_at?: string }[];
+  mtimeMs: number;
+}
+
+async function readAllInboxFiles(): Promise<InboxFileInfo[]> {
+  const { readdir, readFile, stat } = await import("node:fs/promises");
+  const { homedir } = await import("node:os");
+  const { join } = await import("node:path");
+  const out: InboxFileInfo[] = [];
+  for (const root of INBOX_ROOTS) {
+    const dir = (root.env && process.env[root.env])
+      || process.env.AGENT_PEERS_STATE_DIR
+      || join(homedir(), root.dirname);
+    let files: string[];
+    try { files = await readdir(dir); } catch { continue; }
+    for (const file of files) {
+      if (!file.endsWith(".json") || file.endsWith(".metadata.json")) continue;
+      if (file === "wake-registry.json") continue; // daemon state, not an inbox
+      const path = join(dir, file);
+      try {
+        const parsed = JSON.parse(await readFile(path, "utf8")) as { unread?: InboxFileInfo["unread"] };
+        const st = await stat(path);
+        out.push({
+          runtime: root.runtime,
+          path,
+          peerId: decodeURIComponent(file.slice(0, -".json".length)),
+          unread: Array.isArray(parsed.unread) ? parsed.unread : [],
+          mtimeMs: st.mtimeMs,
+        });
+      } catch { /* malformed file: skip, never delete */ }
+    }
+  }
+  return out;
+}
+
+async function openDbReadonly() {
+  const { Database } = await import("bun:sqlite");
+  const { resolve } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const dbPath = process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
+  return new Database(dbPath, { readonly: true });
+}
+
+async function cmdInboxes(showStranded: boolean) {
+  const inboxes = await readAllInboxFiles();
+  if (inboxes.length === 0) { console.log("No inbox files found."); return; }
+  const db = await openDbReadonly();
+  try {
+    let strandedTotal = 0;
+    for (const box of inboxes.sort((a, b) => b.unread.length - a.unread.length)) {
+      const row = db.query<{ name: string; durable: number; last_seen: string }, [string]>(
+        "SELECT name, durable, last_seen FROM peers WHERE id = ?"
+      ).get(box.peerId);
+      const state = row
+        ? `${row.name}${row.durable ? " (durable)" : ""} last_seen=${row.last_seen}`
+        : "DEAD (no broker row)";
+      console.log(`[${box.runtime}] ${box.peerId}  unread=${box.unread.length}  ${state}`);
+      if (!row) strandedTotal += box.unread.length;
+      if (showStranded && !row && box.unread.length > 0) {
+        for (const m of box.unread) {
+          console.log(`    #${m.id} from=${m.from_name ?? "?"} sent_at=${m.sent_at ?? "?"}`);
+          console.log(`      ${String(m.text ?? "").split("\n").join("\n      ")}`);
+        }
+      }
+    }
+    console.log(`\n${strandedTotal} unread message(s) in DEAD inboxes${showStranded ? "" : " (re-run with --stranded for full bodies)"}`);
+  } finally { db.close(); }
+}
+
+async function cmdStrandedMessages() {
+  // The strict orphan view (orphaned-messages) requires the recipient row to
+  // be GONE. A durable row that never comes back holds its mail invisibly for
+  // 7 days — this shows unacked mail whose recipient exists but hasn't been
+  // seen in 24h.
+  const db = await openDbReadonly();
+  try {
+    type Row = { id: number; message_uid: string | null; to_id: string; name: string; last_seen: string; from_name: string | null; text: string; sent_at: string };
+    const rows = db.query<Row, [string]>(
+      `SELECT m.id, m.message_uid, m.to_id, p.name, p.last_seen, pf.name AS from_name, m.text, m.sent_at
+       FROM messages m
+       JOIN peers p ON p.id = m.to_id
+       LEFT JOIN peers pf ON pf.id = m.from_id
+       WHERE m.acked = 0 AND p.last_seen < ?
+       ORDER BY m.id ASC`
+    ).all(new Date(Date.now() - 24 * 3600_000).toISOString());
+    if (rows.length === 0) { console.log("No stranded messages (unacked mail to peers idle >24h)."); return; }
+    for (const r of rows) {
+      console.log(`#${r.id} uid=${r.message_uid ?? "-"} to=${r.name} (idle since ${r.last_seen}) from=${r.from_name ?? r.to_id}`);
+      console.log(`  sent_at=${r.sent_at}`);
+      console.log(`  ${r.text.split("\n").join("\n  ")}`);
+    }
+    console.log(`\n${rows.length} stranded message(s).`);
+  } finally { db.close(); }
+}
+
+async function cmdGcInboxes(apply: boolean, minAgeDays: number) {
+  const { rename } = await import("node:fs/promises");
+  const inboxes = await readAllInboxFiles();
+  const db = await openDbReadonly();
+  const cutoff = Date.now() - minAgeDays * 24 * 3600_000;
+  let candidates = 0;
+  try {
+    for (const box of inboxes) {
+      const row = db.query("SELECT id FROM peers WHERE id = ?").get(box.peerId);
+      if (row) continue;                 // live or retained peer: keep
+      if (box.mtimeMs > cutoff) continue; // too recent: keep
+      candidates++;
+      if (apply) {
+        // Archive, never delete — bodies stay recoverable.
+        await rename(box.path, `${box.path}.archived`);
+        try { await rename(box.path.replace(/\.json$/, ".metadata.json"), `${box.path.replace(/\.json$/, ".metadata.json")}.archived`); } catch { /* no metadata file */ }
+        console.log(`archived ${box.path} (unread=${box.unread.length})`);
+      } else {
+        console.log(`would archive ${box.path} (unread=${box.unread.length}, mtime age ${(Math.round((Date.now() - box.mtimeMs) / 86_400_000))}d)`);
+      }
+    }
+  } finally { db.close(); }
+  console.log(apply
+    ? `archived ${candidates} dead inbox file(s).`
+    : `${candidates} dead inbox file(s) would be archived. Re-run with --apply to archive.`);
+}
+
 const [, , sub, ...rest] = process.argv;
 switch (sub) {
   case "status":
@@ -606,6 +747,18 @@ switch (sub) {
   case "kill-broker":
     await cmdKillBroker();
     break;
+  case "inboxes":
+    await cmdInboxes(rest.includes("--stranded"));
+    break;
+  case "stranded-messages":
+    await cmdStrandedMessages();
+    break;
+  case "gc-inboxes": {
+    const ageIdx = rest.indexOf("--min-age-days");
+    const minAge = ageIdx !== -1 ? parseFloat(rest[ageIdx + 1] ?? "7") : 7;
+    await cmdGcInboxes(rest.includes("--apply"), Number.isFinite(minAge) ? minAge : 7);
+    break;
+  }
   default:
     console.log(`usage:
   bun cli.ts status
@@ -618,6 +771,9 @@ switch (sub) {
   bun cli.ts suggest-name <base>
   bun cli.ts messages
   bun cli.ts orphaned-messages
+  bun cli.ts inboxes [--stranded]
+  bun cli.ts stranded-messages
+  bun cli.ts gc-inboxes [--apply] [--min-age-days N]
   bun cli.ts kill-broker`);
     process.exit(sub ? 2 : 0);
 }
