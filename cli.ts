@@ -675,11 +675,15 @@ async function cmdGcInboxes(apply: boolean, minAgeDays: number) {
   const db = await openDbReadonly();
   const cutoff = Date.now() - minAgeDays * 24 * 3600_000;
   let candidates = 0;
+  let tooRecent = 0;
   try {
     for (const box of inboxes) {
       const row = db.query("SELECT id FROM peers WHERE id = ?").get(box.peerId);
       if (row) continue;                 // live or retained peer: keep
-      if (box.mtimeMs > cutoff) continue; // too recent: keep
+      if (box.mtimeMs > cutoff) {        // too recent: keep (may be mid-write)
+        tooRecent++;
+        continue;
+      }
       candidates++;
       if (apply) {
         // Archive, never delete — bodies stay recoverable.
@@ -698,6 +702,10 @@ async function cmdGcInboxes(apply: boolean, minAgeDays: number) {
   console.log(apply
     ? `archived ${candidates} dead inbox file(s).`
     : `${candidates} dead inbox file(s) would be archived. Re-run with --apply to archive.`);
+  if (tooRecent > 0) {
+    // Silent caps read as "covered everything" — say what was skipped and why.
+    console.log(`${tooRecent} DEAD inbox file(s) skipped: mtime newer than ${minAgeDays}d (may be mid-write). If verified dead, re-run with --min-age-days 0.`);
+  }
 }
 
 const [, , sub, ...rest] = process.argv;
