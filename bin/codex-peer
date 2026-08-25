@@ -262,7 +262,19 @@ ensure_daemon() {
     rmdir "$DAEMON_LOCKDIR" 2>/dev/null || true
     return 0
   fi
-  nohup "$ROOT_DIR/bin/codex-peer" daemon "$DAEMON_INTERVAL" >>"$DAEMON_LOGFILE" 2>&1 &
+  # A normal wakeable Codex launch may carry a process-scoped GBrain role
+  # credential. The machine-wide daemon must never retain that role or pass it
+  # to later wake children. Scrub the whole namespace in the daemon child,
+  # including future role names, while leaving the caller's environment alone.
+  (
+    local name
+    while IFS='=' read -r name _; do
+      case "$name" in
+        BRAIN_ROUTER_TOKEN_*) unset "$name" ;;
+      esac
+    done < <(env)
+    exec nohup "$ROOT_DIR/bin/codex-peer" daemon "$DAEMON_INTERVAL"
+  ) >>"$DAEMON_LOGFILE" 2>&1 &
   local dpid=$!
   printf '%s\n' "$dpid" >"$DAEMON_PIDFILE"
   disown 2>/dev/null || true
