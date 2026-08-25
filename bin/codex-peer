@@ -57,6 +57,10 @@ Usage:
       Resume an existing Codex session as a wakeable peer. The saved rollout
       supplies the repo path, so this works from any directory.
 
+  codex-peer session-cwd <session-id>
+      Print only the absolute cwd saved in an explicit session rollout. This
+      is a read-only shell-composition command; it never launches Codex.
+
   codex-peer daemon [seconds]
       Run the wake loop in the FOREGROUND. Keep this open in one Zed terminal.
       Default interval: 5 seconds. You normally do NOT need this — any launch
@@ -214,11 +218,18 @@ session_cwd() {
   local session_id="$1"
   local codex_home="${CODEX_HOME:-${HOME}/.codex}"
   local rollout cwd
+  [[ "$session_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || \
+    die "session id must be a canonical UUID"
   rollout="$(find "$codex_home/sessions" -type f -name "*-${session_id}.jsonl" -print -quit 2>/dev/null || true)"
   [ -n "$rollout" ] || die "session rollout not found: $session_id"
   need_cmd jq
-  cwd="$(jq -r 'select(.type == "session_meta") | .payload.cwd // empty' "$rollout" 2>/dev/null | head -n1)"
-  [ -n "$cwd" ] || die "session rollout has no cwd: $rollout"
+  cwd="$(jq -ers 'first(.[] | select(.type == "session_meta") | .payload.cwd | select(type == "string" and length > 0))' "$rollout" 2>/dev/null)" || \
+    die "session rollout has no valid cwd"
+  case "$cwd" in
+    /*) ;;
+    *) die "session rollout has no valid cwd" ;;
+  esac
+  [[ "$cwd" != *$'\n'* && "$cwd" != *$'\r'* ]] || die "session rollout has no valid cwd"
   printf '%s\n' "$cwd"
 }
 
@@ -399,6 +410,10 @@ case "$cmd" in
     session_id="$1"
     shift
     resume_peer "$session_id" "$@"
+    ;;
+  session-cwd)
+    [ "$#" -eq 1 ] || die "usage: codex-peer session-cwd <session-id>"
+    session_cwd "$1"
     ;;
   daemon)
     run_daemon "${1:-5}"
