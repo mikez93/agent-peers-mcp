@@ -14,7 +14,7 @@
 //     than 0o600 (fail closed — don't silently serve a leak)
 // Only POSIX platforms get the perm enforcement; on Windows we skip it.
 
-import { mkdir, readFile, rename, writeFile, chmod, stat } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile, chmod, lstat } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -196,6 +196,7 @@ export class CodexInboxStore {
 
   async reset(): Promise<void> {
     await this.withLock(async () => {
+      await this.ensureLoaded();
       const nextState = { unread: [] };
       await this.persistState(this.filePath, nextState);
       this.state = nextState;
@@ -215,48 +216,39 @@ export class CodexInboxStore {
   }
 
   private async readStateFromDisk(): Promise<CodexInboxState> {
+    let st;
     try {
-      // Fail-closed perm check (matches broker.ts enforceDbFilePerms). If
-      // the file exists with perms wider than 0o600 or owned by another
-      // user, refuse to read it — another local user may have stuffed
-      // crafted messages in to spoof peer identities, or may be reading
-      // our message bodies. We return empty state rather than throwing so
-      // the session still starts cleanly; the operator will see the
-      // refusal in stderr and can investigate.
-      if (IS_POSIX) {
-        const st = await stat(this.filePath);
-        if (!st.isFile()) {
-          console.error(
-            `[agent-peers/codex-inbox] ${this.filePath} is not a regular file — refusing to load; starting with empty inbox`,
-          );
-          return { unread: [] };
-        }
-        const mine = (process as unknown as { getuid?: () => number }).getuid?.();
-        if (typeof mine === "number" && st.uid !== mine) {
-          console.error(
-            `[agent-peers/codex-inbox] ${this.filePath} owned by uid ${st.uid}, not ${mine} — refusing to load; starting with empty inbox`,
-          );
-          return { unread: [] };
-        }
-        const mode = st.mode & 0o777;
-        if (mode !== FILE_MODE) {
-          console.error(
-            `[agent-peers/codex-inbox] ${this.filePath} has mode ${mode.toString(8)}, expected 0600 — refusing to load; starting with empty inbox`,
-          );
-          return { unread: [] };
-        }
-      }
-
-      const raw = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<CodexInboxState>;
-      if (!Array.isArray(parsed.unread)) return { unread: [] };
-      return { unread: cloneMessages(parsed.unread as LeasedMessage[]) };
-    } catch {
-      // File doesn't exist yet (common on first boot) or JSON parse failed.
-      // Either way: start empty. stat() throws ENOENT before we can
-      // distinguish, so we can't narrow here without double-statting.
-      return { unread: [] };
+      st = await lstat(this.filePath);
+    } catch (error) {
+      // A genuinely absent file is the only trustworthy empty state. Any
+      // other read failure must block later writes; otherwise a safety
+      // refusal becomes an overwrite of unread mail (bd-336, carried forward
+      // from origin/fix/roast-hardening).
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { unread: [] };
+      throw error;
     }
+
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error(`${this.filePath} is a symlink or not a regular file — refusing to load`);
+    }
+    if (st.nlink !== 1) {
+      throw new Error(`${this.filePath} has ${st.nlink} hard links; expected exactly one — refusing to load`);
+    }
+    if (IS_POSIX) {
+      const mine = (process as unknown as { getuid?: () => number }).getuid?.();
+      if (typeof mine === "number" && st.uid !== mine) {
+        throw new Error(`${this.filePath} owned by uid ${st.uid}, not ${mine} — refusing to load`);
+      }
+      const mode = st.mode & 0o777;
+      if (mode !== FILE_MODE) {
+        throw new Error(`${this.filePath} has mode ${mode.toString(8)}, expected 0600 — refusing to load`);
+      }
+    }
+
+    const raw = await readFile(this.filePath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<CodexInboxState>;
+    if (!Array.isArray(parsed.unread)) throw new Error("inbox unread must be an array");
+    return { unread: cloneMessages(parsed.unread as LeasedMessage[]) };
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {

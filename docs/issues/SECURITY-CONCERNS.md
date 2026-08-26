@@ -19,6 +19,11 @@ with the reasoning and the residual risk, because "already considered" is not th
 
 ## S1 — HIGH — The durable inbox destroys unread mail after any failed read
 
+**Status (2026-08-26): Resolved in `bd-336`.** Only `ENOENT` is treated as an
+empty inbox. Trust failures, corrupt state, and other read errors now throw;
+all mutators lazy-load first and therefore cannot overwrite a refused file.
+The regression test verifies the original bytes remain unchanged.
+
 **Files** `shared/codex-inbox.ts:217-260` (`readStateFromDisk`),
 `:129-133` (`ensureLoaded`), `:149-159` (`queueLeasedMessages`)
 
@@ -432,7 +437,7 @@ Checked and found correct; listed so the next reviewer does not re-audit them:
 - **The preview push carries no message body.** `formatInboxPreview`
   (`shared/piggyback.ts:27-33`) deliberately omits body and `reply_action` to avoid
   double-delivery; `tests/piggyback.test.ts` guards the property.
-- **`OPENAI_API_KEY` is used correctly.** `shared/summarize.ts:41-74` sends only cwd,
-  git root, branch and recent filenames — no message content, no credentials — over TLS
-  with an 8 s timeout, and returns `""` on any failure. Note for operators: repository
-  paths and filenames do leave the machine when this is enabled.
+- **Auto-summary egress is explicit and redacted.** `shared/summarize.ts` requires both
+  `OPENAI_API_KEY` and `AGENT_PEERS_AUTO_SUMMARY=1`, sends branch plus coarse file
+  count/extensions (never paths or filenames) over TLS with an 8 s timeout, and returns
+  `""` on any failure. Regression tests cover opt-in and path redaction (`bd-336`).

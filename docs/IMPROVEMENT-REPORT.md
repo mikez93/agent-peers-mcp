@@ -95,6 +95,11 @@ Genuine strengths worth preserving:
 ## Critical — Fix Before Anything Else
 
 ### C-1: A failed durable-inbox read destroys every unread message
+
+**Status (2026-08-26): Resolved in `bd-336`.** Trust failures and non-`ENOENT`
+read errors now throw and block every mutating operation; the regression test
+proves a rejected inbox is not overwritten.
+
 - **Category**: Reliability (unrecoverable data loss)
 - **Effort**: S
 - **Impact**: Removes the one path in this system that loses peer messages permanently and
@@ -152,6 +157,11 @@ Genuine strengths worth preserving:
 - **Files**: `claude-server.ts:198-206, 280-315`, `shared/async-lock.ts`
 
 ### QW-2: Give `shared/summarize.ts` an opt-out and disclose the egress
+
+**Status (2026-08-26): Resolved in `bd-336`.** Auto-summary now requires
+`AGENT_PEERS_AUTO_SUMMARY=1`, transmits only coarse redacted metadata, and is
+documented in the README and `.env.example`.
+
 - **Category**: Security / Privacy
 - **Effort**: XS
 - **Impact**: Removes silent third-party data transmission from a tool marketed as "No cloud."
@@ -212,6 +222,11 @@ Genuine strengths worth preserving:
 - **Files**: `claude-server.ts:212-250, 318-337`
 
 ### QW-7: Chmod the wake-daemon log to 0600 and add a `typecheck` script
+
+**Status (2026-08-26): Partially resolved in `bd-336`.** The typecheck script
+and a pinned CI workflow are now present. The wake-daemon log permission item
+remains open.
+
 - **Category**: Security (defense in depth) / DX
 - **Effort**: XS
 - **Impact**: Removes an unintentional permissions inconsistency and wires the typecheck that

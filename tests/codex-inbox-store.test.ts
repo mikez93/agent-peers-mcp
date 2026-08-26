@@ -170,7 +170,7 @@ test.if(IS_POSIX)("CodexInboxStore writes inbox file at 0o600 and directory at 0
   expect(dirStat.mode & 0o777).toBe(0o700);
 });
 
-test.if(IS_POSIX)("CodexInboxStore refuses to load an inbox file with too-wide perms", async () => {
+test.if(IS_POSIX)("CodexInboxStore never overwrites an inbox file it refuses to load", async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
   tempDirs.push(dir);
 
@@ -181,13 +181,17 @@ test.if(IS_POSIX)("CodexInboxStore refuses to load an inbox file with too-wide p
   const filePath = join(dir, `${encodeURIComponent(peerId)}.json`);
   await writeFile(filePath, JSON.stringify({ unread: [message(99, { text: "spoofed" })] }), "utf8");
   await chmod(filePath, 0o644); // too wide
+  const original = await readFile(filePath, "utf8");
 
   const store = new CodexInboxStore({ peerId, rootDir: dir });
-  await store.init();
-  const unread = await store.getUnreadMessages();
+  await expect(store.init()).rejects.toThrow("mode 644, expected 0600");
+  await expect(store.queueLeasedMessages([message(100)])).rejects.toThrow("mode 644, expected 0600");
+  await expect(store.reset()).rejects.toThrow("mode 644, expected 0600");
 
-  // Fail-closed: we got an empty inbox instead of the attacker-controlled payload.
-  expect(unread).toEqual([]);
+  // A trust failure is not proof that the durable queue is empty. The old
+  // behavior marked an empty state loaded and the next write destroyed every
+  // unread message in this file.
+  expect(await readFile(filePath, "utf8")).toBe(original);
 });
 
 test("CodexInboxStore keeps unread messages in memory when consume persistence fails", async () => {

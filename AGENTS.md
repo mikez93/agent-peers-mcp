@@ -1,12 +1,12 @@
 # agent-peers-mcp — AI Context
 
-Working context for an AI agent editing this repo. Written against `63503f2` (2026-08-10).
+Working context for an AI agent editing this repo. Updated against `06939e4` (2026-08-26).
 
 ## Quick Reference
 
 - **Stack**: Bun + TypeScript, SQLite (`bun:sqlite`), MCP SDK. No build step; sources run directly.
 - **Entry points**: `broker.ts` (daemon), `codex-server.ts` / `claude-server.ts` / `hermes-server.ts` (MCP servers), `cli.ts` (ops), `wake-daemon.ts` + `bin/codex-peer` (Codex wake).
-- **Test**: `bun test` (239 tests, 31 files). **Typecheck**: `bunx tsc --noEmit`. Both must be clean before you commit.
+- **Test**: `bun test` (245 tests, 32 files). **Typecheck**: `bun run typecheck`. Both must be clean before you commit.
 - **Runtime state** (not in the repo): `~/.agent-peers.db`, `~/.agent-peers-secret` (0600), `~/.agent-peers-{codex,claude,hermes}/`.
 
 ## Component Map

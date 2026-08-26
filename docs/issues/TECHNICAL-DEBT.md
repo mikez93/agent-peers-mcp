@@ -253,6 +253,10 @@ across `broker.ts`, `shared/summarize.ts` and `shared/peer-context.ts`.
 
 ### D16 — LOW — No `typecheck` or `lint` script
 
+**Status (2026-08-26): Typecheck portion resolved in `bd-336`.** `package.json`
+now exposes `typecheck` and `test:ci`, and the pinned CI workflow runs both.
+There is still no lint script.
+
 **File** `package.json:7-10` defines only `broker` and `test`. `bunx tsc --noEmit` passes
 cleanly at HEAD and takes a few seconds — worth wiring as `"typecheck": "tsc --noEmit"`
 so CI and pre-commit can run it.

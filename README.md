@@ -339,7 +339,8 @@ Full design, security model, and failure-mode notes: [`docs/wakeable-codex.md`](
 | `AGENT_PEERS_PORT` | `7900` | Broker port |
 | `AGENT_PEERS_DB` | `~/.agent-peers.db` | SQLite path |
 | `PEER_NAME` | auto-generated | Human-readable peer name at launch (1-32 chars, `[a-zA-Z0-9_-]`) |
-| `OPENAI_API_KEY` | — | Enables `gpt-5.4-nano` auto-summary of what each session is working on |
+| `OPENAI_API_KEY` | — | API key used only when `AGENT_PEERS_AUTO_SUMMARY=1` |
+| `AGENT_PEERS_AUTO_SUMMARY` | `0` | Set to `1` to opt in to `gpt-5.4-nano` summaries. Only branch, file count/extensions, and presence of a Git root are sent; paths and filenames are excluded. |
 | `AGENT_PEERS_DISABLE_TAB_TITLE` | — | Set to `1` to skip terminal tab title writing |
 | `AGENT_PEERS_CODEX_STATE_DIR` | `~/.agent-peers-codex` | Codex durable inbox + wake registry/daemon state dir |
 | `CODEX_PEER_DAEMON_INTERVAL` | `5` | Background wake daemon poll interval (seconds) |
