@@ -78,12 +78,36 @@ the thing being engineered out.
    unhandled SIGHUP exits 129 without firing `exit`, which would strand a `peer:<name>` tab title.
 2. Orphan-parent watchdog every 1s (`:799-805`) — Bun's stdio transport can outlive its app-server
    parent; `parentProcessWasLost` detects the reparent to launchd.
-3. Activation gate (`:811-816`) — `AGENT_PEERS_ENABLED !== "1"` ⇒ connect, expose **zero tools**,
+3. Paperclip containment gate (`:813-819`) — `PAPERCLIP_AGENT_ID` or `PAPERCLIP_RUN_ID` set ⇒
+   connect, expose **zero tools**, return. Runs **before** the activation gate on purpose, so a
+   Paperclip adapter config that sets `AGENT_PEERS_ENABLED=1` cannot opt the agent back on. See
+   `shared/paperclip-guard.ts` and [§2.3.1](#231-paperclip-containment).
+4. Activation gate (`:825-830`) — `AGENT_PEERS_ENABLED !== "1"` ⇒ connect, expose **zero tools**,
    return. No broker, no tab title.
-4. Wake-launch election (`:828-855`) — only for Codex. See [§2.4](#24-two-elections).
-5. Tab title placeholder + keepalive (`:867-868`) — before `register()` so there is no "node" window.
-6. `ensureBroker` → `waitForSharedSecret` → `createClient` (`:870-873`).
-7. `myCwd` from `AGENT_PEERS_CWD || process.cwd()` (`:879`), git root, tty.
+5. Wake-launch election — only for Codex. See [§2.4](#24-two-elections).
+6. Tab title placeholder + keepalive — before `register()` so there is no "node" window.
+7. `ensureBroker` → `waitForSharedSecret` → `createClient`.
+8. `myCwd` from `AGENT_PEERS_CWD || process.cwd()`, git root, tty.
+
+#### 2.3.1 Paperclip containment
+
+An agent embodied inside a Paperclip company must never join the peer network. Refusing broker
+registration is the single choke point that blocks both directions: the agent cannot be listed,
+messaged, or woken by a peer, and it never receives the peer tools to message out.
+
+Keys **only** on embodiment markers (`PAPERCLIP_AGENT_ID`, `PAPERCLIP_RUN_ID`) — set per-run by
+Paperclip's adapter, and by `paperclipai agent local-cli` when a shell is given an agent identity.
+Deliberately ignores `PAPERCLIP_HOME` / `PAPERCLIP_INSTANCE_ID` / `PAPERCLIP_CONFIG` /
+`PAPERCLIP_COMPANY_ID`: a board **operator** carries those while running the CLI and must stay
+allowed on the network.
+
+Motivation: on 2026-08-27 CCR ran two copies of the same persona — one Paperclip agent, one
+hand-launched peer — coordinating with the same colleague on the same task with no shared state.
+Pausing the board agent stopped only half the work. Before the guard the separation held only by
+accident, because Paperclip's adapter happened not to set `AGENT_PEERS_ENABLED`.
+
+`hermes-server.ts` delegates to `codex-server.ts`, so all three surfaces inherit the guard.
+Covered by `tests/paperclip-guard.test.ts`, which asserts gate ordering against the real source.
 8. Hermes name-claim election (`:888-902`).
 9. Best-effort summary with a 3s race (`:904-918`).
 10. `register()` → construct + `init()` the `CodexInboxStore` (`:920-934`).
@@ -202,7 +226,8 @@ first thing every user turn.**
 
 | Variable | Read at | Effect |
 | --- | --- | --- |
-| `AGENT_PEERS_ENABLED` | `codex-server.ts:811`, `claude-server.ts:347` | Must be exactly `"1"`. Anything else ⇒ zero-tool no-op MCP, no broker, no tab title. Hermes defaults it to `"1"` (`hermes-server.ts:37`). |
+| `PAPERCLIP_AGENT_ID`, `PAPERCLIP_RUN_ID` | `codex-server.ts:813`, `claude-server.ts:346` | Either one set ⇒ zero-tool no-op MCP, no registration. Checked **before** `AGENT_PEERS_ENABLED`, so it cannot be overridden. See `shared/paperclip-guard.ts`. |
+| `AGENT_PEERS_ENABLED` | `codex-server.ts:825`, `claude-server.ts:360` | Must be exactly `"1"`. Anything else ⇒ zero-tool no-op MCP, no broker, no tab title. Hermes defaults it to `"1"` (`hermes-server.ts:37`). |
 | `PEER_NAME` | `codex-server.ts:888`, `claude-server.ts:415` | Requested stable name. Also the durability trigger. |
 | `AGENT_PEERS_EPHEMERAL` | `codex-server.ts:889`, `claude-server.ts:421` | `"1"` ⇒ register non-durable even with a `PEER_NAME`. |
 | `AGENT_PEERS_CWD` | `codex-server.ts:879` | Codex/Hermes only. Hermes surfaces inherit an arbitrary cwd (`/`, the profile dir, a workdir — three "identities" for one agent), so profiles pin it. **Claude has no equivalent** and always uses `process.cwd()` (`claude-server.ts:392`). |
@@ -510,7 +535,7 @@ alias agentpeers='AGENT_PEERS_ENABLED=1 claude --dangerously-skip-permissions \
 ```
 
 Registered globally, so *every* `claude` session spawns the process; the alias is what sets
-`AGENT_PEERS_ENABLED=1`. Plain `claude` gets the no-op MCP (`claude-server.ts:341-352`).
+`AGENT_PEERS_ENABLED=1`. Plain `claude` gets the no-op MCP (`claude-server.ts:354-365`).
 `--dangerously-load-development-channels server:agent-peers` is what makes the `claude/channel`
 capability (`:88-90`) usable.
 

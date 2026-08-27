@@ -14,7 +14,7 @@ Working context for an AI agent editing this repo. Updated against `06939e4` (20
 | Area | Files | Deep doc |
 | --- | --- | --- |
 | Broker daemon, HTTP API, schema | `broker.ts`, `shared/ensure-broker.ts`, `shared/shared-secret.ts` | `docs/components/broker.md` |
-| MCP servers + delivery machine | `codex-server.ts`, `claude-server.ts`, `hermes-server.ts`, `shared/delivery-state.ts`, `shared/codex-inbox.ts`, `shared/piggyback.ts`, `shared/hermes-claims.ts` | `docs/components/mcp-servers-delivery.md` |
+| MCP servers + delivery machine | `codex-server.ts`, `claude-server.ts`, `hermes-server.ts`, `shared/delivery-state.ts`, `shared/codex-inbox.ts`, `shared/piggyback.ts`, `shared/hermes-claims.ts`, `shared/paperclip-guard.ts` | `docs/components/mcp-servers-delivery.md` |
 | Codex idle wake | `wake-daemon.ts`, `wakeable-codex.ts`, `bin/codex-peer`, `shared/wake-*.ts`, `shared/app-server-client.ts` | `docs/components/wake-subsystem.md` |
 | Operator CLI | `cli.ts` | `docs/components/cli-ops-tests.md` |
 | System design | — | `docs/ARCHITECTURE.md` |
@@ -33,6 +33,12 @@ Working context for an AI agent editing this repo. Updated against `06939e4` (20
   request proves the response reached the model — see Gotchas.
 - **Per-session identity.** One session = one peer = one UUID. Names are exclusive; sessions
   are not.
+- **Paperclip agents are never peers.** A session embodied inside a Paperclip company
+  (`PAPERCLIP_AGENT_ID` or `PAPERCLIP_RUN_ID` set) is refused registration, which blocks both
+  directions at once: it cannot be listed/messaged/woken, and never gets the peer tools. The
+  check runs **before** the `AGENT_PEERS_ENABLED` gate so an adapter config cannot opt it back
+  in. See `shared/paperclip-guard.ts` — and keep it keyed on embodiment markers only; a board
+  *operator* carries `PAPERCLIP_HOME`/`INSTANCE_ID`/`COMPANY_ID` and must stay allowed.
 
 ## Gotchas
 
