@@ -57,6 +57,16 @@ function isUniqueViolation(e: unknown): boolean {
   return e instanceof Error && /UNIQUE constraint failed/i.test(e.message);
 }
 
+function isDefinitelyDeadLocalPid(pid: number | null): boolean {
+  if (!Number.isInteger(pid) || (pid ?? 0) <= 0) return false;
+  try {
+    process.kill(pid!, 0);
+    return false;
+  } catch (error) {
+    return error instanceof Error && "code" in error && error.code === "ESRCH";
+  }
+}
+
 // ----- Schema -----
 
 function chmodIfExists(p: string, mode: number): void {
@@ -413,17 +423,33 @@ function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse
   // place, preserve UUID. The type guard (2026-08-10) stops a claude process
   // from inheriting `ezra-hermes`'s UUID — and therefore its queued mailbox —
   // just by asking for the name. A name-match with a type mismatch falls
-  // through to the suffix ladder instead.
+  // through to the suffix ladder instead. A same-host peer whose recorded PID
+  // is provably gone may reclaim immediately; this preserves its UUID and
+  // queued mailbox across an ordinary process restart without waiting for the
+  // stale timer. Live, uninspectable, and remote-host peers remain age-gated.
   if (req.name && isValidName(req.name)) {
     const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
+    const existing = db.query<
+      { pid: number | null; host: string | null },
+      [string, RegisterRequest["peer_type"]]
+    >("SELECT pid, host FROM peers WHERE name = ? AND peer_type = ?")
+      .get(req.name, req.peer_type);
+    // Fast reclaim requires positive proof that the old process belonged to
+    // this host. A legacy NULL host is unknown ownership, so it remains
+    // subject to the normal stale-age gate even when its PID is absent here.
+    const sameHost = existing?.host === host;
+    const deadLocalProcess = Boolean(
+      sameHost && isDefinitelyDeadLocalPid(existing.pid)
+    );
     const reclaim = db.query(
       `UPDATE peers
          SET pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
              session_token = ?, last_seen = ?, durable = ?, host = ?
-       WHERE name = ? AND peer_type = ? AND last_seen < ?`
+       WHERE name = ? AND peer_type = ? AND (last_seen < ? OR ? = 1)`
     ).run(
       req.pid, req.cwd, req.git_root, req.tty, req.summary,
       session_token, ts, durable, host, req.name, req.peer_type, cutoff,
+      deadLocalProcess ? 1 : 0,
     );
     if ((reclaim.changes ?? 0) > 0) {
       const row = db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE name = ?").get(req.name);

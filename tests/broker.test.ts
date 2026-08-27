@@ -118,6 +118,35 @@ test("registerPeer reclaims stale peer with same name, preserving UUID and issui
   expect(row.cwd).toBe("/new");
 });
 
+test("registerPeer immediately reclaims a same-host peer whose PID is gone", () => {
+  const first = reg({ name: "restarted", peer_type: "hermes", pid: 999_999_999 });
+  const second = reg({ name: "restarted", peer_type: "hermes", pid: process.pid });
+
+  expect(second.id).toBe(first.id);
+  expect(second.name).toBe("restarted");
+  expect(second.session_token).not.toBe(first.session_token);
+});
+
+test("registerPeer does not immediately reclaim a recent peer from another host", () => {
+  const first = reg({ name: "remote", peer_type: "hermes", pid: 999_999_999 });
+  db.query("UPDATE peers SET host = ? WHERE id = ?").run("another-host", first.id);
+
+  const second = reg({ name: "remote", peer_type: "hermes", pid: process.pid });
+
+  expect(second.id).not.toBe(first.id);
+  expect(second.name).toBe("remote-2");
+});
+
+test("registerPeer does not immediately reclaim a recent peer with unknown host", () => {
+  const first = reg({ name: "legacy", peer_type: "hermes", pid: 999_999_999 });
+  db.query("UPDATE peers SET host = NULL WHERE id = ?").run(first.id);
+
+  const second = reg({ name: "legacy", peer_type: "hermes", pid: process.pid });
+
+  expect(second.id).not.toBe(first.id);
+  expect(second.name).toBe("legacy-2");
+});
+
 test("registerPeer on reclaim clears stale leases so new session sees backlog immediately", () => {
   // Sender stays alive; receiver "dies" mid-delivery and is reclaimed.
   const sender = reg({ name: "sender" });
@@ -153,8 +182,8 @@ test("registerPeer on reclaim clears stale leases so new session sees backlog im
   expect(backlog.map((m) => m.text).sort()).toEqual(["hi", "second"]);
 });
 
-test("registerPeer does NOT reclaim a LIVE peer, falls through to suffix", () => {
-  const live = reg({ name: "active" });
+test("registerPeer does NOT immediately reclaim a same-host LIVE peer", () => {
+  const live = reg({ name: "active", pid: process.pid });
   const second = reg({ name: "active" });
   expect(second.id).not.toBe(live.id);
   expect(second.name).toBe("active-2");
@@ -165,7 +194,7 @@ test("registerPeer is atomic under simulated interleaving", () => {
     `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
-    "external-id", "race", "claude", 99, "/ext", null, null, "",
+    "external-id", "race", "claude", process.pid, "/ext", null, null, "",
     "external-session", new Date().toISOString(), new Date().toISOString(),
   );
   const res = reg({ name: "race" });
