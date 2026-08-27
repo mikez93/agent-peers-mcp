@@ -1,12 +1,14 @@
 import { expect, test } from "bun:test";
 
 import {
+  buildAppServerPassthroughArgs,
   buildCodexResumeArgs,
   buildFreshThreadModelConfigArgs,
   buildMaterializeMcpConfigArgs,
   buildMcpEnvConfigArgs,
   buildMcpPeerNameConfigArgs,
   buildResumeMcpConfigArgs,
+  buildResumeAppServerArgs,
   buildWakeableEnv,
   isEmptyRolloutRaceError,
   materializeThreadName,
@@ -94,6 +96,36 @@ test("buildCodexResumeArgs targets the managed remote thread", () => {
     "thread-1",
     "--model",
     "gpt-5",
+  ]);
+});
+
+test("the owning app-server receives caller config and feature overrides", () => {
+  expect(buildAppServerPassthroughArgs([
+    "-c", "mcp_servers.digitalocean.enabled=true",
+    "--disable", "apps",
+    "resume prompt stays TUI-only",
+  ])).toEqual([
+    "-c", "mcp_servers.digitalocean.enabled=true",
+    "--disable", "apps",
+  ]);
+
+  expect(buildResumeAppServerArgs({
+    appServerUrl: "ws://127.0.0.1:41037",
+    peerName: "brisk-bison",
+    extraCodexArgs: [
+      "-c", "features.apps=false",
+      "-c", "mcp_servers.digitalocean.enabled=true",
+      "prompt text",
+    ],
+  })).toEqual([
+    "-c", 'model="gpt-5.6-sol"',
+    "-c", 'model_reasoning_effort="high"',
+    "-c", "features.apps=false",
+    "-c", "mcp_servers.digitalocean.enabled=true",
+    "-c", 'mcp_servers.agent-peers.env.PEER_NAME="brisk-bison"',
+    "-c", 'mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_LAUNCH="1"',
+    "-c", "mcp_servers.agent-peers.required=true",
+    "app-server", "--listen", "ws://127.0.0.1:41037",
   ]);
 });
 

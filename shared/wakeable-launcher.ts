@@ -106,6 +106,46 @@ export function buildCodexResumeArgs(opts: {
   ];
 }
 
+// In remote mode, the app-server owns the session and starts its MCP servers;
+// the visible TUI is only a client. Preserve caller-supplied config/feature
+// overrides on that owning process as well as on the TUI. Other passthrough
+// arguments (for example a resume prompt) remain TUI-only.
+export function buildAppServerPassthroughArgs(extraCodexArgs: string[]): string[] {
+  const args: string[] = [];
+  for (let i = 0; i < extraCodexArgs.length; i += 1) {
+    const arg = extraCodexArgs[i]!;
+    if (arg === "-c" || arg === "--config" || arg === "--enable" || arg === "--disable") {
+      const value = extraCodexArgs[i + 1];
+      if (value === undefined) throw new Error(`${arg} requires a value`);
+      args.push(arg, value);
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--config=") || arg.startsWith("--enable=") || arg.startsWith("--disable=")) {
+      args.push(arg);
+    }
+  }
+  return args;
+}
+
+export function buildResumeAppServerArgs(opts: {
+  appServerUrl: string;
+  peerName?: string;
+  threadId?: string;
+  extraCodexArgs?: string[];
+}): string[] {
+  return [
+    ...buildFreshThreadModelConfigArgs(opts.threadId),
+    ...buildAppServerPassthroughArgs(opts.extraCodexArgs ?? []),
+    // Launcher invariants stay last so a caller cannot accidentally disable
+    // the wakeable peer registration channel.
+    ...buildResumeMcpConfigArgs(opts.peerName),
+    "app-server",
+    "--listen",
+    opts.appServerUrl,
+  ];
+}
+
 export function buildMcpEnvConfigArgs(opts: {
   appServerUrl: string;
   appServerPid: number;
@@ -254,11 +294,12 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
     const appServerUrl = `ws://127.0.0.1:${port}`;
     const appServer = spawnLoggedAppServer([
       "codex",
-      ...buildFreshThreadModelConfigArgs(opts.threadId),
-      ...buildResumeMcpConfigArgs(opts.peerName),
-      "app-server",
-      "--listen",
-      appServerUrl,
+      ...buildResumeAppServerArgs({
+        appServerUrl,
+        peerName: opts.peerName,
+        threadId: opts.threadId,
+        extraCodexArgs: opts.extraCodexArgs,
+      }),
     ], {
       // Pin the app-server to the peer's repo. `bin/codex-peer`'s run_bun cd's
       // into the agent-peers-mcp install dir before launching us, so without an
