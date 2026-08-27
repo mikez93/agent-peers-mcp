@@ -4,7 +4,12 @@
 import { createServer } from "node:net";
 import { existsSync, statSync } from "node:fs";
 
-import { CodexAppServerWsClient, type AppServerThread } from "./app-server-client.ts";
+import {
+  CodexAppServerWsClient,
+  type AppServerApprovalPolicy,
+  type AppServerSandboxMode,
+  type AppServerThread,
+} from "./app-server-client.ts";
 import { BoundedLog, createWakeableAppServerLog } from "./bounded-log.ts";
 import { WakeLaunchClaimStore } from "./wake-launch-claims.ts";
 import { getTty } from "./peer-context.ts";
@@ -128,6 +133,95 @@ export function buildAppServerPassthroughArgs(extraCodexArgs: string[]): string[
   return args;
 }
 
+export interface FreshThreadPermissions {
+  approvalPolicy: AppServerApprovalPolicy;
+  sandbox: AppServerSandboxMode;
+}
+
+// `thread/start` does not inherit the CLI's user-level permission defaults.
+// Set Mike's full-access contract explicitly at the protocol boundary, while
+// preserving intentional per-launch narrowing from native Codex flags/config.
+export function resolveFreshThreadPermissions(extraCodexArgs: string[]): FreshThreadPermissions {
+  const resolved: FreshThreadPermissions = {
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
+  };
+
+  const setApproval = (raw: string): void => {
+    const value = parseConfigString(raw);
+    if (value !== "untrusted" && value !== "on-request" && value !== "never") {
+      throw new Error(`unsupported Codex approval policy: ${value}`);
+    }
+    resolved.approvalPolicy = value;
+  };
+  const setSandbox = (raw: string): void => {
+    const value = parseConfigString(raw);
+    if (value !== "read-only" && value !== "workspace-write" && value !== "danger-full-access") {
+      throw new Error(`unsupported Codex sandbox mode: ${value}`);
+    }
+    resolved.sandbox = value;
+  };
+  const applyConfig = (entry: string): void => {
+    const equals = entry.indexOf("=");
+    if (equals < 1) return;
+    const key = entry.slice(0, equals).trim();
+    const value = entry.slice(equals + 1).trim();
+    if (key === "approval_policy") setApproval(value);
+    if (key === "sandbox_mode") setSandbox(value);
+  };
+
+  for (let i = 0; i < extraCodexArgs.length; i += 1) {
+    const arg = extraCodexArgs[i]!;
+    if (arg === "--dangerously-bypass-approvals-and-sandbox") {
+      resolved.approvalPolicy = "never";
+      resolved.sandbox = "danger-full-access";
+      continue;
+    }
+    if (arg === "--full-auto") {
+      resolved.approvalPolicy = "on-request";
+      resolved.sandbox = "workspace-write";
+      continue;
+    }
+    if (arg === "-a" || arg === "--ask-for-approval") {
+      setApproval(requireValue(extraCodexArgs, ++i, arg));
+      continue;
+    }
+    if (arg.startsWith("--ask-for-approval=")) {
+      setApproval(arg.slice("--ask-for-approval=".length));
+      continue;
+    }
+    if (arg === "-s" || arg === "--sandbox") {
+      setSandbox(requireValue(extraCodexArgs, ++i, arg));
+      continue;
+    }
+    if (arg.startsWith("--sandbox=")) {
+      setSandbox(arg.slice("--sandbox=".length));
+      continue;
+    }
+    if (arg === "-c" || arg === "--config") {
+      applyConfig(requireValue(extraCodexArgs, ++i, arg));
+      continue;
+    }
+    if (arg.startsWith("--config=")) {
+      applyConfig(arg.slice("--config=".length));
+    }
+  }
+
+  return resolved;
+}
+
+export function buildFreshThreadPermissionConfigArgs(
+  threadId?: string,
+  extraCodexArgs: string[] = [],
+): string[] {
+  if (threadId) return [];
+  const permissions = resolveFreshThreadPermissions(extraCodexArgs);
+  return [
+    "-c", `approval_policy=${tomlString(permissions.approvalPolicy)}`,
+    "-c", `sandbox_mode=${tomlString(permissions.sandbox)}`,
+  ];
+}
+
 export function buildResumeAppServerArgs(opts: {
   appServerUrl: string;
   peerName?: string;
@@ -136,6 +230,7 @@ export function buildResumeAppServerArgs(opts: {
 }): string[] {
   return [
     ...buildFreshThreadModelConfigArgs(opts.threadId),
+    ...buildFreshThreadPermissionConfigArgs(opts.threadId, opts.extraCodexArgs),
     ...buildAppServerPassthroughArgs(opts.extraCodexArgs ?? []),
     // Launcher invariants stay last so a caller cannot accidentally disable
     // the wakeable peer registration channel.
@@ -382,6 +477,7 @@ async function materializeThread(
   const matUrl = `ws://127.0.0.1:${matPort}`;
   const matServer = spawnLoggedAppServer([
     "codex",
+    ...buildFreshThreadPermissionConfigArgs(undefined, opts.extraCodexArgs),
     ...buildMaterializeMcpConfigArgs(opts.peerName),
     "app-server",
     "--listen",
@@ -394,10 +490,13 @@ async function materializeThread(
     await waitForReadyz(matPort, appServerLog.path);
     const client = new CodexAppServerWsClient(matUrl);
     try {
+      const permissions = resolveFreshThreadPermissions(opts.extraCodexArgs);
       const thread = await client.startThread({
         cwd: opts.cwd,
         model: "gpt-5.6-sol",
         modelReasoningEffort: "high",
+        approvalPolicy: permissions.approvalPolicy,
+        sandbox: permissions.sandbox,
       });
       if (opts.materialize) {
         // Naming the thread persists its rollout with no model turn. See
@@ -557,6 +656,20 @@ async function pumpProcessOutput(stream: ReadableStream<Uint8Array>, log: Bounde
 
 function tomlString(value: string): string {
   return JSON.stringify(value);
+}
+
+function parseConfigString(raw: string): string {
+  const value = raw.trim();
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(value);
+      if (typeof parsed === "string") return parsed;
+    } catch { /* validation below will fail loudly */ }
+  }
+  if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1);
+  }
+  return value;
 }
 
 export function isEmptyRolloutRaceError(error: unknown): boolean {

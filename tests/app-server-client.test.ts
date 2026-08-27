@@ -82,6 +82,8 @@ test("startThread sends the wakeable peer's Sol high defaults", async () => {
                 path: "/rollout.jsonl",
                 status: { type: "idle" },
               },
+              approvalPolicy: "never",
+              sandbox: { type: "dangerFullAccess" },
             }
           : {};
         ws.send(JSON.stringify({ id: request.id, result }));
@@ -95,6 +97,8 @@ test("startThread sends the wakeable peer's Sol high defaults", async () => {
     cwd: "/repo",
     model: "gpt-5.6-sol",
     modelReasoningEffort: "high",
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
   });
 
   expect(seen.find((request) => request.method === "thread/start")?.params)
@@ -102,6 +106,8 @@ test("startThread sends the wakeable peer's Sol high defaults", async () => {
       cwd: "/repo",
       model: "gpt-5.6-sol",
       config: { model_reasoning_effort: "high" },
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
     });
   client.close();
 });

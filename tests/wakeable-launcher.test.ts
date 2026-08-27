@@ -4,6 +4,7 @@ import {
   buildAppServerPassthroughArgs,
   buildCodexResumeArgs,
   buildFreshThreadModelConfigArgs,
+  buildFreshThreadPermissionConfigArgs,
   buildMaterializeMcpConfigArgs,
   buildMcpEnvConfigArgs,
   buildMcpPeerNameConfigArgs,
@@ -13,6 +14,7 @@ import {
   isEmptyRolloutRaceError,
   materializeThreadName,
   parseWakeableLauncherArgs,
+  resolveFreshThreadPermissions,
   waitForRolloutOnDisk,
 } from "../shared/wakeable-launcher.ts";
 
@@ -120,6 +122,8 @@ test("the owning app-server receives caller config and feature overrides", () =>
   })).toEqual([
     "-c", 'model="gpt-5.6-sol"',
     "-c", 'model_reasoning_effort="high"',
+    "-c", 'approval_policy="never"',
+    "-c", 'sandbox_mode="danger-full-access"',
     "-c", "features.apps=false",
     "-c", "mcp_servers.digitalocean.enabled=true",
     "-c", 'mcp_servers.agent-peers.env.PEER_NAME="brisk-bison"',
@@ -127,6 +131,32 @@ test("the owning app-server receives caller config and feature overrides", () =>
     "-c", "mcp_servers.agent-peers.required=true",
     "app-server", "--listen", "ws://127.0.0.1:41037",
   ]);
+});
+
+test("fresh wakeable threads default to full access and preserve deliberate narrowing", () => {
+  expect(resolveFreshThreadPermissions([])).toEqual({
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
+  });
+  expect(resolveFreshThreadPermissions([
+    "--sandbox", "workspace-write",
+    "--ask-for-approval=on-request",
+  ])).toEqual({
+    approvalPolicy: "on-request",
+    sandbox: "workspace-write",
+  });
+  expect(resolveFreshThreadPermissions([
+    "-c", 'approval_policy="untrusted"',
+    "--config=sandbox_mode='read-only'",
+  ])).toEqual({
+    approvalPolicy: "untrusted",
+    sandbox: "read-only",
+  });
+  expect(buildFreshThreadPermissionConfigArgs()).toEqual([
+    "-c", 'approval_policy="never"',
+    "-c", 'sandbox_mode="danger-full-access"',
+  ]);
+  expect(buildFreshThreadPermissionConfigArgs("thread-existing")).toEqual([]);
 });
 
 test("buildMcpEnvConfigArgs omits optional values when absent", () => {

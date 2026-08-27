@@ -14,6 +14,9 @@ export interface AppServerThread {
   status: ThreadStatus;
 }
 
+export type AppServerApprovalPolicy = "untrusted" | "on-request" | "never";
+export type AppServerSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+
 // Render a ThreadStatus as a single stable token for operator output
 // (`codexpeer live`). `active` carries its flags so a parked
 // waitingOnApproval/waitingOnUserInput thread is distinguishable from a
@@ -111,6 +114,8 @@ export class CodexAppServerWsClient implements AppServerClient {
     cwd: string;
     model?: string;
     modelReasoningEffort?: string;
+    approvalPolicy?: AppServerApprovalPolicy;
+    sandbox?: AppServerSandboxMode;
   }): Promise<AppServerThread> {
     await this.connect();
     const result = await this.request("thread/start", {
@@ -119,10 +124,34 @@ export class CodexAppServerWsClient implements AppServerClient {
       ...(params.modelReasoningEffort
         ? { config: { model_reasoning_effort: params.modelReasoningEffort } }
         : {}),
+      ...(params.approvalPolicy ? { approvalPolicy: params.approvalPolicy } : {}),
+      ...(params.sandbox ? { sandbox: params.sandbox } : {}),
     });
-    const thread = (result as { thread?: AppServerThread }).thread;
+    const response = result as {
+      thread?: AppServerThread;
+      approvalPolicy?: AppServerApprovalPolicy;
+      sandbox?: { type?: string };
+    };
+    const thread = response.thread;
     if (!thread || typeof thread.id !== "string") {
       throw new Error("thread/start returned invalid thread");
+    }
+    if (params.approvalPolicy && response.approvalPolicy !== params.approvalPolicy) {
+      throw new Error(
+        `thread/start approval mismatch: requested ${params.approvalPolicy}, got ${response.approvalPolicy ?? "missing"}`,
+      );
+    }
+    if (params.sandbox) {
+      const expectedType: Record<AppServerSandboxMode, string> = {
+        "read-only": "readOnly",
+        "workspace-write": "workspaceWrite",
+        "danger-full-access": "dangerFullAccess",
+      };
+      if (response.sandbox?.type !== expectedType[params.sandbox]) {
+        throw new Error(
+          `thread/start sandbox mismatch: requested ${params.sandbox}, got ${response.sandbox?.type ?? "missing"}`,
+        );
+      }
     }
     return thread;
   }
