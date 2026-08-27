@@ -38,6 +38,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
+import { paperclipAgentMarker, paperclipRefusalMessage } from "./shared/paperclip-guard.ts";
 import type { PeerId, PeerType } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
@@ -338,6 +339,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
 });
 
 async function main() {
+  // Paperclip containment gate — see shared/paperclip-guard.ts for the full
+  // rationale. Checked BEFORE the AGENT_PEERS_ENABLED gate on purpose: setting
+  // the enable flag in a Paperclip adapter config must not be able to opt a
+  // Paperclip agent back onto the peer network.
+  const paperclipMarker = paperclipAgentMarker();
+  if (paperclipMarker) {
+    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+    await mcp.connect(new StdioServerTransport());
+    log(paperclipRefusalMessage(paperclipMarker));
+    return;
+  }
+
   // Activation gate — the MCP is globally registered in ~/.claude.json so every
   // `claude` session spawns this process. If AGENT_PEERS_ENABLED is not "1",
   // we run as a no-op MCP: connect, expose zero tools, don't touch the broker,

@@ -79,6 +79,7 @@ import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts"
 import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
 import type { PeerId, LeasedMessage, PeerType } from "./shared/types.ts";
+import { paperclipAgentMarker, paperclipRefusalMessage } from "./shared/paperclip-guard.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -803,6 +804,19 @@ async function main() {
     }
   }, 1_000);
   lifecycleCleanup = () => clearInterval(parentWatch);
+
+  // Paperclip containment gate — see shared/paperclip-guard.ts for the full
+  // rationale. Checked BEFORE the AGENT_PEERS_ENABLED gate on purpose: setting
+  // the enable flag in a Paperclip adapter config must not be able to opt a
+  // Paperclip agent back onto the peer network. hermes-server.ts delegates to
+  // this file, so Hermes surfaces inherit the same guard.
+  const paperclipMarker = paperclipAgentMarker();
+  if (paperclipMarker) {
+    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+    await mcp.connect(new StdioServerTransport());
+    log(paperclipRefusalMessage(paperclipMarker));
+    return;
+  }
 
   // Activation gate — matches claude-server. If AGENT_PEERS_ENABLED is not "1",
   // run as a no-op MCP (no broker connection, no tab title). Codex sessions
