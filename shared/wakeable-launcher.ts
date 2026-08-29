@@ -488,7 +488,8 @@ async function materializeThread(
   }, appServerLog, "materialize");
   try {
     await waitForReadyz(matPort, appServerLog.path);
-    const client = new CodexAppServerWsClient(matUrl);
+    // experimentalApi is what makes `historyMode` accepted on thread/start.
+    const client = new CodexAppServerWsClient(matUrl, { experimentalApi: true });
     try {
       const permissions = resolveFreshThreadPermissions(opts.extraCodexArgs);
       const thread = await client.startThread({
@@ -497,6 +498,12 @@ async function materializeThread(
         modelReasoningEffort: "high",
         approvalPolicy: permissions.approvalPolicy,
         sandbox: permissions.sandbox,
+        // codex-cli 0.151.0 made "paginated" the default history mode: history
+        // lives in SQLite and the rollout JSONL is never written, so
+        // thread/name/set still succeeds while waitForRolloutOnDisk times out.
+        // thread/resume still refuses a thread with no rollout on disk ("no
+        // rollout found for thread id"), so the launcher pins legacy history.
+        historyMode: "legacy",
       });
       if (opts.materialize) {
         // Naming the thread persists its rollout with no model turn. See

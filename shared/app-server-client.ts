@@ -15,6 +15,10 @@ export interface AppServerThread {
 }
 
 export type AppServerApprovalPolicy = "untrusted" | "on-request" | "never";
+// Where codex-cli keeps a thread's history. "legacy" writes the rollout JSONL
+// this launcher (and `codex resume`) depends on; "paginated" — the default from
+// codex-cli 0.151.0 — keeps history in SQLite and never creates that file.
+export type AppServerHistoryMode = "legacy" | "paginated";
 export type AppServerSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 
 // Render a ThreadStatus as a single stable token for operator output
@@ -67,8 +71,14 @@ export class CodexAppServerWsClient implements AppServerClient {
   private pending = new Map<number, PendingRequest>();
   private readonly timeoutMs: number;
 
-  constructor(private readonly url: string, opts: { timeoutMs?: number } = {}) {
+  private readonly experimentalApi: boolean;
+
+  constructor(
+    private readonly url: string,
+    opts: { timeoutMs?: number; experimentalApi?: boolean } = {},
+  ) {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.experimentalApi = opts.experimentalApi ?? false;
   }
 
   async connect(): Promise<void> {
@@ -97,9 +107,13 @@ export class CodexAppServerWsClient implements AppServerClient {
       this.pending.clear();
     });
 
+    // `experimentalApi` unlocks thread/start params that codex-cli gates behind
+    // an explicit client opt-in — currently `historyMode`, which the launcher
+    // needs to keep materializing an on-disk rollout. Declared only by callers
+    // that use such a param; the wake daemon stays on the stable surface.
     await this.request("initialize", {
       clientInfo: { name: "agent-peers-wake-daemon", version: "0.1.0" },
-      capabilities: {},
+      capabilities: this.experimentalApi ? { experimentalApi: true } : {},
     });
   }
 
@@ -116,6 +130,7 @@ export class CodexAppServerWsClient implements AppServerClient {
     modelReasoningEffort?: string;
     approvalPolicy?: AppServerApprovalPolicy;
     sandbox?: AppServerSandboxMode;
+    historyMode?: AppServerHistoryMode;
   }): Promise<AppServerThread> {
     await this.connect();
     const result = await this.request("thread/start", {
@@ -126,6 +141,7 @@ export class CodexAppServerWsClient implements AppServerClient {
         : {}),
       ...(params.approvalPolicy ? { approvalPolicy: params.approvalPolicy } : {}),
       ...(params.sandbox ? { sandbox: params.sandbox } : {}),
+      ...(params.historyMode ? { historyMode: params.historyMode } : {}),
     });
     const response = result as {
       thread?: AppServerThread;
@@ -171,6 +187,10 @@ export class CodexAppServerWsClient implements AppServerClient {
   // model turn. `thread/start` alone only reserves the rollout path, and
   // `codex resume --remote <threadId>` fails with "no rollout found for thread
   // id" until the file actually exists.
+  //
+  // This only holds for a thread started with `historyMode: "legacy"`. Under the
+  // `paginated` default of codex-cli 0.151.0 the thread keeps its history in
+  // SQLite, and this call returns success while no rollout is ever written.
   //
   // This replaces the old materialize-turn + `thread/rollback` dance. That dance
   // burned a real model turn (measured 5.3s-29.4s per launch) purely to force

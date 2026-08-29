@@ -112,6 +112,79 @@ test("startThread sends the wakeable peer's Sol high defaults", async () => {
   client.close();
 });
 
+test("the materialize client pins legacy history so a rollout still lands on disk", async () => {
+  // Intent: codex-cli 0.151.0 flipped the default history mode to "paginated",
+  // which keeps thread history in SQLite and never writes the rollout JSONL.
+  // thread/name/set then returns success while the file the launcher (and
+  // thread/resume) requires never appears — the "thread rollout was never
+  // written to ... within 10000ms" launch failure. This test fails if the
+  // experimentalApi opt-in or the explicit legacy history mode is dropped.
+  const seen: Array<{ method?: string; params?: unknown }> = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch(req, srv) {
+      if (srv.upgrade(req)) return undefined;
+      return new Response("not a websocket", { status: 400 });
+    },
+    websocket: {
+      message(ws, raw) {
+        const request = JSON.parse(String(raw)) as { id: number; method?: string; params?: unknown };
+        seen.push(request);
+        const result = request.method === "thread/start"
+          ? {
+              thread: {
+                id: "thread-1",
+                cwd: "/repo",
+                path: "/rollout.jsonl",
+                status: { type: "idle" },
+              },
+            }
+          : {};
+        ws.send(JSON.stringify({ id: request.id, result }));
+      },
+    },
+  });
+  stoppers.push(() => server.stop(true));
+
+  const client = new CodexAppServerWsClient(`ws://127.0.0.1:${server.port}`, { experimentalApi: true });
+  await client.startThread({ cwd: "/repo", historyMode: "legacy" });
+
+  expect((seen.find((request) => request.method === "initialize")?.params as { capabilities?: unknown })?.capabilities)
+    .toEqual({ experimentalApi: true });
+  expect(seen.find((request) => request.method === "thread/start")?.params)
+    .toEqual({ cwd: "/repo", historyMode: "legacy" });
+  client.close();
+});
+
+test("the stable client keeps codex-cli experimental params locked", async () => {
+  // The wake daemon has no reason to opt into experimental thread/start params;
+  // declaring the capability everywhere widens the surface codex-cli may change
+  // under us. initialize must stay on the stable contract by default.
+  const seen: Array<{ method?: string; params?: unknown }> = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch(req, srv) {
+      if (srv.upgrade(req)) return undefined;
+      return new Response("not a websocket", { status: 400 });
+    },
+    websocket: {
+      message(ws, raw) {
+        const request = JSON.parse(String(raw)) as { id: number; method?: string; params?: unknown };
+        seen.push(request);
+        ws.send(JSON.stringify({ id: request.id, result: { data: [] } }));
+      },
+    },
+  });
+  stoppers.push(() => server.stop(true));
+
+  const client = new CodexAppServerWsClient(`ws://127.0.0.1:${server.port}`);
+  await client.listLoadedThreads();
+
+  expect((seen.find((request) => request.method === "initialize")?.params as { capabilities?: unknown })?.capabilities)
+    .toEqual({});
+  client.close();
+});
+
 test("setThreadName materializes via thread/name/set and never runs a turn", async () => {
   // Intent: materialization must persist the rollout WITHOUT a model turn.
   // This test fails if anyone reintroduces the old materialize-turn approach

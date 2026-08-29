@@ -91,6 +91,13 @@ Codex. The wake only causes a turn; it never *is* the message.
   turn. Before 2026-08-06 every launch ran (and then deleted) a real model turn just
   to force the rollout file into existence — measured at 5.3s–29.4s of latency plus
   its tokens, on every single launch.
+  `thread/name/set` only writes that file for a thread whose history mode is
+  `legacy`. codex-cli 0.151.0 made `paginated` the default (history in SQLite, no
+  rollout JSONL), which turned materialization into a silent no-op and broke every
+  launch with `thread rollout was never written to ... within 10000ms`. The
+  materialize client therefore declares the `experimentalApi` capability and passes
+  `historyMode: "legacy"` on `thread/start`; `thread/resume` still refuses a thread
+  with no rollout on disk, so legacy history is a hard requirement, not a preference.
 - **Idle with no mail = zero model tokens.** The idle TUI runs no inference. The
   wake daemon's poll is local-only (read metadata files + local WebSocket JSON-RPC
   to the app-server) and never calls the model. A model turn (`turn/start`) fires
