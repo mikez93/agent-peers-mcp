@@ -146,7 +146,7 @@ export function initDb(path: string): Database {
       summary       TEXT DEFAULT '',
       session_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
-      started_at    TEXT NOT NULL,
+      started_at    TEXT,
       last_seen     TEXT NOT NULL,
       durable       INTEGER NOT NULL DEFAULT 0
     );
@@ -346,7 +346,11 @@ function migrate_peers_add_started_at(db: Database): void {
     db.exec(`UPDATE peers
              SET started_at = registered_at
              WHERE started_at IS NULL OR trim(started_at) = ''`);
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_started_at ON peers(started_at)`);
+    // A prior release created a plain-column index, but discovery orders by
+    // COALESCE(started_at, registered_at), so SQLite could not use it. Peer
+    // tables are tiny; remove the misleading dead index instead of carrying
+    // schema complexity with no operational benefit.
+    db.exec(`DROP INDEX IF EXISTS idx_peers_started_at`);
     db.exec("COMMIT");
   } catch (e) {
     try { db.exec("ROLLBACK"); } catch { /* best effort */ }

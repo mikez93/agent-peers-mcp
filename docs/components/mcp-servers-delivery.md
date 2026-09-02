@@ -222,11 +222,13 @@ peer messages. Each server then appends its own delivery prologue (`codex-server
 `claude-server.ts:92-125`). Both prologues carry the same load-bearing rule: **call `check_messages`
 first thing every user turn.**
 
-Both servers also use `shared/peer-list.ts` for discovery rendering. `Started` means working-session
-age and controls newest-first order; `Heartbeat` means only that the peer is live. The response and
-shared protocol tell the model to choose the newest plausible match for latest/current requests,
-while preserving exact user targets and treating empty summaries or unfamiliar harnesses as valid
-candidates.
+Both servers also use `shared/peer-list.ts` for discovery rendering. `Started` means when the
+current MCP-backed working session began and controls display order; `Heartbeat` means only that
+the peer is live. The response and shared protocol require a deliberate selection check before
+messaging: identify the collaboration need, compare every plausible candidate's repo/CWD and
+Current status, and choose the strongest task match rather than the first row. Exact user targets
+and explicit latest/current requests take precedence; `Started` otherwise breaks ties between
+similarly relevant candidates. Missing statuses and unfamiliar harnesses remain valid candidates.
 
 ### 3.2 Environment configuration
 

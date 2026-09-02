@@ -73,6 +73,13 @@ test("initDb creates tables and indices with WAL", () => {
   expect(tables).toContain("peers");
   expect(tables).toContain("messages");
 
+  const startedAtColumn = db.query<{ is_not_null: number }, []>(
+    "SELECT \"notnull\" AS is_not_null FROM pragma_table_info('peers') WHERE name = 'started_at'"
+  ).get();
+  // Fresh and upgraded databases must share this nullable shape so rolling
+  // back to an older broker does not make its INSERTs fail.
+  expect(startedAtColumn?.is_not_null).toBe(0);
+
   const pragma = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
   expect(pragma?.journal_mode.toLowerCase()).toBe("wal");
 });
@@ -87,6 +94,22 @@ test("registerPeer creates peer with UUID + name + session_token", () => {
   const peer = getPeer(db, id);
   expect(peer?.name).toBe(name);
   expect(peer?.started_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+});
+
+test("fresh schema accepts a prior broker insert that omits started_at", () => {
+  const ts = new Date().toISOString();
+  db.query(
+    `INSERT INTO peers
+       (id, name, peer_type, pid, cwd, git_root, tty, summary,
+        session_token, registered_at, last_seen, durable, host)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "old-broker-id", "old-broker-peer", "codex", process.pid, "/old",
+    null, null, "", "old-broker-token", ts, ts, 0, null,
+  );
+
+  // New readers still expose a useful fallback start for that old row.
+  expect(getPeer(db, "old-broker-id")?.started_at).toBe(ts);
 });
 
 test("registerPeer honors explicit name if unique", () => {
@@ -361,13 +384,15 @@ test("listPeers peer_type filter", () => {
 });
 
 test("listPeers orders by working-session start, not synchronized heartbeat", () => {
-  const older = reg({ name: "older-session", started_at: "2026-01-01T00:00:00.000Z" });
-  const newer = reg({ name: "newer-session", started_at: "2026-02-01T00:00:00.000Z" });
+  // Deliberately invert session age against both registration order and name
+  // order. Removing the started_at ORDER BY must make this test fail.
+  const newer = reg({ name: "z-newer-session", started_at: "2026-02-01T00:00:00.000Z" });
+  const older = reg({ name: "a-older-session", started_at: "2026-01-01T00:00:00.000Z" });
   const heartbeat = new Date().toISOString();
   db.query("UPDATE peers SET last_seen = ? WHERE id IN (?, ?)").run(heartbeat, older.id, newer.id);
 
   const peers = listPeers(db, { scope: "machine", cwd: "/any", git_root: null });
-  expect(peers.map((p) => p.name)).toEqual(["newer-session", "older-session"]);
+  expect(peers.map((p) => p.name)).toEqual(["z-newer-session", "a-older-session"]);
 });
 
 // ---------- sendMessage ----------

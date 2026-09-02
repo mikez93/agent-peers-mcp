@@ -165,6 +165,7 @@ test("migrated DB has session_token as NOT NULL, matching fresh install invarian
     ).all().map((r) => r.name);
     expect(indices).toContain("idx_peers_last_seen");
     expect(indices).toContain("idx_peers_name");
+    expect(indices).not.toContain("idx_peers_started_at");
   } finally {
     db.close();
   }
@@ -191,6 +192,7 @@ test("initDb self-heals NULL session_token rows from a crashed partial migration
       started_at    TEXT,
       last_seen     TEXT NOT NULL
     );
+    CREATE INDEX idx_peers_started_at ON peers(started_at);
   `);
   setup.exec(`
     CREATE TABLE messages (
@@ -222,6 +224,9 @@ test("initDb self-heals NULL session_token rows from a crashed partial migration
     expect(db.query<{ started_at: string }, []>(
       "SELECT started_at FROM peers WHERE id = 'half-migrated-1'"
     ).get()?.started_at).toBe("2025-01-01T00:00:00.000Z");
+    expect(db.query<{ name: string }, []>(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_peers_started_at'"
+    ).get()).toBeNull();
   } finally {
     db.close();
   }

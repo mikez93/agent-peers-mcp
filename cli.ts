@@ -126,7 +126,7 @@ async function cmdPeers() {
     console.log(`${p.name}  (${p.peer_type})  id=${p.id}`);
     console.log(`  started_at=${peerStartedAt(p)}`);
     console.log(`  cwd=${p.cwd}${p.tty ? `  tty=${p.tty}` : ""}`);
-    if (p.summary) console.log(`  summary: ${p.summary}`);
+    console.log(`  current_status=${p.summary || "(not set)"}`);
     console.log(`  heartbeat=${p.last_seen}`);
   }
 }

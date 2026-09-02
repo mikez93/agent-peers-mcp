@@ -38,7 +38,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
-import { formatPeerList } from "./shared/peer-list.ts";
+import { formatPeerList, PEER_LIST_TOOL_DESCRIPTION } from "./shared/peer-list.ts";
+import { workingSessionStartedAt } from "./shared/session-start.ts";
 import { paperclipAgentMarker, paperclipRefusalMessage } from "./shared/paperclip-guard.ts";
 import type { PeerId, PeerType } from "./shared/types.ts";
 
@@ -46,7 +47,7 @@ const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.AGENT_PEERS_HEARTBEAT_MS ?? "15000", 10);
-const WORKING_SESSION_STARTED_AT = new Date().toISOString();
+const WORKING_SESSION_STARTED_AT = workingSessionStartedAt("claude");
 
 function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the protocol).
@@ -132,8 +133,7 @@ same thing.`,
 const TOOLS = [
   {
     name: "list_peers",
-    description:
-      "List live AI agent peers ordered by working-session start, newest first. Returns Started, heartbeat, id, name, peer_type, cwd, and summary. For latest/current requests, prefer the newest plausible match unless the user gives an exact target or another rule; empty summary and harness type are not disqualifiers.",
+    description: PEER_LIST_TOOL_DESCRIPTION,
     inputSchema: {
       type: "object" as const,
       properties: {

@@ -1,8 +1,8 @@
 # Broker Daemon
 
-Truth-from-code documentation of the `agent-peers-mcp` broker, as of repo HEAD `63503f2`.
+Truth-from-code documentation of the current `agent-peers-mcp` broker checkout.
 
-Primary source: `/Users/mike/agent-peers-mcp/broker.ts` (1552 lines).
+Primary source: `/Users/mike/agent-peers-mcp/broker.ts`.
 Supporting: `shared/ensure-broker.ts`, `shared/shared-secret.ts`, `shared/types.ts`, `shared/broker-client.ts`, `shared/names.ts`.
 
 ---
@@ -59,7 +59,9 @@ Two tables, both created by `initDb` (`broker.ts:94-181`).
 `pid`, `cwd`, `git_root`, `tty`, `summary`, `session_token` (NOT NULL), `registered_at`,
 `started_at`, `last_seen`, `durable` (INTEGER default 0), `host` (added by migration,
 nullable). `started_at` is working-session age; `last_seen` is only the liveness heartbeat.
-Indices on `last_seen`, `started_at`, and `name`.
+Indices on `last_seen` and `name`. Discovery intentionally has no recency index:
+the peer table is tiny and its compatibility ordering uses
+`COALESCE(started_at, registered_at)`.
 
 **`messages`** — `id` (INTEGER AUTOINCREMENT PK), `from_id`, `to_id`, `text`, `sent_at`,
 `acked` (default 0), `lease_token`, `lease_expires_at`, `message_uid` (UUID, unique index).
@@ -84,8 +86,9 @@ concurrent broker startups serialize:
 5. `migrate_peers_add_host` (291) — adds `host TEXT`, filled with `os.hostname()` on new
    registrations. Schema-only; no routing code reads it yet.
 6. `migrate_peers_add_started_at` — adds `started_at`, backfills old rows from
-   `registered_at`, and creates the recency index. It runs after every migration that may
-   rebuild `peers`, so an upgrade cannot silently discard the value.
+   `registered_at`, and removes the unusable plain-column recency index from the prior
+   release. It runs after every migration that may rebuild `peers`, so an upgrade cannot
+   silently discard the value.
 
 Both rebuild-capable migrations (1 and 2) share `rebuildPeersTableWithNotNullSessionToken`
 (257), a shadow-table copy whose column list is written out literally and **omits `durable` and
@@ -220,7 +223,7 @@ into the registry requires the secret.
 ### `POST /register`
 
 Request `RegisterRequest` (`types.ts:36-55`): `peer_type`, optional `name`, `pid`, `cwd`,
-`git_root`, `tty`, `summary`, optional `durable`, optional `prev_id`.
+`git_root`, `tty`, `summary`, optional `started_at`, optional `durable`, optional `prev_id`.
 Response: `RegisterResponse` (`id`, `name`, `session_token`) plus `epoch`.
 
 Semantics (`registerPeer` / `registerPeerInner`, `broker.ts:391-472`), all in one transaction:
