@@ -15,6 +15,10 @@ export interface Peer {
   tty: string | null;
   summary: string;
   registered_at: string; // ISO timestamp
+  /** Start of the real working-session lineage. Optional while old brokers
+   * and clients coexist during a rolling upgrade; readers fall back to
+   * registered_at. */
+  started_at?: string; // canonical UTC ISO timestamp
   last_seen: string; // ISO timestamp
 }
 
@@ -41,6 +45,10 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  /** Stable start of this client's real working session. Claude/Codex send
+   * one value for the process lifetime. Hermes omits it because its MCP
+   * surface can be a temporary child of a longer-lived durable identity. */
+  started_at?: string;
   /** Durable retention is now EXPLICIT (2026-08-10): merely requesting a name
    *  no longer reserves it for 7 days (throwaway `hermes mcp test` spawns and
    *  crashed cli-operator peers were squatting names). Servers send true only

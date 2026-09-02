@@ -200,7 +200,7 @@ generated name (`:897-901`); it simply never owns the address peers use.
 
 | Tool | Codex | Hermes | Claude | Notes |
 | --- | :---: | :---: | :---: | --- |
-| `list_peers(scope, peer_type?)` | ✅ | ✅ | ✅ | `scope` ∈ `machine \| directory \| repo`, required |
+| `list_peers(scope, peer_type?)` | ✅ | ✅ | ✅ | `scope` ∈ `machine \| directory \| repo`, required; returns live peers by `Started`, newest first |
 | `send_message(to_id, message)` | ✅ | ✅ | ✅ | `to_id` accepts UUID or name |
 | `set_summary(summary)` | ✅ | ✅ | ✅ | |
 | `check_messages()` | ✅ | ✅ | ✅ | Different semantics per side — see below |
@@ -221,6 +221,12 @@ imported verbatim by both servers specifically so the two ends cannot drift in h
 peer messages. Each server then appends its own delivery prologue (`codex-server.ts:138-188`,
 `claude-server.ts:92-125`). Both prologues carry the same load-bearing rule: **call `check_messages`
 first thing every user turn.**
+
+Both servers also use `shared/peer-list.ts` for discovery rendering. `Started` means working-session
+age and controls newest-first order; `Heartbeat` means only that the peer is live. The response and
+shared protocol tell the model to choose the newest plausible match for latest/current requests,
+while preserving exact user targets and treating empty summaries or unfamiliar harnesses as valid
+candidates.
 
 ### 3.2 Environment configuration
 

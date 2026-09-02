@@ -9,6 +9,7 @@ import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts"
 import { WakeLaunchClaimStore } from "./shared/wake-launch-claims.ts";
 import { CodexAppServerWsClient, formatThreadStatus } from "./shared/app-server-client.ts";
 import type { Peer } from "./shared/types.ts";
+import { peerStartedAt, sortPeersNewestFirst } from "./shared/peer-list.ts";
 
 // True app-server thread status for a wakeable peer — the GROUND TRUTH the
 // operator can trust over the TUI's "working" spinner, which lingers after
@@ -121,11 +122,12 @@ async function cmdPeers() {
     console.log("(no peers registered)");
     return;
   }
-  for (const p of peers) {
+  for (const p of sortPeersNewestFirst(peers)) {
     console.log(`${p.name}  (${p.peer_type})  id=${p.id}`);
+    console.log(`  started_at=${peerStartedAt(p)}`);
     console.log(`  cwd=${p.cwd}${p.tty ? `  tty=${p.tty}` : ""}`);
     if (p.summary) console.log(`  summary: ${p.summary}`);
-    console.log(`  last_seen=${p.last_seen}`);
+    console.log(`  heartbeat=${p.last_seen}`);
   }
 }
 

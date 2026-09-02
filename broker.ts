@@ -53,6 +53,18 @@ export const SECRET_HEADER = "x-agent-peers-secret";
 
 function nowIso(): string { return new Date().toISOString(); }
 
+/** Normalize client session starts before lexical SQLite ordering. Missing or
+ * invalid values return null so INSERT can use broker time and RECLAIM can
+ * conservatively preserve the existing lineage. Future values are bounded by
+ * broker receipt time so clock error cannot make a peer permanently newest. */
+function canonicalStartedAt(value: string | undefined, brokerNow: string): string | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  const brokerMillis = Date.parse(brokerNow);
+  return new Date(Math.min(parsed, brokerMillis)).toISOString();
+}
+
 function isUniqueViolation(e: unknown): boolean {
   return e instanceof Error && /UNIQUE constraint failed/i.test(e.message);
 }
@@ -134,6 +146,7 @@ export function initDb(path: string): Database {
       summary       TEXT DEFAULT '',
       session_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
+      started_at    TEXT NOT NULL,
       last_seen     TEXT NOT NULL,
       durable       INTEGER NOT NULL DEFAULT 0
     );
@@ -172,6 +185,9 @@ export function initDb(path: string): Database {
   migrate_peers_add_durable(db);
   migrate_messages_add_message_uid(db);
   migrate_peers_add_host(db);
+  // MUST remain after every migration that can rebuild the peers table from
+  // an explicit column list. Existing rows are backfilled from registered_at.
+  migrate_peers_add_started_at(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -270,6 +286,8 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
   // drop the old table, rename. All inside the outer BEGIN IMMEDIATE tx, so
   // readers/writers see either the old table or the renamed new table, never
   // an in-between state.
+  const preserveStartedAt = columnExists(db, "peers", "started_at");
+  const startedAtDefinition = preserveStartedAt ? ",\n      started_at    TEXT" : "";
   db.exec(`
     CREATE TABLE peers_new (
       id            TEXT PRIMARY KEY,
@@ -282,12 +300,13 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
       summary       TEXT DEFAULT '',
       session_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
-      last_seen     TEXT NOT NULL
+      last_seen     TEXT NOT NULL${startedAtDefinition}
     );
   `);
+  const startedAtColumn = preserveStartedAt ? ", started_at" : "";
   db.exec(`
-    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen
+    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen${startedAtColumn})
+    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen${startedAtColumn}
     FROM peers
     WHERE session_token IS NOT NULL;
   `);
@@ -309,6 +328,25 @@ function migrate_peers_add_host(db: Database): void {
     if (!columnExists(db, "peers", "host")) {
       db.exec(`ALTER TABLE peers ADD COLUMN host TEXT`);
     }
+    db.exec("COMMIT");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
+  }
+}
+
+function migrate_peers_add_started_at(db: Database): void {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!columnExists(db, "peers", "started_at")) {
+      // SQLite cannot ADD a NOT NULL column whose default comes from another
+      // column, so add nullable then backfill in the same transaction.
+      db.exec(`ALTER TABLE peers ADD COLUMN started_at TEXT`);
+    }
+    db.exec(`UPDATE peers
+             SET started_at = registered_at
+             WHERE started_at IS NULL OR trim(started_at) = ''`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_started_at ON peers(started_at)`);
     db.exec("COMMIT");
   } catch (e) {
     try { db.exec("ROLLBACK"); } catch { /* best effort */ }
@@ -407,6 +445,7 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
 
 function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse {
   const ts = nowIso();
+  const requestedStartedAt = canonicalStartedAt(req.started_at, ts);
   // Every register (fresh or reclaim) issues a new session_token. Reclaim
   // rotates the token so the previous session's client (if it's still alive
   // elsewhere) can no longer act as this peer — the token is the session
@@ -444,11 +483,17 @@ function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse
     const reclaim = db.query(
       `UPDATE peers
          SET pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
-             session_token = ?, last_seen = ?, durable = ?, host = ?
+             session_token = ?, last_seen = ?, durable = ?, host = ?,
+             started_at = CASE
+               WHEN ? IS NULL THEN COALESCE(started_at, registered_at)
+               ELSE ?
+             END
        WHERE name = ? AND peer_type = ? AND (last_seen < ? OR ? = 1)`
     ).run(
       req.pid, req.cwd, req.git_root, req.tty, req.summary,
-      session_token, ts, durable, host, req.name, req.peer_type, cutoff,
+      session_token, ts, durable, host,
+      requestedStartedAt, requestedStartedAt,
+      req.name, req.peer_type, cutoff,
       deadLocalProcess ? 1 : 0,
     );
     if ((reclaim.changes ?? 0) > 0) {
@@ -472,15 +517,16 @@ function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse
 
   // Fresh INSERT with suffix ladder.
   const id = randomUUID();
+  const startedAt = requestedStartedAt ?? ts;
   const insert = db.query(
-    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen, durable, host)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, started_at, last_seen, durable, host)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   for (const candidate of nameCandidates(req.name)) {
     try {
       insert.run(
         id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
-        session_token, ts, ts,
+        session_token, ts, startedAt, ts,
         // Only the peer's OWN requested name is durable. If the suffix ladder
         // had to rename it (a genuine concurrent duplicate — a second live
         // Ezra), the fallback name is not the identity anyone addresses, so it
@@ -565,7 +611,8 @@ export function setPeerSummary(db: Database, id: string, session_token: string, 
 // back to a client. authPeer() is the only code path that touches
 // session_token, and it does its own narrow query.
 const PEER_COLS =
-  "id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, last_seen";
+  "id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, " +
+  "COALESCE(started_at, registered_at) AS started_at, last_seen";
 
 export function getPeer(db: Database, id: string): Peer | null {
   const row = db.query<Peer, [string]>(`SELECT ${PEER_COLS} FROM peers WHERE id = ?`).get(id);
@@ -627,8 +674,12 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
   // `session_token` out of every client-facing payload.
   const where = `WHERE ${clauses.join(" AND ")}`;
   const sql = `SELECT id, name, peer_type, pid, cwd, git_root, tty, summary,
-                      registered_at, last_seen
-               FROM peers ${where} ORDER BY last_seen DESC`;
+                      registered_at,
+                      COALESCE(started_at, registered_at) AS started_at,
+                      last_seen
+               FROM peers ${where}
+               ORDER BY COALESCE(started_at, registered_at) DESC,
+                        registered_at DESC, name ASC, id ASC`;
   return db.query<Peer, typeof params>(sql).all(...params);
 }
 

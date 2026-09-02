@@ -38,6 +38,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
+import { formatPeerList } from "./shared/peer-list.ts";
 import { paperclipAgentMarker, paperclipRefusalMessage } from "./shared/paperclip-guard.ts";
 import type { PeerId, PeerType } from "./shared/types.ts";
 
@@ -45,6 +46,7 @@ const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.AGENT_PEERS_HEARTBEAT_MS ?? "15000", 10);
+const WORKING_SESSION_STARTED_AT = new Date().toISOString();
 
 function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the protocol).
@@ -131,7 +133,7 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other AI agent peers on this machine. Returns id, human name, peer_type (claude|codex|hermes), cwd, summary.",
+      "List live AI agent peers ordered by working-session start, newest first. Returns Started, heartbeat, id, name, peer_type, cwd, and summary. For latest/current requests, prefer the newest plausible match unless the user gives an exact target or another rule; empty summary and harness type are not disqualifiers.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -221,17 +223,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       if (peers.length === 0) {
         return { content: [{ type: "text" as const, text: `No other peers found (scope: ${scope}).` }] };
       }
-      const lines = peers.map((p) =>
-        [
-          `Peer ${p.name} (${p.peer_type})`,
-          `  ID: ${p.id}`,
-          `  CWD: ${p.cwd}`,
-          p.tty ? `  TTY: ${p.tty}` : null,
-          p.summary ? `  Summary: ${p.summary}` : null,
-          `  Last seen: ${p.last_seen}`,
-        ].filter(Boolean).join("\n")
-      );
-      return { content: [{ type: "text" as const, text: `Found ${peers.length} peer(s):\n\n${lines.join("\n\n")}` }] };
+      return { content: [{ type: "text" as const, text: formatPeerList(peers, scope) }] };
     }
 
     case "send_message": {
@@ -431,6 +423,7 @@ async function main() {
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    started_at: WORKING_SESSION_STARTED_AT,
     durable: !!process.env.PEER_NAME && process.env.AGENT_PEERS_EPHEMERAL !== "1",
   });
   myId = reg.id;
@@ -600,6 +593,7 @@ async function main() {
           git_root: myGitRoot,
           tty,
           summary: initialSummary,
+          started_at: WORKING_SESSION_STARTED_AT,
           durable: !!process.env.PEER_NAME && process.env.AGENT_PEERS_EPHEMERAL !== "1",
           // Mailbox follows the agent: if our old row is gone, the broker
           // re-points our unacked mail to the new incarnation.

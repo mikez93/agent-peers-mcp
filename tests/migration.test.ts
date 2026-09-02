@@ -79,6 +79,7 @@ test("initDb migrates pre-session_token DB: adds column, DROPS legacy peers, mes
       `SELECT name FROM pragma_table_info('peers')`
     ).all().map((r) => r.name);
     expect(cols).toContain("session_token");
+    expect(cols).toContain("started_at");
 
     // Legacy peer rows are gone (migration drops them)
     const peerCount = db.query<{ c: number }, []>(
@@ -187,6 +188,7 @@ test("initDb self-heals NULL session_token rows from a crashed partial migration
       summary       TEXT DEFAULT '',
       session_token TEXT,
       registered_at TEXT NOT NULL,
+      started_at    TEXT,
       last_seen     TEXT NOT NULL
     );
   `);
@@ -205,9 +207,9 @@ test("initDb self-heals NULL session_token rows from a crashed partial migration
   const ts = new Date().toISOString();
   // Insert row with NULL session_token
   setup.query(
-    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
-  ).run("half-migrated-1", "half", "claude", 1, "/half", null, null, "", ts, ts);
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, started_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+  ).run("half-migrated-1", "half", "claude", 1, "/half", null, null, "", ts, "2025-01-01T00:00:00.000Z", ts);
   setup.close();
 
   // initDb should self-heal the NULL token
@@ -217,6 +219,9 @@ test("initDb self-heals NULL session_token rows from a crashed partial migration
       "SELECT session_token FROM peers WHERE id = 'half-migrated-1'"
     ).get();
     expect(row?.session_token).toMatch(/^[a-f0-9-]{36}$/);
+    expect(db.query<{ started_at: string }, []>(
+      "SELECT started_at FROM peers WHERE id = 'half-migrated-1'"
+    ).get()?.started_at).toBe("2025-01-01T00:00:00.000Z");
   } finally {
     db.close();
   }
@@ -252,6 +257,8 @@ test("initDb expands an existing peer_type constraint to Hermes without dropping
   try {
     expect(db.query<{ name: string }, []>("SELECT name FROM peers WHERE id = 'existing-codex-id'").get()?.name)
       .toBe("existing-codex");
+    expect(db.query<{ started_at: string }, []>("SELECT started_at FROM peers WHERE id = 'existing-codex-id'").get()?.started_at)
+      .toBe(ts);
     const hermes = registerPeer(db, {
       name: "hermes-first",
       peer_type: "hermes",

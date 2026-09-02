@@ -71,6 +71,7 @@ import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
+import { formatPeerList } from "./shared/peer-list.ts";
 import { planWaitForPeerMessages, waitForFreshPeerMessages as waitForFreshPeerMessagesLoop } from "./shared/wait-for-peer-messages.ts";
 import { createAsyncLock } from "./shared/async-lock.ts";
 import { DeliveryState } from "./shared/delivery-state.ts";
@@ -88,6 +89,10 @@ const HEARTBEAT_INTERVAL_MS = parseInt(process.env.AGENT_PEERS_HEARTBEAT_MS ?? "
 const RUNTIME_PEER_TYPE: PeerType = process.env.AGENT_PEERS_RUNTIME === "hermes" ? "hermes" : "codex";
 const RUNTIME_DISPLAY_NAME = RUNTIME_PEER_TYPE === "hermes" ? "Hermes" : "Codex";
 const RUNTIME_IS_CODEX = RUNTIME_PEER_TYPE === "codex";
+// Claude/Codex MCP lifetime is the real working-session lineage. Hermes may
+// launch temporary MCP children, so it deliberately omits this value and lets
+// the broker preserve the durable peer's existing start on reclaim.
+const WORKING_SESSION_STARTED_AT = RUNTIME_IS_CODEX ? new Date().toISOString() : undefined;
 // Hermes surfaces are per-turn processes that are never wakeable, so the
 // Codex-grade 5-minute wait is always wrong there: it pins the turn "working"
 // and the surface may be torn down before the wait ends. 60s is the ceiling.
@@ -193,7 +198,7 @@ DELIVERY CHANNELS:
 const TOOLS = [
   {
     name: "list_peers",
-    description: "List other AI agent peers on this machine.",
+    description: "List live AI agent peers ordered by working-session start, newest first. Returns Started, heartbeat, id, name, peer_type, cwd, and summary. For latest/current requests, prefer the newest plausible match unless the user gives an exact target or another rule; empty summary and harness type are not disqualifiers.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -671,17 +676,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         if (peers.length === 0) {
           return { text: `No other peers found (scope: ${scope}).` };
         }
-        const lines = peers.map((p) =>
-          [
-            `Peer ${p.name} (${p.peer_type})`,
-            `  ID: ${p.id}`,
-            `  CWD: ${p.cwd}`,
-            p.tty ? `  TTY: ${p.tty}` : null,
-            p.summary ? `  Summary: ${p.summary}` : null,
-            `  Last seen: ${p.last_seen}`,
-          ].filter(Boolean).join("\n")
-        );
-        return { text: `Found ${peers.length} peer(s):\n\n${lines.join("\n\n")}` };
+        return { text: formatPeerList(peers, scope) };
       }
 
       case "send_message": {
@@ -939,6 +934,7 @@ async function main() {
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    started_at: WORKING_SESSION_STARTED_AT,
     durable: requestDurable,
   });
   myId = reg.id;
@@ -1020,6 +1016,7 @@ async function main() {
           git_root: myGitRoot,
           tty,
           summary: initialSummary,
+          started_at: WORKING_SESSION_STARTED_AT,
           durable: requestDurable,
           // Mailbox follows the agent: if our old row is gone, the broker
           // re-points our unacked mail to the new incarnation.

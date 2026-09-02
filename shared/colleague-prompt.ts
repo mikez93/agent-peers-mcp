@@ -72,6 +72,14 @@ MAINTENANCE — always:
 - Before asking a peer a question, call \`list_peers\` and read their
   summary. The answer might already be there — or you might realize
   they're deep in something unrelated and you should ask later.
+- When the user asks for the latest, current, or most recent instance of an
+  agent, first identify plausible candidates from the user's handoff, exact
+  name/ID, repo/CWD, and summary. Then choose the newest working session by
+  \`Started\` unless the user gave another rule. An exact user-supplied name
+  or ID wins over recency. Never exclude a candidate merely because its
+  summary is empty or its harness differs from prior sessions. Treat summary
+  as supporting evidence, not a recency signal; state genuine ambiguity
+  instead of guessing.
 - Refer to shared concepts using the peer's naming, not your own, so
   conversation history stays searchable ("the auth module" if they said
   that, don't rebrand it "authentication service").
@@ -97,7 +105,8 @@ That's the loop. Brief, substantive, initiative on both sides.
 
 TOOLS:
 
-- \`list_peers(scope)\` — see who else is around. Scope: "machine" | "directory" | "repo".
+- \`list_peers(scope)\` — see live peers ordered by working-session start,
+  newest first. Scope: "machine" | "directory" | "repo".
 - \`send_message(to_id, message)\` — to_id accepts UUID or human name.
 - \`set_summary(summary)\` — 1-2 sentences on your current work. Update it when focus shifts.
 - \`check_messages\` — explicit inbox poll (useful when you expect a reply).

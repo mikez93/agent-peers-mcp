@@ -57,8 +57,9 @@ Two tables, both created by `initDb` (`broker.ts:94-181`).
 
 **`peers`** — `id` (UUID PK), `name` (UNIQUE), `peer_type` (CHECK in `claude|codex|hermes`),
 `pid`, `cwd`, `git_root`, `tty`, `summary`, `session_token` (NOT NULL), `registered_at`,
-`last_seen`, `durable` (INTEGER default 0), `host` (added by migration, nullable).
-Indices on `last_seen` and `name`.
+`started_at`, `last_seen`, `durable` (INTEGER default 0), `host` (added by migration,
+nullable). `started_at` is working-session age; `last_seen` is only the liveness heartbeat.
+Indices on `last_seen`, `started_at`, and `name`.
 
 **`messages`** — `id` (INTEGER AUTOINCREMENT PK), `from_id`, `to_id`, `text`, `sent_at`,
 `acked` (default 0), `lease_token`, `lease_expires_at`, `message_uid` (UUID, unique index).
@@ -82,6 +83,9 @@ concurrent broker startups serialize:
    AUTOINCREMENT integer would collide across brokers.
 5. `migrate_peers_add_host` (291) — adds `host TEXT`, filled with `os.hostname()` on new
    registrations. Schema-only; no routing code reads it yet.
+6. `migrate_peers_add_started_at` — adds `started_at`, backfills old rows from
+   `registered_at`, and creates the recency index. It runs after every migration that may
+   rebuild `peers`, so an upgrade cannot silently discard the value.
 
 Both rebuild-capable migrations (1 and 2) share `rebuildPeersTableWithNotNullSessionToken`
 (257), a shadow-table copy whose column list is written out literally and **omits `durable` and

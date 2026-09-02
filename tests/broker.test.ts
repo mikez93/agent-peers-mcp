@@ -48,6 +48,7 @@ function reg(opts: {
   pid?: number;
   durable?: boolean;
   prev_id?: string;
+  started_at?: string;
 }) {
   return registerPeer(db, {
     peer_type: opts.peer_type ?? "claude",
@@ -56,6 +57,7 @@ function reg(opts: {
     git_root: opts.git_root ?? null,
     tty: opts.tty ?? null,
     summary: opts.summary ?? "",
+    ...(opts.started_at ? { started_at: opts.started_at } : {}),
     durable: opts.durable ?? (opts.name ? true : false),
     ...(opts.prev_id ? { prev_id: opts.prev_id } : {}),
     ...(opts.name ? { name: opts.name } : {}),
@@ -84,6 +86,7 @@ test("registerPeer creates peer with UUID + name + session_token", () => {
   expect(name.length).toBeGreaterThan(0);
   const peer = getPeer(db, id);
   expect(peer?.name).toBe(name);
+  expect(peer?.started_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 });
 
 test("registerPeer honors explicit name if unique", () => {
@@ -94,6 +97,18 @@ test("registerPeer honors explicit name if unique", () => {
 test("registerPeer accepts Hermes as a first-class peer", () => {
   const { id } = reg({ name: "hermes-tab", peer_type: "hermes" });
   expect(getPeer(db, id)?.peer_type).toBe("hermes");
+});
+
+test("registerPeer canonicalizes supplied working-session start and bounds future values", () => {
+  const offset = reg({ name: "offset-start", started_at: "2026-01-01T00:00:00-05:00" });
+  expect(getPeer(db, offset.id)?.started_at).toBe("2026-01-01T05:00:00.000Z");
+
+  const before = new Date().toISOString();
+  const future = reg({ name: "future-start", started_at: "2999-01-01T00:00:00.000Z" });
+  const after = new Date().toISOString();
+  const stored = getPeer(db, future.id)?.started_at ?? "";
+  expect(stored >= before).toBe(true);
+  expect(stored <= after).toBe(true);
 });
 
 test("registerPeer appends -2 on name collision with live peer", () => {
@@ -116,6 +131,32 @@ test("registerPeer reclaims stale peer with same name, preserving UUID and issui
   ).get(second.id)!;
   expect(row.pid).toBe(222);
   expect(row.cwd).toBe("/new");
+});
+
+test("reclaim uses a new client's working-session start but preserves it when omitted", () => {
+  const originalStart = "2026-01-01T00:00:00.000Z";
+  const restartedStart = "2026-02-01T00:00:00.000Z";
+  const first = reg({ name: "lineage", started_at: originalStart });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", first.id);
+
+  const restarted = reg({ name: "lineage", started_at: restartedStart });
+  expect(restarted.id).toBe(first.id);
+  expect(getPeer(db, restarted.id)?.started_at).toBe(restartedStart);
+
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", restarted.id);
+  const oldClient = reg({ name: "lineage" });
+  expect(oldClient.id).toBe(first.id);
+  expect(getPeer(db, oldClient.id)?.started_at).toBe(restartedStart);
+});
+
+test("durable Hermes peer keeps one working-session start across temporary MCP turns", () => {
+  const first = reg({ name: "hermes-lineage", peer_type: "hermes" });
+  const startedAt = getPeer(db, first.id)?.started_at;
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", first.id);
+
+  const nextTurn = reg({ name: "hermes-lineage", peer_type: "hermes" });
+  expect(nextTurn.id).toBe(first.id);
+  expect(getPeer(db, nextTurn.id)?.started_at).toBe(startedAt);
 });
 
 test("registerPeer immediately reclaims a same-host peer whose PID is gone", () => {
@@ -191,11 +232,11 @@ test("registerPeer does NOT immediately reclaim a same-host LIVE peer", () => {
 
 test("registerPeer is atomic under simulated interleaving", () => {
   db.query(
-    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, started_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     "external-id", "race", "claude", process.pid, "/ext", null, null, "",
-    "external-session", new Date().toISOString(), new Date().toISOString(),
+    "external-session", new Date().toISOString(), new Date().toISOString(), new Date().toISOString(),
   );
   const res = reg({ name: "race" });
   expect(res.name).toBe("race-2");
@@ -317,6 +358,16 @@ test("listPeers peer_type filter", () => {
     scope: "machine", cwd: "/any", git_root: null, peer_type: "codex",
   });
   expect(peers.map((p) => p.id)).toEqual([c.id]);
+});
+
+test("listPeers orders by working-session start, not synchronized heartbeat", () => {
+  const older = reg({ name: "older-session", started_at: "2026-01-01T00:00:00.000Z" });
+  const newer = reg({ name: "newer-session", started_at: "2026-02-01T00:00:00.000Z" });
+  const heartbeat = new Date().toISOString();
+  db.query("UPDATE peers SET last_seen = ? WHERE id IN (?, ?)").run(heartbeat, older.id, newer.id);
+
+  const peers = listPeers(db, { scope: "machine", cwd: "/any", git_root: null });
+  expect(peers.map((p) => p.name)).toEqual(["newer-session", "older-session"]);
 });
 
 // ---------- sendMessage ----------

@@ -50,7 +50,7 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 | 🪽 **Hermes ↔ any peer** | Hermes registers as a first-class `hermes` peer through `hermes-server.ts`, with the same durable polling and authoritative `[PEER INBOX]` delivery used by Codex. A running Hermes conversation can load the adapter with `/reload-mcp` after configuration. |
 | 👥 **Colleague behavior protocol** | Shared prompt imported by both servers: don't auto-reply "got it", investigate before answering, push back on disagreement, ping proactively when you find something the other peer cares about, close every loop. |
 | 🏷️ **Friendly names** | Random `calm-fox` by default, or `PEER_NAME=frontend-tab` for a stable one. Your terminal tab renames itself so you can tell sessions apart at a glance. Peers can rename themselves mid-session. |
-| 🔍 **Scoped discovery** | `list_peers` with scope `machine` / `directory` / `repo`. Agents find relevant peers without a global cloud directory. |
+| 🔍 **Scoped discovery** | `list_peers` with scope `machine` / `directory` / `repo`. Live peers are ordered by working-session start, newest first, with `Started` kept distinct from the liveness `Heartbeat`. |
 | 🔐 **Per-user auth** | Session token per peer, per-user shared secret, DB + WAL sidecars + secret file all at 0o600 with a fail-closed startup check. Another local user can't eavesdrop on your peer traffic. |
 | 📬 **At-least-once delivery** | 30s lease → confirm-on-next-call ack. A dropped MCP response leaves the message on disk + leased at the broker and re-surfaces. Never silently lost. Unreachable recipient → message becomes an orphan, visible via `cli.ts orphaned-messages`. |
 | ♻️ **Reclaim-safe restart** | Kill a session and relaunch with the same `PEER_NAME` within 60s → broker reclaims the UUID *and* clears stale leases. Backlog lands on the new session's first poll. |
@@ -396,6 +396,9 @@ Most terminals (iTerm2, Terminal.app, Ghostty, Warp) track the running foregroun
 
 **Closed tabs disappear from discovery within ~60 seconds, but the backlog isn't stranded.**
 When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately — you won't see ghost peers there even in that window. If you restart with the same `PEER_NAME` within 60-90s, the broker reclaims the same UUID AND clears any stale leases for that peer, so the new session picks up undelivered backlog on its first poll instead of waiting up to 30s for leases to expire. Codex additionally persists its durable inbox on disk, so messages sitting on a reclaimed session are replayed even if they were drawn but not yet confirmed delivered.
+
+**Peer discovery distinguishes age from activity.**
+`Started` is the beginning of the real Claude or Codex working session, while `Heartbeat` only proves that the peer is still live. Hermes may launch a temporary MCP helper on each turn, so the broker preserves the durable Hermes peer's original `Started` value instead of making every helper look like a brand-new agent. For requests such as “find the latest Cedar,” the shared agent instructions choose the newest plausible match by `Started`; an exact user-supplied name or ID still wins, and an empty summary or unfamiliar harness does not exclude a candidate.
 
 ---
 
