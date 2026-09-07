@@ -8,7 +8,7 @@ import { readSharedSecret } from "./shared/shared-secret.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore } from "./shared/wake-launch-claims.ts";
 import { CodexAppServerWsClient, formatThreadStatus } from "./shared/app-server-client.ts";
-import { DroidLaunchClaimStore, type BoundDroidLaunchClaim } from "./shared/droid-launch-claims.ts";
+import { DroidLaunchClaimStore, selectDroidClaim, type BoundDroidLaunchClaim } from "./shared/droid-launch-claims.ts";
 import type { Peer } from "./shared/types.ts";
 import { peerStartedAt, sortPeersNewestFirst } from "./shared/peer-list.ts";
 
@@ -323,7 +323,6 @@ async function cmdWakeStatus() {
   const boundDroidClaims = droidClaims.filter((claim): claim is BoundDroidLaunchClaim =>
     claim.status === "bound" && !!claim.peer_id && !!claim.peer_name && !!claim.mcp_pid
   );
-  const droidClaimByPeer = new Map(boundDroidClaims.map((claim) => [claim.peer_id, claim]));
   const droidUnreadCounts = await readUnreadCountsByPeer(droidRoot);
 
   const rows = codexPeers.sort(comparePeers).map((peer) => ({
@@ -395,7 +394,7 @@ async function cmdWakeStatus() {
     console.log("  (none)");
   } else {
     for (const peer of droidPeers.sort(comparePeers)) {
-      const claim = droidClaimByPeer.get(peer.id);
+      const claim = selectDroidClaim(boundDroidClaims, peer, processIsAlive);
       printDroidWakePeer(peer, claim, droidUnreadCounts.get(peer.id) ?? 0, "registered");
     }
     const liveDroidIds = new Set(droidPeers.map((peer) => peer.id));
@@ -423,7 +422,8 @@ function printDroidWakePeer(
 ): void {
   const launcherLive = processIsAlive(claim?.launcher_pid);
   const mcpLive = processIsAlive(claim?.mcp_pid);
-  const wakeable = broker === "registered" && launcherLive && mcpLive ? "yes" : "no";
+  const wakeable = broker === "registered" && launcherLive && mcpLive
+    && !!claim?.session_id && claim.mcp_pid === peer?.pid ? "yes" : "no";
   const name = peer?.name ?? claim?.peer_name ?? "unknown-droid";
   const peerId = peer?.id ?? claim?.peer_id ?? "unknown";
   console.log(`  ${name}  broker=${broker}  session=${launcherLive ? "live" : "dead"}  mcp=${mcpLive ? "live" : "dead"}  wakeable=${wakeable}  unread=${pending}  id=${peerId}`);

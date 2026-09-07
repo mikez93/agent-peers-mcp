@@ -15,13 +15,18 @@ handle with which to start a turn.
 ## Launch and resume
 
 ```bash
-droidpeer start <peer-name> [cwd]
+droidpeer start [peer-name] [cwd]
+droidpeer start --cwd <repo-path>
 droidpeer resume <factory-session-id> [peer-name] [cwd]
 ```
 
 The launcher starts `droid exec --output-format acp`, negotiates ACP v1, and
 creates or resumes one Factory session. It injects `droid-server.ts` as a stdio
 MCP server using ACP's `mcpServers` session field.
+
+Omitting the name derives `<persona>-<repo>-droid` from the repository's primary
+`AGENTS.md` identity, falling back to `<repo>-droid`. An explicit argument or
+`PEER_NAME` overrides that default.
 
 ## Wake path
 
@@ -68,11 +73,23 @@ If the bound MCP child itself dies, `peerstatus` reports `mcp=dead` and
 `wakeable=no`. Restart the launcher with `droidpeer resume <session-id>`; a
 binding is never stolen inside a live claim.
 
-Bare `droidpeer resume <session-id>` restores the saved peer name and working
-directory. Explicit name or cwd arguments override the saved values.
+Bare `droidpeer resume <session-id>` restores the actual allocated peer name
+(including a collision suffix), prior peer UUID, and working directory. The UUID
+lets the broker recover orphaned unread mail if the old peer row was collected.
+MCP rename and broker re-registration refresh that saved identity. Explicit name
+or cwd arguments override the saved values.
+
+Malformed ACP output and closed stdout terminate the managed host so it cannot
+remain falsely wakeable. Cancellation covers startup as well as idle/wake turns;
+shutdown waits for the child to exit, escalating SIGTERM to SIGKILL after two
+seconds. A child that fails to exit produces a shutdown error instead of a
+successful close report.
 
 ## Inspection
 
 Run `bun cli.ts live` (or the fleet `peerstatus` wrapper) to distinguish Droid
 broker membership, launcher/session process liveness, MCP process liveness,
 wakeability, and unread count.
+When crash residue and a resumed claim share a peer UUID, inspection prefers the
+live claim matching the broker's current MCP PID. A claim without a finalized
+Factory session ID cannot report wakeable.

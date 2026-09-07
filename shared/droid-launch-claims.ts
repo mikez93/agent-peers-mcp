@@ -15,6 +15,7 @@ export interface DroidLaunchClaim {
   claim_id: string;
   cwd: string;
   requested_peer_name: string | null;
+  previous_peer_id?: string | null;
   launcher_pid: number;
   session_id: string | null;
   peer_id: string | null;
@@ -32,10 +33,27 @@ export interface BoundDroidLaunchClaim extends DroidLaunchClaim {
   status: "bound";
 }
 
+/** Crash residue must not shadow the claim held by the broker's current MCP. */
+export function selectDroidClaim(
+  claims: readonly BoundDroidLaunchClaim[],
+  peer: { id: string; pid: number | null },
+  isAlive: (pid: number) => boolean,
+): BoundDroidLaunchClaim | undefined {
+  const rank = (claim: BoundDroidLaunchClaim): number =>
+    (claim.mcp_pid === peer.pid ? 2 : 0)
+    + (isAlive(claim.launcher_pid) && isAlive(claim.mcp_pid) && !!claim.session_id ? 1 : 0);
+  return claims.filter((claim) => claim.peer_id === peer.id).sort((a, b) =>
+    rank(b) - rank(a) || b.updated_at.localeCompare(a.updated_at) || b.claim_id.localeCompare(a.claim_id)
+  )[0];
+}
+
 export interface DroidSessionState {
   session_id: string;
   cwd: string;
   requested_peer_name: string | null;
+  /** Actual broker allocation, including any concurrent-instance suffix. */
+  peer_name?: string;
+  peer_id?: string;
   updated_at: string;
 }
 
@@ -84,13 +102,14 @@ export class DroidLaunchClaimStore {
     this.sessionsDir = join(root, "sessions");
   }
 
-  async createClaim(opts: { cwd: string; requestedPeerName?: string; launcherPid?: number }): Promise<DroidLaunchClaim> {
+  async createClaim(opts: { cwd: string; requestedPeerName?: string; previousPeerId?: string; launcherPid?: number }): Promise<DroidLaunchClaim> {
     await ensurePrivateDir(this.rootDir);
     const now = new Date().toISOString();
     const claim: DroidLaunchClaim = {
       claim_id: randomUUID(),
       cwd: opts.cwd,
       requested_peer_name: opts.requestedPeerName ?? null,
+      previous_peer_id: opts.previousPeerId ?? null,
       launcher_pid: opts.launcherPid ?? process.pid,
       session_id: null,
       peer_id: null,
@@ -105,15 +124,23 @@ export class DroidLaunchClaimStore {
   }
 
   async setSessionId(claimId: string, sessionId: string): Promise<void> {
-    const claim = await this.requireClaim(claimId);
-    await atomicWriteJson(this.claimPath(claimId), {
-      ...claim,
-      session_id: sessionId,
-      updated_at: new Date().toISOString(),
+    await this.withClaimUpdate(claimId, async () => {
+      const claim = await this.requireClaim(claimId);
+      const finalized = {
+        ...claim,
+        session_id: sessionId,
+        updated_at: new Date().toISOString(),
+      };
+      await atomicWriteJson(this.claimPath(claimId), finalized);
+      if (finalized.status === "bound") await this.saveBoundSession(finalized as BoundDroidLaunchClaim);
     });
   }
 
   async bindClaim(claimId: string, binding: { peerId: string; peerName: string; mcpPid: number; cwd: string }): Promise<BoundDroidLaunchClaim> {
+    return this.withClaimUpdate(claimId, () => this.bindClaimInner(claimId, binding));
+  }
+
+  private async bindClaimInner(claimId: string, binding: { peerId: string; peerName: string; mcpPid: number; cwd: string }): Promise<BoundDroidLaunchClaim> {
     const claim = await this.requireClaim(claimId);
     if (!binding.peerId || !binding.peerName || !Number.isInteger(binding.mcpPid) || binding.mcpPid <= 0) {
       throw new Error("invalid Droid peer binding");
@@ -141,6 +168,7 @@ export class DroidLaunchClaimStore {
         updated_at: new Date().toISOString(),
       } as BoundDroidLaunchClaim;
       await atomicWriteJson(this.claimPath(claimId), rebound);
+      if (rebound.session_id) await this.saveBoundSession(rebound);
       return rebound;
     }
     const bound: BoundDroidLaunchClaim = {
@@ -152,12 +180,38 @@ export class DroidLaunchClaimStore {
       updated_at: new Date().toISOString(),
     };
     await atomicWriteJson(this.claimPath(claimId), bound);
+    if (bound.session_id) await this.saveBoundSession(bound);
     return bound;
   }
 
-  async waitForBinding(claimId: string, opts: { timeoutMs?: number; pollMs?: number } = {}): Promise<BoundDroidLaunchClaim> {
+  /** Short cross-process critical section for launcher finalization and MCP
+   * rebinding. A crashed writer is not stolen: resume creates a fresh claim. */
+  private async withClaimUpdate<T>(claimId: string, update: () => Promise<T>): Promise<T> {
+    const lock = `${this.claimPath(claimId)}.update-lock`;
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      try {
+        await writeFile(lock, String(process.pid), { mode: FILE_MODE, flag: "wx" });
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (Date.now() >= deadline) throw new Error("Droid claim update is locked; restart/resume with a fresh launch claim");
+        await Bun.sleep(10);
+      }
+    }
+    try { return await update(); }
+    finally { await unlink(lock); }
+  }
+
+  private async saveBoundSession(claim: BoundDroidLaunchClaim): Promise<void> {
+    await this.saveSession({ session_id: claim.session_id!, cwd: claim.cwd,
+      requested_peer_name: claim.requested_peer_name, peer_id: claim.peer_id, peer_name: claim.peer_name });
+  }
+
+  async waitForBinding(claimId: string, opts: { timeoutMs?: number; pollMs?: number; signal?: AbortSignal } = {}): Promise<BoundDroidLaunchClaim> {
     const deadline = Date.now() + (opts.timeoutMs ?? 15_000);
     while (true) {
+      opts.signal?.throwIfAborted();
       const claim = await this.readClaim(claimId);
       if (!claim) throw new Error(`Droid launch claim ${claimId} disappeared before binding`);
       if (claim.status === "bound" && claim.peer_id && claim.peer_name && claim.mcp_pid) {

@@ -4,6 +4,8 @@ import { lstat, readFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { defaultPeerName } from "./peer-identity.ts";
+import { isValidName, NAME_MAX_LEN } from "./names.ts";
 
 import {
   DroidAcpClient,
@@ -114,6 +116,9 @@ export function parseDroidLauncherArgs(argv: string[]): DroidLauncherOptions {
     else throw new DroidLauncherUsageError(`unknown option: ${arg}`);
   }
   opts.cwd = resolve(opts.cwd);
+  if (opts.peerName && !isValidName(opts.peerName)) {
+    throw new DroidLauncherUsageError(`peer name must be 1-${NAME_MAX_LEN} letters, digits, underscores or hyphens, and cannot be a UUID`);
+  }
   if (opts.autonomyLevel && /^(low|medium|high)$/.test(opts.autonomyLevel)) {
     opts.autonomyLevel = `auto-${opts.autonomyLevel}`;
   }
@@ -316,61 +321,90 @@ export async function runDroidLauncher(
   const effectiveOpts: DroidLauncherOptions = {
     ...opts,
     cwd: opts.sessionId && opts.cwdExplicit === false && saved ? saved.cwd : opts.cwd,
-    peerName: opts.peerName ?? saved?.requested_peer_name ?? undefined,
+    peerName: opts.peerName ?? saved?.peer_name ?? saved?.requested_peer_name ?? (process.env.PEER_NAME || undefined),
   };
-  const claim = await claims.createClaim({ cwd: effectiveOpts.cwd, requestedPeerName: effectiveOpts.peerName });
-  const client = deps.clientFactory?.(effectiveOpts) ?? new DroidAcpClient(spawnDroidAcpTransport({
-    cwd: effectiveOpts.cwd,
-    droidCommand: effectiveOpts.droidCommand,
-    onStderr: (chunk) => process.stderr.write(chunk),
-  }));
+  effectiveOpts.peerName = await defaultPeerName(effectiveOpts.cwd, "droid", effectiveOpts.peerName);
+  if (signal?.aborted) return 0;
+  const claim = await claims.createClaim({ cwd: effectiveOpts.cwd, requestedPeerName: effectiveOpts.peerName, previousPeerId: saved?.peer_id });
+  let client: DroidLauncherClient | undefined;
   let sessionId: string | null = null;
-  let abortHandler: (() => void) | null = null;
+  const stopped = new AbortController();
+  let exitCode: number | null = null;
+  const abortHandler = () => {
+    stopped.abort();
+    if (sessionId) void client?.cancel(sessionId).catch(() => {});
+    client?.close();
+  };
+  signal?.addEventListener("abort", abortHandler, { once: true });
 
   try {
-    const initialized = await client.initialize();
+    client = deps.clientFactory?.(effectiveOpts) ?? new DroidAcpClient(spawnDroidAcpTransport({
+      cwd: effectiveOpts.cwd,
+      droidCommand: effectiveOpts.droidCommand,
+      onStderr: (chunk) => process.stderr.write(chunk),
+    }));
+    // Subscribe once per process, not once per inbox poll. Otherwise each
+    // idle day retains another 86,400 handlers on an unresolved exit promise.
+    void client.closed.then((code) => { exitCode = code; stopped.abort(); });
+    if (signal?.aborted) { abortHandler(); return 0; }
+    const initialized = await untilStopped(client.initialize(), stopped.signal);
     const mcpServer = deps.mcpServerFactory?.(claim.claim_id, stateRoot, effectiveOpts.peerName)
       ?? buildDroidMcpServer({ claimId: claim.claim_id, stateRoot, peerName: effectiveOpts.peerName });
-    sessionId = effectiveOpts.sessionId
-      ? await resumeExactSession(client, initialized, effectiveOpts.sessionId, effectiveOpts.cwd, [mcpServer])
-      : await client.newSession({ cwd: effectiveOpts.cwd, mcpServers: [mcpServer] });
-    await configureDroidSession(client, sessionId, effectiveOpts);
-    const binding = await claims.waitForBinding(claim.claim_id, { timeoutMs: effectiveOpts.claimTimeoutMs });
+    sessionId = await untilStopped(effectiveOpts.sessionId
+      ? resumeExactSession(client, initialized, effectiveOpts.sessionId, effectiveOpts.cwd, [mcpServer])
+      : client.newSession({ cwd: effectiveOpts.cwd, mcpServers: [mcpServer] }), stopped.signal);
+    await untilStopped(configureDroidSession(client, sessionId, effectiveOpts), stopped.signal);
+    await claims.waitForBinding(claim.claim_id, { timeoutMs: effectiveOpts.claimTimeoutMs, signal: stopped.signal });
     // The MCP child can bind during session/new or session/resume. Finalize
     // the session id only after observing that completed write so the two
     // cross-process claim updates can never overwrite one another.
     await claims.setSessionId(claim.claim_id, sessionId);
-    await claims.saveSession({ session_id: sessionId, cwd: effectiveOpts.cwd, requested_peer_name: effectiveOpts.peerName ?? null });
+    const binding = await claims.waitForBinding(claim.claim_id, { timeoutMs: effectiveOpts.claimTimeoutMs, signal: stopped.signal });
     deps.onReady?.({ peerId: binding.peer_id, peerName: binding.peer_name, sessionId });
     const source = deps.metadataSourceFactory?.(binding, stateRoot)
       ?? new ClaimBoundDroidWakeMetadataSource(claims, claim.claim_id, stateRoot);
     const controller = new DroidWakeController(sessionId, client, source, deps.onWakeError);
     const sleep = deps.sleep ?? ((ms: number) => Bun.sleep(ms));
 
-    abortHandler = () => {
-      void client.cancel(sessionId!).catch(() => {});
-      client.close();
-    };
-    signal?.addEventListener("abort", abortHandler, { once: true });
-    if (signal?.aborted) abortHandler();
-
-    while (!signal?.aborted) {
+    while (!stopped.signal.aborted) {
       await controller.pollOnce();
-      const outcome = await Promise.race([
-        sleep(effectiveOpts.pollMs).then(() => null),
-        client.closed.then((code) => ({ code })),
-      ]);
-      if (outcome) {
-        await Promise.race([controller.waitForIdle(), sleep(deps.shutdownGraceMs ?? 2_000)]);
-        return outcome.code;
-      }
+      await untilStopped(sleep(effectiveOpts.pollMs), stopped.signal).catch(() => {});
     }
-    await Promise.race([controller.waitForIdle(), sleep(deps.shutdownGraceMs ?? 2_000)]);
-    return 0;
+    return signal?.aborted ? 0 : exitCode ?? 1;
+  } catch (error) {
+    if (signal?.aborted) return 0;
+    throw error;
   } finally {
-    if (abortHandler) signal?.removeEventListener("abort", abortHandler);
-    client.close();
-    await claims.removeClaim(claim.claim_id);
+    signal?.removeEventListener("abort", abortHandler);
+    try {
+      if (client) {
+        client.close();
+        // Keep the host alive through the transport's SIGKILL fallback.
+        await waitForChildExit(client.closed, deps.shutdownGraceMs ?? 5_000);
+      }
+    } finally {
+      await claims.removeClaim(claim.claim_id);
+    }
+  }
+}
+
+function untilStopped<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(new Error("Factory Droid ACP host stopped"));
+    signal.addEventListener("abort", abort, { once: true });
+    operation.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    if (signal.aborted) abort();
+  });
+}
+
+async function waitForChildExit(closed: Promise<number>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([closed, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Factory Droid child did not exit before shutdown deadline")), timeoutMs);
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

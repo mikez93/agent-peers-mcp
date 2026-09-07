@@ -356,7 +356,7 @@ blind spot.
 
 Request `{ id, session_token, new_name }`. Response `{ ok: true, name }` or `{ ok: false, error }`.
 
-Validates the name (`isValidName`: 1-32 chars, `^[a-zA-Z0-9_-]+$`), then an atomic
+Validates the name (`isValidName`: 1-96 chars, `^[a-zA-Z0-9_-]+$`, excluding UUID-shaped names), then an atomic
 auth-and-rename UPDATE with `session_token` in the WHERE. Zero changes → `unauthorized rename`
 for both "unknown id" and "wrong token" (no auth-vs-enumeration leak). A UNIQUE violation →
 `name taken`.
@@ -417,7 +417,7 @@ orphaning their mail, and letting them collide with their own uncollected ghost 
 
 ### Name reclaim rules (summary)
 
-1. Name must be valid (`^[a-zA-Z0-9_-]+$`, 1-32 chars).
+1. Name must be valid (`^[a-zA-Z0-9_-]+$`, 1-96 chars, not a UUID).
 2. Existing row must match **both** name and `peer_type`.
 3. Existing row must be stale (`last_seen < now - 60s`).
 4. On success: UUID preserved, `session_token` rotated, stale leases cleared, `prev_id` mail

@@ -2,7 +2,8 @@
 // Friendly auto-generated peer names + validation.
 
 export const NAME_REGEX = /^[a-zA-Z0-9_-]+$/;
-export const NAME_MAX_LEN = 32;
+// A persona + repository + harness must survive a concurrent-instance suffix.
+export const NAME_MAX_LEN = 96;
 
 const ADJECTIVES = [
   "calm","bold","swift","quiet","loud","bright","fuzzy","sly","brave","tidy",
@@ -43,7 +44,7 @@ export function appendSuffixWithinLimit(base: string, word: string): string {
   if (full.length <= NAME_MAX_LEN) return full;
   const allowed = NAME_MAX_LEN - word.length - 1; // 1 for the separator
   if (allowed <= 0) return word.slice(0, NAME_MAX_LEN);
-  const trimmed = base.slice(0, allowed).replace(/-+$/, "") || "peer";
+  const trimmed = base.slice(0, allowed).replace(/-+$/, "") || "p".slice(0, allowed);
   return `${trimmed}-${word}`;
 }
 
@@ -77,5 +78,7 @@ export function pickAvailablePeerName(
 export function isValidName(name: string): boolean {
   if (typeof name !== "string") return false;
   if (name.length < 1 || name.length > NAME_MAX_LEN) return false;
+  // Names and UUID identifiers share lookup endpoints; keep them unambiguous.
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(name)) return false;
   return NAME_REGEX.test(name);
 }

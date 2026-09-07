@@ -260,7 +260,9 @@ codex-peer retire NAME       # remove a stale/confusing peer from discovery
 
 ### Peer naming (multiple instances per repo)
 
-A bare `codex-peer` auto-names the peer `<repo>-codex` (e.g. `ccr-website-codex`).
+A bare `codex-peer` auto-names the peer `<persona>-<repo>-codex` from the primary
+`AGENTS.md` identity (e.g. `vector-agentic-coding-resources-codex`), with
+`<repo>-codex` as the fallback when no unambiguous persona is declared.
 The name is intentionally deterministic so the primary instance is predictable
 to address and so a relaunch **reclaims the same name** (the broker reclaims a
 stale same-named row in place).
@@ -271,7 +273,7 @@ positional `-2` — e.g. `ccr-website-codex-otter`. The launcher resolves this b
 asking the broker (read-only, `cli.ts suggest-name <base>`) for the set of
 **live** peer names: if `<base>` is free it is used unchanged (preserving the
 canonical name + reclaim); if it is held by a live peer, a single animal word is
-appended, trimmed if needed to stay within the 32-char name limit. Each instance
+appended, trimmed if needed to stay within the 96-char name limit. Each instance
 therefore gets a unique, individually-addressable name with no typing, so you can
 tell any specific one to collaborate over the network. (The broker's own
 register-time suffix ladder remains the final uniqueness backstop for the rare

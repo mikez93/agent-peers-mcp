@@ -27,6 +27,7 @@ import { createClient, createReadinessProbe } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
+import { defaultPeerName } from "./shared/peer-identity.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
@@ -36,7 +37,7 @@ import { DeliveryState } from "./shared/delivery-state.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isValidName } from "./shared/names.ts";
+import { isValidName, NAME_MAX_LEN } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { formatPeerList, PEER_LIST_TOOL_DESCRIPTION } from "./shared/peer-list.ts";
 import { workingSessionStartedAt } from "./shared/session-start.ts";
@@ -174,7 +175,7 @@ const TOOLS = [
   {
     name: "rename_peer",
     description:
-      "Rename YOURSELF. new_name must be 1-32 chars, matching [a-zA-Z0-9_-]. Names must be unique among active peers.",
+      `Rename YOURSELF. new_name must be 1-${NAME_MAX_LEN} chars, matching [a-zA-Z0-9_-], not a UUID. Names must be unique among active peers.`,
     inputSchema: {
       type: "object" as const,
       properties: { new_name: { type: "string" as const } },
@@ -312,7 +313,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       const { new_name } = args as { new_name: string };
       if (!isValidName(new_name)) {
         return {
-          content: [{ type: "text" as const, text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.` }],
+          content: [{ type: "text" as const, text: `Invalid name: must be 1-${NAME_MAX_LEN} chars, [a-zA-Z0-9_-] only, and cannot be a UUID.` }],
           isError: true,
         };
       }
@@ -399,6 +400,7 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+  const requestedName = defaultPeerName(myCwd, "claude", process.env.PEER_NAME || undefined);
 
   // Best-effort auto-summary with 3s cap; register may proceed with empty summary.
   let initialSummary = "";
@@ -419,7 +421,7 @@ async function main() {
 
   const reg = await client.register({
     peer_type: "claude",
-    name: process.env.PEER_NAME,
+    name: requestedName,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
@@ -589,7 +591,7 @@ async function main() {
         log(`Broker no longer knows us (id=${myId}) — evicted, most likely a broker outage >60s. Re-registering as ${myName}.`);
         const again = await client.register({
           peer_type: "claude",
-          name: myName ?? process.env.PEER_NAME,
+          name: myName ?? requestedName,
           pid: process.pid,
           cwd: myCwd,
           git_root: myGitRoot,

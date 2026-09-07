@@ -3,7 +3,7 @@
 
 export type PeerId = string; // UUID v4
 export type PeerType = "claude" | "codex" | "hermes" | "droid";
-export type PeerName = string; // 1-32 chars, ^[a-zA-Z0-9_-]+$
+export type PeerName = string; // Validated by shared/names.ts; UUID-shaped names are excluded.
 
 export interface Peer {
   id: PeerId;

@@ -1,13 +1,20 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   DroidAcpClient,
+  spawnDroidAcpTransport,
   type AcpLineTransport,
 } from "../shared/droid-acp-client.ts";
 
 class FakeTransport implements AcpLineTransport {
-  readonly closed = new Promise<number>(() => {});
+  private resolveClosed!: (code: number) => void;
+  readonly closed = new Promise<number>((resolve) => { this.resolveClosed = resolve; });
   readonly written: unknown[] = [];
+  closeCount = 0;
+  private outputEnded = false;
   private lines: string[] = [];
   private waiters: Array<(value: IteratorResult<string>) => void> = [];
 
@@ -21,10 +28,18 @@ class FakeTransport implements AcpLineTransport {
   }
 
   push(message: unknown): void {
-    const line = JSON.stringify(message);
+    this.pushLine(JSON.stringify(message));
+  }
+
+  pushLine(line: string): void {
     const waiter = this.waiters.shift();
     if (waiter) waiter({ value: line, done: false });
     else this.lines.push(line);
+  }
+
+  endOutput(): void {
+    this.outputEnded = true;
+    for (const waiter of this.waiters.splice(0)) waiter({ value: undefined, done: true });
   }
 
   async *readLines(): AsyncIterable<string> {
@@ -33,13 +48,18 @@ class FakeTransport implements AcpLineTransport {
         yield this.lines.shift()!;
         continue;
       }
+      if (this.outputEnded) return;
       const item = await new Promise<IteratorResult<string>>((resolve) => this.waiters.push(resolve));
       if (item.done) return;
       yield item.value;
     }
   }
 
-  close(): void {}
+  close(): void {
+    this.closeCount++;
+    this.endOutput();
+    this.resolveClosed(1);
+  }
 }
 
 function responseFor(message: any, result: unknown): unknown {
@@ -153,3 +173,100 @@ test("ACP client rejects a non-v1 handshake and missing resume capability", asyn
     capabilities: init.agentCapabilities,
   })).rejects.toThrow("does not advertise ACP session/resume");
 });
+
+test("malformed ACP stdout while idle closes the transport and prevents future prompts", async () => {
+  const transport = new FakeTransport((message, fake) => fake.push(responseFor(message, {
+    protocolVersion: 1, agentCapabilities: {},
+  })));
+  const client = new DroidAcpClient(transport);
+  await client.initialize();
+  transport.pushLine("unexpected stdout banner");
+  expect(await client.closed).toBe(1);
+  expect(transport.closeCount).toBe(1);
+  await expect(client.prompt("session", "wake")).rejects.toThrow("non-JSON ACP stdout");
+  expect(transport.written).toHaveLength(1);
+});
+
+test("terminal ACP reader failure rejects an unbounded in-flight prompt and closes the transport", async () => {
+  const transport = new FakeTransport((message, fake) => {
+    if (message.method === "initialize") fake.push(responseFor(message, {
+      protocolVersion: 1, agentCapabilities: {},
+    }));
+  });
+  const client = new DroidAcpClient(transport);
+  await client.initialize();
+  const prompt = client.prompt("session", "wake");
+  const outcome = prompt.then(() => null, (error: Error) => error);
+  transport.pushLine("{");
+  expect((await outcome)?.message).toContain("non-JSON ACP stdout");
+  await client.closed;
+  expect(client.isBusy).toBe(false);
+  expect(transport.closeCount).toBe(1);
+});
+
+test("ACP stdout EOF retires an otherwise idle transport", async () => {
+  const transport = new FakeTransport((message, fake) => fake.push(responseFor(message, {
+    protocolVersion: 1, agentCapabilities: {},
+  })));
+  const client = new DroidAcpClient(transport);
+  await client.initialize();
+  transport.endOutput();
+  await client.closed;
+  expect(transport.closeCount).toBe(1);
+  await expect(client.prompt("session", "wake")).rejects.toThrow("ACP stdout closed");
+});
+
+test("transport close kills a real SIGTERM-ignoring child and repeated close preserves the deadline", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "droid-acp-shutdown-"));
+  const command = join(dir, "droid-fixture");
+  writeFileSync(command, `#!${process.execPath}
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+process.stderr.write(String(process.pid) + "\\n");
+`, { mode: 0o700 });
+  let ready!: (pid: number) => void;
+  const started = new Promise<number>((resolve) => { ready = resolve; });
+  const transport = spawnDroidAcpTransport({
+    cwd: dir,
+    droidCommand: command,
+    shutdownGraceMs: 50,
+    onStderr: (chunk) => ready(Number(chunk.trim())),
+  });
+  let startupTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const pid = await Promise.race([
+      started,
+      new Promise<never>((_, reject) => {
+        startupTimer = setTimeout(() => reject(new Error("test child did not become ready")), 2_000);
+      }),
+    ]);
+    clearTimeout(startupTimer);
+    expect(Number.isInteger(pid)).toBe(true);
+    transport.close();
+    transport.close();
+    expect(await transport.closed).toBe(1);
+    // `closed` must mean the process actually exited, not merely that a signal
+    // was sent. Otherwise launcher process.exit can strand the Droid child.
+    expect(() => process.kill(pid, 0)).toThrow();
+    transport.close();
+    await expect(transport.writeLine("{}")).rejects.toThrow();
+  } finally {
+    clearTimeout(startupTimer);
+    transport.close();
+    await transport.closed;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 5_000);
+
+test("failed child spawn deterministically settles closed and rejects ACP initialization", async () => {
+  const transport = spawnDroidAcpTransport({
+    cwd: tmpdir(),
+    droidCommand: `/missing-droid-command-${process.pid}`,
+  });
+  const client = new DroidAcpClient(transport);
+  const rejected = expect(client.initialize()).rejects.toThrow();
+  expect(await client.closed).toBe(1);
+  await rejected;
+  client.close();
+  client.close();
+}, 5_000);

@@ -24,7 +24,7 @@ test("generateName varies across calls", () => {
 
 test("isValidName rejects empty, too long, bad chars, and UUID-shaped", () => {
   expect(isValidName("")).toBe(false);
-  expect(isValidName("a".repeat(33))).toBe(false);
+  expect(isValidName("a".repeat(NAME_MAX_LEN + 1))).toBe(false);
   expect(isValidName("has space")).toBe(false);
   expect(isValidName("has/slash")).toBe(false);
   expect(isValidName("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")).toBe(false);
@@ -55,16 +55,15 @@ test("appendSuffixWithinLimit appends when there is room", () => {
 });
 
 test("appendSuffixWithinLimit trims the base (never the suffix) to fit NAME_MAX_LEN", () => {
-  const base = "abcdefghijklmnopqrstuvwxyz-codex"; // exactly 32 chars
+  const base = "a".repeat(NAME_MAX_LEN - 6) + "-codex";
   const out = appendSuffixWithinLimit(base, "otter");
   expect(out.length).toBeLessThanOrEqual(NAME_MAX_LEN);
   expect(out.endsWith("-otter")).toBe(true);
 });
 
 test("appendSuffixWithinLimit removes a dangling dash left by trimming", () => {
-  // base[29] is '-', word "x": allowed = 32-1-1 = 30, slice(0,30) ends in '-'
-  const base = "a".repeat(29) + "-aa"; // length 32, dash at index 29
-  expect(appendSuffixWithinLimit(base, "x")).toBe("a".repeat(29) + "-x");
+  const base = "a".repeat(NAME_MAX_LEN - 3) + "-aa";
+  expect(appendSuffixWithinLimit(base, "x")).toBe("a".repeat(NAME_MAX_LEN - 3) + "-x");
   expect(appendSuffixWithinLimit(base, "x")).not.toContain("--");
 });
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // Start a managed Factory Droid ACP session that agent-peers can wake.
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 export {};
 const argv = process.argv.slice(2);
 const USAGE = "droidpeer start [peer-name] [cwd] [options] | droidpeer resume <session-id> [peer-name] [cwd] [options]";
@@ -19,7 +19,7 @@ if (argv.includes("--help") || argv.includes("-h")) {
   console.log("  --model ID                 ACP session model (env: DROID_PEER_MODEL)");
   console.log("  --reasoning-effort LEVEL   ACP reasoning effort (env: DROID_PEER_REASONING_EFFORT)");
   console.log("  --autonomy-level LEVEL     low|medium|high or ACP value (env: DROID_PEER_AUTONOMY_LEVEL)");
-  console.log("  --name NAME                Broker peer name");
+  console.log("  --name NAME                Override AGENTS.md persona-repo-droid default");
   console.log("  --cwd, -C DIR              Working directory (default: current directory)");
   console.log("  --droid PATH               Droid executable (default: PATH lookup)");
   console.log("  --poll-ms MS               Inbox metadata poll interval (default: 1000)");

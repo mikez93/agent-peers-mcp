@@ -6,7 +6,7 @@ Working context for an AI agent editing this repo. Updated against `06939e4` (20
 
 - **Stack**: Bun + TypeScript, SQLite (`bun:sqlite`), MCP SDK. No build step; sources run directly.
 - **Entry points**: `broker.ts` (daemon), `codex-server.ts` / `claude-server.ts` / `hermes-server.ts` / `droid-server.ts` (MCP servers), `cli.ts` (ops), `wake-daemon.ts` + `bin/codex-peer` (Codex wake), `wakeable-droid.ts` + `bin/droidpeer` (Droid ACP wake).
-- **Test**: `bun test` (299 tests, 39 files). **Typecheck**: `bun run typecheck`. Both must be clean before you commit.
+- **Test**: `bun test`. **Typecheck**: `bun run typecheck`. Both must be clean before you commit.
 - **Runtime state** (not in the repo): `~/.agent-peers.db`, `~/.agent-peers-secret` (0600), `~/.agent-peers-{codex,claude,hermes,droid}/`.
 
 ## Component Map
@@ -62,6 +62,10 @@ Things that have already caused real bugs here. Read before touching delivery or
 6. **`launchctl bootstrap` immediately after `bootout` fails** with "Input/output error 5".
    Wait 2-3 seconds, or just use `launchctl kickstart -k`.
 7. **Peer names are case-sensitive** (`vector` ≠ `Vector`) — bd-21r.11.
+   Defaults now include the AGENTS.md persona + repository + harness. Explicit names
+   remain overrides. Names allow 96 characters but never UUID-shaped strings; this
+   keeps name-or-ID addressing unambiguous. `Started` determines session age,
+   independently of name suffixes and heartbeat recency.
 8. **`gc-inboxes` has a 7-day mtime gate** and dry-runs by default. It announces skips; pass
    `--min-age-days 0` only for rows you have verified dead. It archives by timestamped rename
    and never deletes.

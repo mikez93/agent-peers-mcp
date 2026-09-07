@@ -64,12 +64,13 @@ import { createClient, createReadinessProbe } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
+import { defaultPeerName } from "./shared/peer-identity.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { decideWakeLaunchRole, isWakeLaunchEnv, shouldRegisterAsPeer } from "./shared/wake-launch-role.ts";
 import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
-import { isValidName } from "./shared/names.ts";
+import { isValidName, NAME_MAX_LEN } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { formatPeerList, PEER_LIST_TOOL_DESCRIPTION } from "./shared/peer-list.ts";
 import { workingSessionStartedAt } from "./shared/session-start.ts";
@@ -271,7 +272,7 @@ const TOOLS = [
   },
   {
     name: "rename_peer",
-    description: "Rename YOURSELF. 1-32 chars, [a-zA-Z0-9_-].",
+    description: `Rename YOURSELF. 1-${NAME_MAX_LEN} chars, [a-zA-Z0-9_-], not a UUID.`,
     inputSchema: {
       type: "object" as const,
       properties: { new_name: { type: "string" as const } },
@@ -737,11 +738,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       case "rename_peer": {
         const { new_name } = args as { new_name: string };
         if (!isValidName(new_name)) {
-          return { text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.`, isError: true };
+          return { text: `Invalid name: must be 1-${NAME_MAX_LEN} chars, [a-zA-Z0-9_-] only, and cannot be a UUID.`, isError: true };
         }
         const res = await client.renamePeer({ id: myId!, session_token: mySession!, new_name });
         if (!res.ok) return { text: `Rename failed: ${res.error}`, isError: true };
         myName = res.name ?? new_name;
+        if (RUNTIME_IS_DROID) {
+          await bindDroidLaunchClaim({ peerId: myId!, peerName: myName, cwd: myCwd });
+        }
         setTabTitle(`peer:${myName}`);
         return { text: `Renamed to ${myName}` };
       }
@@ -907,18 +911,21 @@ async function main() {
   // one surface may own that name; the loser keeps full tooling but registers
   // an ephemeral generated name (it may be the surface the user is talking
   // through — it must be able to SEND — it just isn't the address peers use).
-  let requestedName: string | undefined = process.env.PEER_NAME;
-  let requestDurable = !!requestedName && process.env.AGENT_PEERS_EPHEMERAL !== "1";
+  let requestedName: string | undefined = defaultPeerName(myCwd, RUNTIME_PEER_TYPE, process.env.PEER_NAME || undefined);
+  let requestDurable = !!process.env.PEER_NAME && process.env.AGENT_PEERS_EPHEMERAL !== "1";
+  const droidResumeClaim = RUNTIME_IS_DROID && process.env.AGENT_PEERS_DROID_LAUNCH_CLAIM_ID
+    ? await new DroidLaunchClaimStore().readClaim(process.env.AGENT_PEERS_DROID_LAUNCH_CLAIM_ID)
+    : null;
   let hermesClaims: HermesNameClaims | null = null;
   let hermesClaimedName: string | null = null;
-  if (RUNTIME_PEER_TYPE === "hermes" && requestedName) {
+  if (RUNTIME_PEER_TYPE === "hermes" && process.env.PEER_NAME && requestedName) {
     hermesClaims = new HermesNameClaims();
     if (await hermesClaims.tryAcquire(requestedName, process.pid)) {
       hermesClaimedName = requestedName;
       log(`hermes name-claim won: this surface owns "${requestedName}"`);
     } else {
       log(`hermes name-claim lost: "${requestedName}" is owned by another live surface; registering ephemeral`);
-      requestedName = undefined;
+      requestedName = await defaultPeerName(myCwd, RUNTIME_PEER_TYPE);
       requestDurable = false;
     }
   }
@@ -949,6 +956,7 @@ async function main() {
     summary: initialSummary,
     started_at: WORKING_SESSION_STARTED_AT,
     durable: requestDurable,
+    ...(droidResumeClaim?.previous_peer_id ? { prev_id: droidResumeClaim.previous_peer_id } : {}),
   });
   myId = reg.id;
   myName = reg.name;

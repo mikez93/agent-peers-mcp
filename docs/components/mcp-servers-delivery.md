@@ -205,7 +205,7 @@ generated name (`:897-901`); it simply never owns the address peers use.
 | `set_summary(summary)` | ✅ | ✅ | ✅ | |
 | `check_messages()` | ✅ | ✅ | ✅ | Different semantics per side — see below |
 | `wait_for_peer_messages(timeout_ms?, from?)` | ✅ | ✅ (60s cap) | ❌ | Codex/Hermes only |
-| `rename_peer(new_name)` | ✅ | ✅ | ✅ | Renames *yourself*; 1-32 chars `[a-zA-Z0-9_-]` |
+| `rename_peer(new_name)` | ✅ | ✅ | ✅ | Renames *yourself*; 1-96 chars `[a-zA-Z0-9_-]`, not a UUID |
 
 Codex/Hermes tool definitions: `codex-server.ts:192-264`. Claude: `claude-server.ts:129-181`.
 
@@ -596,7 +596,9 @@ finishes afterwards. Every failure path returns `""`.
 `getTty` tries `ps -o tty=` for this pid, then the parent's, treating `?`/`??` as no tty.
 
 **Names** (`shared/names.ts`). `isValidName` (`:77-81`) gates `rename_peer` on both servers:
-1-32 chars, `^[a-zA-Z0-9_-]+$`. `generateName`/`generateSuffixWord` are broker/CLI-side.
+1-96 chars, `^[a-zA-Z0-9_-]+$`, excluding UUID-shaped names. `shared/peer-identity.ts`
+derives persona-repository-harness defaults from AGENTS.md for all four adapters.
+`generateName`/`generateSuffixWord` are broker/CLI-side fallback/collision helpers.
 
 ---
 

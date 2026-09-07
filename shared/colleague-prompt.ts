@@ -113,5 +113,5 @@ TOOLS:
 - \`send_message(to_id, message)\` — to_id accepts UUID or human name.
 - \`set_summary(summary)\` — 1-2 sentences on your current work. Update it when focus shifts.
 - \`check_messages\` — explicit inbox poll (useful when you expect a reply).
-- \`rename_peer(new_name)\` — rename YOURSELF, 1-32 chars, [a-zA-Z0-9_-].
+- \`rename_peer(new_name)\` — rename YOURSELF, 1-96 chars, [a-zA-Z0-9_-], not a UUID.
 `;

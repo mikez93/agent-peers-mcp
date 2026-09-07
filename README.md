@@ -191,14 +191,16 @@ That's it — the MCP loads automatically and your terminal tab renames itself t
 
 ### Step 2 — Name it (optional but useful)
 
-Every session gets a random friendly name at launch (`calm-fox`, `swift-panda`). For a stable one, set `PEER_NAME` **before** launching:
+New default names include the persona declared in the repository's `AGENTS.md`, the repository, and the harness: `vector-agentic-coding-resources-codex`, `valentina-trophy-master-mind-claude`, or `marco-imekka-director-ops-droid`. If there is no unambiguous persona declaration, the default is `<repo>-<harness>`. For an explicit override, set `PEER_NAME` **before** launching:
 
 ```bash
 PEER_NAME=frontend-tab agentpeers   # Claude
 PEER_NAME=backend-work codex        # Codex
 ```
 
-Rules: 1–32 chars, `[a-zA-Z0-9_-]`, unique among live peers (currently case-SENSITIVE — see bd-21r.11). Name collision auto-suffixes (`frontend-tab` → `frontend-tab-2`); a durable name is reclaimed by a same-type re-register only after the old row is ~60s stale, so back-to-back restarts briefly suffix rather than reclaim. Mid-session rename updates the broker row only: a durable peer configured via `PEER_NAME` re-registers under its configured name on restart, so treat rename as session-scoped for durable peers.
+Rules: 1–96 chars, `[a-zA-Z0-9_-]`, excluding UUID-shaped names so names cannot be confused with peer IDs. Names remain case-sensitive. Concurrent instances receive suffixes while retaining their persona/repository prefix. `Started` records working-session age; choose the newest matching live session when asked for the latest instance, and otherwise compare current task and CWD first. Heartbeat indicates liveness only.
+
+Explicit names and existing durable profile names remain overrides; active rows are not renamed by this update. Retention remains explicit (`PEER_NAME` without `AGENT_PEERS_EPHEMERAL=1`), not a side effect of deriving a default name. A same-type peer can reclaim its name once the old row is stale or its same-host process is provably dead. Droid saves its actual allocated name and UUID, including a collision suffix or an MCP rename, for exact-session resume; other harnesses retain their existing configured-name resume behavior.
 
 ### Step 3 — Sanity check
 
@@ -355,7 +357,7 @@ This guarantee applies only to ACP-managed sessions launched with `droidpeer`. A
 |---|---|---|
 | `AGENT_PEERS_PORT` | `7900` | Broker port |
 | `AGENT_PEERS_DB` | `~/.agent-peers.db` | SQLite path |
-| `PEER_NAME` | auto-generated | Human-readable peer name at launch (1-32 chars, `[a-zA-Z0-9_-]`) |
+| `PEER_NAME` | persona-repo-harness | Explicit peer-name override (1-96 chars, `[a-zA-Z0-9_-]`, not a UUID) |
 | `OPENAI_API_KEY` | — | API key used only when `AGENT_PEERS_AUTO_SUMMARY=1` |
 | `AGENT_PEERS_AUTO_SUMMARY` | `0` | Set to `1` to opt in to `gpt-5.4-nano` summaries. Only branch, file count/extensions, and presence of a Git root are sent; paths and filenames are excluded. |
 | `AGENT_PEERS_DISABLE_TAB_TITLE` | — | Set to `1` to skip terminal tab title writing |

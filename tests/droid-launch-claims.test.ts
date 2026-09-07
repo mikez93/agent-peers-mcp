@@ -1,9 +1,9 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DroidLaunchClaimStore } from "../shared/droid-launch-claims.ts";
+import { DroidLaunchClaimStore, selectDroidClaim } from "../shared/droid-launch-claims.ts";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -102,3 +102,112 @@ test("waitForBinding observes the exact claim and removeClaim is idempotent", as
   await fixture.store.removeClaim(claim.claim_id);
   expect(await fixture.store.readClaim(claim.claim_id)).toBeNull();
 });
+
+test("live broker MCP claim wins over newer crash residue in either directory order", async () => {
+  const { store: claims } = await store();
+  const live = await claims.createClaim({ cwd: "/repo", launcherPid: 101 });
+  await claims.setSessionId(live.claim_id, "session-live");
+  const bound = await claims.bindClaim(live.claim_id, { peerId: "peer", peerName: "droid", mcpPid: 102, cwd: "/repo" });
+  const stale = { ...bound, claim_id: "stale", launcher_pid: 201, mcp_pid: 202, updated_at: "2999-01-01" };
+  const isAlive = (pid: number) => pid === 101 || pid === 102;
+  for (const ordered of [[stale, bound], [bound, stale]]) {
+    expect(selectDroidClaim(ordered, { id: "peer", pid: 102 }, isAlive)?.claim_id).toBe(live.claim_id);
+  }
+});
+
+test("rename and broker re-registration update saved actual resume identity", async () => {
+  const { store: claims } = await store();
+  const claim = await claims.createClaim({ cwd: "/repo", requestedPeerName: "base" });
+  await claims.bindClaim(claim.claim_id, { peerId: "old", peerName: "base-2", mcpPid: process.pid, cwd: "/repo" });
+  await claims.setSessionId(claim.claim_id, "session");
+  await claims.bindClaim(claim.claim_id, { peerId: "new", peerName: "renamed", mcpPid: process.pid, cwd: "/repo" });
+  expect(await claims.readSession("session")).toMatchObject({ peer_id: "new", peer_name: "renamed", requested_peer_name: "base" });
+});
+
+test("launcher session finalization and MCP rebinding serialize across independent stores", async () => {
+  const { root, store: launcher } = await store();
+  const mcp = new DroidLaunchClaimStore({ rootDir: root });
+  const claim = await launcher.createClaim({ cwd: "/repo", requestedPeerName: "base" });
+  await mcp.bindClaim(claim.claim_id, {
+    peerId: "peer-old", peerName: "base", mcpPid: process.pid, cwd: "/repo",
+  });
+
+  const snapshotRead = deferred<void>();
+  const releaseSnapshot = deferred<void>();
+  const secondWriterProgress = deferred<"lock-wait" | "claim-read">();
+  const retryLock = deferred<void>();
+  const launcherRead = launcher.readClaim.bind(launcher);
+  let pauseSnapshot = true;
+  launcher.readClaim = async (id) => {
+    const snapshot = await launcherRead(id);
+    if (pauseSnapshot) {
+      pauseSnapshot = false;
+      expect(snapshot?.peer_id).toBe("peer-old");
+      snapshotRead.resolve();
+      await releaseSnapshot.promise;
+    }
+    return snapshot;
+  };
+  const mcpRead = mcp.readClaim.bind(mcp);
+  let secondWriterRead = false;
+  mcp.readClaim = async (id) => {
+    secondWriterRead = true;
+    secondWriterProgress.resolve("claim-read");
+    return mcpRead(id);
+  };
+
+  const finalizing = launcher.setSessionId(claim.claim_id, "factory-session");
+  await snapshotRead.promise;
+  // The lock retry is an observable barrier: the second store has attempted
+  // the filesystem lock while the first still holds its stale read snapshot.
+  // No timing assumption is needed to arrange or prove the interleaving.
+  const sleep = spyOn(Bun, "sleep").mockImplementation(() => {
+    secondWriterProgress.resolve("lock-wait");
+    return retryLock.promise;
+  });
+  const rebinding = mcp.bindClaim(claim.claim_id, {
+    peerId: "peer-new", peerName: "renamed", mcpPid: process.pid, cwd: "/repo",
+  });
+  try {
+    expect(await secondWriterProgress.promise).toBe("lock-wait");
+    expect(secondWriterRead).toBe(false);
+    releaseSnapshot.resolve();
+    await finalizing;
+    sleep.mockRestore();
+    retryLock.resolve();
+    await rebinding;
+    expect(await launcher.readClaim(claim.claim_id)).toMatchObject({
+      session_id: "factory-session", peer_id: "peer-new", peer_name: "renamed", status: "bound",
+    });
+    expect(await launcher.readSession("factory-session")).toMatchObject({
+      session_id: "factory-session", peer_id: "peer-new", peer_name: "renamed", requested_peer_name: "base",
+    });
+  } finally {
+    sleep.mockRestore();
+    releaseSnapshot.resolve();
+    retryLock.resolve();
+    await Promise.allSettled([finalizing, rebinding]);
+  }
+});
+
+test("binding after session finalization saves the actual allocated resume identity", async () => {
+  const { root, store: launcher } = await store();
+  const mcp = new DroidLaunchClaimStore({ rootDir: root });
+  const claim = await launcher.createClaim({ cwd: "/repo", requestedPeerName: "base" });
+  await launcher.setSessionId(claim.claim_id, "factory-session");
+  await mcp.bindClaim(claim.claim_id, {
+    peerId: "allocated-peer", peerName: "base-2", mcpPid: process.pid, cwd: "/repo",
+  });
+  expect(await launcher.readClaim(claim.claim_id)).toMatchObject({
+    session_id: "factory-session", peer_id: "allocated-peer", peer_name: "base-2", status: "bound",
+  });
+  expect(await launcher.readSession("factory-session")).toMatchObject({
+    session_id: "factory-session", peer_id: "allocated-peer", peer_name: "base-2", requested_peer_name: "base",
+  });
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((finish) => { resolve = finish; });
+  return { promise, resolve };
+}

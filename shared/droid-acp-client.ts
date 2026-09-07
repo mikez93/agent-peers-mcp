@@ -99,7 +99,7 @@ export class DroidAcpClient {
       clientInfo: {
         name: "agent-peers-droid",
         title: "Agent Peers Droid",
-        version: "0.1.0",
+        version: "0.1.1",
       },
     }) as AcpInitializeResult;
 
@@ -231,6 +231,10 @@ export class DroidAcpClient {
       this.readerFailure = error instanceof Error ? error : new Error(String(error));
       for (const pending of this.pending.values()) pending.reject(this.readerFailure);
       this.pending.clear();
+      // A broken reader cannot service another wake, even if Droid itself is
+      // still running. Terminating the transport also releases the launcher's
+      // idle wait on `closed` so it can retire its wakeability claim.
+      this.transport.close();
     }
   }
 
@@ -311,27 +315,45 @@ export function spawnDroidAcpTransport(opts: {
   droidCommand?: string;
   env?: NodeJS.ProcessEnv;
   onStderr?: (chunk: string) => void;
+  shutdownGraceMs?: number;
 }): AcpLineTransport {
   const child = spawn(opts.droidCommand ?? "droid", ["exec", "--output-format", "acp"], {
     cwd: opts.cwd,
     env: opts.env ?? process.env,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  return new ChildProcessAcpTransport(child, opts.onStderr);
+  return new ChildProcessAcpTransport(child, opts.onStderr, opts.shutdownGraceMs);
 }
 
 class ChildProcessAcpTransport implements AcpLineTransport {
   readonly closed: Promise<number>;
   private closedByClient = false;
+  private exited = false;
+  private forceKill: ReturnType<typeof setTimeout> | undefined;
+  private processError: Error | undefined;
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     onStderr?: (chunk: string) => void,
+    private readonly shutdownGraceMs = 2_000,
   ) {
     this.closed = new Promise<number>((resolve) => {
-      child.once("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
-      child.once("error", () => resolve(1));
+      const finish = (code: number) => {
+        this.exited = true;
+        if (this.forceKill) clearTimeout(this.forceKill);
+        resolve(code);
+      };
+      child.once("exit", (code, signal) => finish(code ?? (signal ? 1 : 0)));
+      child.on("error", (error) => {
+        this.processError = error;
+        // Failed spawns never emit `exit`. A kill error for an existing child
+        // is not proof that it exited; keep waiting for the real exit event.
+        if (child.pid === undefined) finish(1);
+      });
     });
+    // An EPIPE can accompany the write callback's error when Droid exits.
+    // Keep it from becoming an uncaught EventEmitter error.
+    child.stdin.on("error", (error) => { this.processError = error; });
     if (onStderr) {
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (chunk: string) => onStderr(chunk));
@@ -341,7 +363,8 @@ class ChildProcessAcpTransport implements AcpLineTransport {
   }
 
   async writeLine(line: string): Promise<void> {
-    if (this.closedByClient || this.child.stdin.destroyed) throw new Error("Factory Droid ACP stdin is closed");
+    if (this.processError) throw this.processError;
+    if (this.closedByClient || this.exited || this.child.stdin.destroyed) throw new Error("Factory Droid ACP stdin is closed");
     await new Promise<void>((resolve, reject) => {
       this.child.stdin.write(`${line}\n`, (error) => error ? reject(error) : resolve());
     });
@@ -356,12 +379,11 @@ class ChildProcessAcpTransport implements AcpLineTransport {
     if (this.closedByClient) return;
     this.closedByClient = true;
     this.child.stdin.end();
-    if (this.child.exitCode === null) {
+    if (!this.exited && this.child.pid !== undefined) {
       this.child.kill("SIGTERM");
-      const forceKill = setTimeout(() => {
-        if (this.child.exitCode === null) this.child.kill("SIGKILL");
-      }, 2_000);
-      forceKill.unref();
+      this.forceKill = setTimeout(() => {
+        if (!this.exited) this.child.kill("SIGKILL");
+      }, this.shutdownGraceMs);
     }
   }
 }

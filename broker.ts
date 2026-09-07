@@ -15,7 +15,7 @@ import type {
   LeasedMessage, AckMessagesRequest, AckMessagesResponse,
   RenamePeerRequest, RenamePeerResponse,
 } from "./shared/types.ts";
-import { generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
+import { appendSuffixWithinLimit, generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
@@ -486,8 +486,7 @@ function* nameCandidates(requested: string | undefined): Generator<string> {
   if (requested && isValidName(requested)) {
     yield requested;
     for (let i = 2; i <= 99; i++) {
-      const candidate = `${requested}-${i}`;
-      if (candidate.length <= NAME_MAX_LEN) yield candidate;
+      yield appendSuffixWithinLimit(requested, String(i));
     }
   }
   for (let i = 0; i < 100; i++) yield generateName();

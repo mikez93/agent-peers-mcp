@@ -36,7 +36,7 @@ Simple zsh aliases installed on Mike's machine:
 Usage:
   codex-peer
       Start wakeable Codex in the current directory.
-      Auto-names the peer from the repo, like ccr-website-codex. If another
+      Auto-names the peer from AGENTS.md and the repo, like vector-agentic-coding-resources-codex. If another
       LIVE peer in the same repo already holds that name, this one gets a
       memorable funny suffix instead of a positional -2 (e.g.
       ccr-website-codex-otter), so multiple instances in one repo are each
@@ -134,41 +134,9 @@ canonical_dir() {
   (cd "$dir" && pwd -P)
 }
 
-repo_root_or_dir() {
-  local dir="$1"
-  git -C "$dir" rev-parse --show-toplevel 2>/dev/null || canonical_dir "$dir"
-}
-
-sanitize_peer_segment() {
-  printf '%s' "$1" \
-    | tr '[:upper:]' '[:lower:]' \
-    | sed -E 's/[^a-z0-9_-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
-}
-
 auto_peer_name() {
   local repo_path="$1"
-  local repo_root repo_root_canon google_canon ccr_canon base clean max_base
-  repo_root="$(repo_root_or_dir "$repo_path")"
-  repo_root_canon="$(canonical_dir "$repo_root")"
-  google_canon="$(canonical_dir "$GOOGLE_ADS_REPO" 2>/dev/null || printf '%s' "$GOOGLE_ADS_REPO")"
-  ccr_canon="$(canonical_dir "$CCR_WEBSITE_REPO" 2>/dev/null || printf '%s' "$CCR_WEBSITE_REPO")"
-
-  case "$repo_root_canon" in
-    "$google_canon") printf 'google-ads-codex\n'; return ;;
-    "$ccr_canon") printf 'ccr-codex\n'; return ;;
-  esac
-
-  base="$(basename "$repo_root_canon")"
-  clean="$(sanitize_peer_segment "$base")"
-  [ -n "$clean" ] || clean="repo"
-
-  max_base=26
-  if [ "${#clean}" -gt "$max_base" ]; then
-    clean="${clean:0:$max_base}"
-    clean="$(printf '%s' "$clean" | sed -E 's/-+$//')"
-    [ -n "$clean" ] || clean="repo"
-  fi
-  printf '%s-codex\n' "$clean"
+  run_bun peer-name.ts "$repo_path" codex
 }
 
 run_bun() {
