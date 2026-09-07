@@ -232,6 +232,68 @@ test("initDb self-heals NULL session_token rows from a crashed partial migration
   }
 });
 
+test("nullable-token normalization preserves a durable Droid row and current peer columns", () => {
+  TEST_DB = `/tmp/agent-peers-migration-nullable-droid-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  const setup = new Database(TEST_DB);
+  setup.exec("PRAGMA journal_mode = WAL;");
+  setup.exec(`
+    CREATE TABLE peers (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      peer_type TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes', 'droid')),
+      pid INTEGER,
+      cwd TEXT,
+      git_root TEXT,
+      tty TEXT,
+      summary TEXT DEFAULT '',
+      session_token TEXT,
+      registered_at TEXT NOT NULL,
+      started_at TEXT,
+      last_seen TEXT NOT NULL,
+      durable INTEGER NOT NULL DEFAULT 0,
+      host TEXT
+    );
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_id TEXT NOT NULL,
+      to_id TEXT NOT NULL,
+      text TEXT NOT NULL,
+      sent_at TEXT NOT NULL,
+      acked INTEGER NOT NULL DEFAULT 0,
+      lease_token TEXT,
+      lease_expires_at TEXT,
+      message_uid TEXT
+    );
+  `);
+  const ts = "2026-09-07T12:00:00.000Z";
+  setup.query(`
+    INSERT INTO peers
+      (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token,
+       registered_at, started_at, last_seen, durable, host)
+    VALUES (?, ?, 'droid', ?, ?, ?, NULL, ?, NULL, ?, ?, ?, 1, ?)
+  `).run("droid-null", "durable-droid", 123, "/repo", "/repo", "preserve", ts, ts, ts, "studio.example");
+  setup.close();
+
+  const db = initDb(TEST_DB);
+  try {
+    expect(db.query<Record<string, string | number | null>, []>(
+      "SELECT * FROM peers WHERE id = 'droid-null'"
+    ).get()).toMatchObject({
+      name: "durable-droid",
+      peer_type: "droid",
+      cwd: "/repo",
+      summary: "preserve",
+      durable: 1,
+      host: "studio.example",
+    });
+    expect(db.query<{ session_token: string }, []>(
+      "SELECT session_token FROM peers WHERE id = 'droid-null'"
+    ).get()?.session_token).toMatch(/^[a-f0-9-]{36}$/);
+  } finally {
+    db.close();
+  }
+});
+
 test("initDb expands an existing peer_type constraint to Hermes without dropping peers", () => {
   TEST_DB = `/tmp/agent-peers-migration-hermes-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
   const setup = new Database(TEST_DB);
@@ -277,5 +339,111 @@ test("initDb expands an existing peer_type constraint to Hermes without dropping
       .toBe("hermes");
   } finally {
     db.close();
+  }
+});
+
+test("initDb expands the current peer_type constraint to Droid without losing broker state", () => {
+  TEST_DB = `/tmp/agent-peers-migration-droid-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  const setup = new Database(TEST_DB);
+  setup.exec("PRAGMA journal_mode = WAL;");
+  setup.exec(`
+    CREATE TABLE peers (
+      id            TEXT PRIMARY KEY,
+      name          TEXT NOT NULL UNIQUE,
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes')),
+      pid           INTEGER,
+      cwd           TEXT,
+      git_root      TEXT,
+      tty           TEXT,
+      summary       TEXT DEFAULT '',
+      session_token TEXT NOT NULL,
+      registered_at TEXT NOT NULL,
+      started_at    TEXT,
+      last_seen     TEXT NOT NULL,
+      durable       INTEGER NOT NULL DEFAULT 0,
+      host          TEXT
+    );
+    CREATE TABLE messages (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_id           TEXT NOT NULL,
+      to_id             TEXT NOT NULL,
+      text              TEXT NOT NULL,
+      sent_at           TEXT NOT NULL,
+      acked             INTEGER NOT NULL DEFAULT 0,
+      lease_token       TEXT,
+      lease_expires_at  TEXT,
+      message_uid       TEXT
+    );
+  `);
+  const registeredAt = "2026-08-01T01:02:03.000Z";
+  const startedAt = "2026-07-31T23:59:58.000Z";
+  const lastSeen = "2026-08-01T01:03:04.000Z";
+  setup.query(
+    `INSERT INTO peers
+       (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token,
+        registered_at, started_at, last_seen, durable, host)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "current-hermes-id", "current-hermes", "hermes", 8123, "/current",
+    "/repo", "/dev/ttys001", "preserve me", "current-secret-token",
+    registeredAt, startedAt, lastSeen, 1, "studio.example",
+  );
+  setup.query(
+    `INSERT INTO messages
+       (from_id, to_id, text, sent_at, acked, lease_token, lease_expires_at, message_uid)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "sender-id", "current-hermes-id", "queued before droid migration", registeredAt,
+    0, "existing-lease", lastSeen, "existing-message-uid",
+  );
+  setup.close();
+
+  const db = initDb(TEST_DB);
+  db.close();
+
+  // A second initialization proves the constraint migration is idempotent.
+  const reopened = initDb(TEST_DB);
+  try {
+    const peer = reopened.query<Record<string, string | number | null>, []>(
+      "SELECT * FROM peers WHERE id = 'current-hermes-id'"
+    ).get();
+    expect(peer).toMatchObject({
+      id: "current-hermes-id",
+      name: "current-hermes",
+      peer_type: "hermes",
+      pid: 8123,
+      cwd: "/current",
+      git_root: "/repo",
+      tty: "/dev/ttys001",
+      summary: "preserve me",
+      session_token: "current-secret-token",
+      registered_at: registeredAt,
+      started_at: startedAt,
+      last_seen: lastSeen,
+      durable: 1,
+      host: "studio.example",
+    });
+    expect(reopened.query<{ text: string; message_uid: string }, []>(
+      "SELECT text, message_uid FROM messages WHERE to_id = 'current-hermes-id'"
+    ).get()).toEqual({
+      text: "queued before droid migration",
+      message_uid: "existing-message-uid",
+    });
+
+    const droid = registerPeer(reopened, {
+      name: "droid-first",
+      peer_type: "droid",
+      pid: 9001,
+      cwd: "/current",
+      git_root: "/repo",
+      tty: null,
+      summary: "",
+      durable: true,
+    });
+    expect(reopened.query<{ peer_type: string }, [string]>(
+      "SELECT peer_type FROM peers WHERE id = ?"
+    ).get(droid.id)?.peer_type).toBe("droid");
+  } finally {
+    reopened.close();
   }
 });

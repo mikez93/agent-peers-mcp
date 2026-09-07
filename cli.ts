@@ -8,6 +8,7 @@ import { readSharedSecret } from "./shared/shared-secret.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore } from "./shared/wake-launch-claims.ts";
 import { CodexAppServerWsClient, formatThreadStatus } from "./shared/app-server-client.ts";
+import { DroidLaunchClaimStore, type BoundDroidLaunchClaim } from "./shared/droid-launch-claims.ts";
 import type { Peer } from "./shared/types.ts";
 import { peerStartedAt, sortPeersNewestFirst } from "./shared/peer-list.ts";
 
@@ -44,7 +45,9 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 // peers, send, set-summary) require the secret. Direct-SQLite commands
 // (rename, messages, orphaned-messages) and `kill-broker` don't — those are
 // gated by OS file permissions on the DB + secret files.
-const sharedSecret = readSharedSecret();
+const sharedSecret = readSharedSecret(
+  process.env.AGENT_PEERS_SECRET_PATH ?? undefined,
+);
 const client = createClient(BROKER_URL, sharedSecret ?? "");
 
 interface PeerAuthRow {
@@ -75,15 +78,15 @@ async function readPeerAuth(target: string): Promise<PeerAuthRow | null> {
   }
 }
 
-async function readUnreadCountsByPeer(): Promise<Map<string, number>> {
+async function readUnreadCountsByPeer(rootDir?: string): Promise<Map<string, number>> {
   const { readdir, readFile } = await import("node:fs/promises");
   const { homedir } = await import("node:os");
   const { join } = await import("node:path");
-  const rootDir = process.env.AGENT_PEERS_CODEX_STATE_DIR ?? join(homedir(), ".agent-peers-codex");
+  const inboxRoot = rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? join(homedir(), ".agent-peers-codex");
   const counts = new Map<string, number>();
   let files: string[];
   try {
-    files = await readdir(rootDir);
+    files = await readdir(inboxRoot);
   } catch {
     return counts;
   }
@@ -91,7 +94,7 @@ async function readUnreadCountsByPeer(): Promise<Map<string, number>> {
   for (const file of files) {
     if (!file.endsWith(".metadata.json")) continue;
     try {
-      const raw = await readFile(join(rootDir, file), "utf8");
+      const raw = await readFile(join(inboxRoot, file), "utf8");
       const parsed = JSON.parse(raw) as { unread?: unknown[] };
       const peerId = decodeURIComponent(file.slice(0, -".metadata.json".length));
       counts.set(peerId, Array.isArray(parsed.unread) ? parsed.unread.length : 0);
@@ -305,6 +308,7 @@ async function cmdWakeStatus() {
     scope: "machine", cwd: process.cwd(), git_root: null,
   });
   const codexPeers = peers.filter((peer) => peer.peer_type === "codex");
+  const droidPeers = peers.filter((peer) => peer.peer_type === "droid");
 
   const registry = new WakeRegistry();
   await registry.init();
@@ -312,10 +316,15 @@ async function cmdWakeStatus() {
   const registryByPeerId = new Map(registryEntries.map((entry) => [entry.peer_id, entry]));
   const unreadCounts = await readUnreadCountsByPeer();
 
-  if (codexPeers.length === 0 && registryEntries.length === 0) {
-    console.log("wakeable codex: no live Codex peers or wake registry entries");
-    return;
-  }
+  const { homedir } = await import("node:os");
+  const { join } = await import("node:path");
+  const droidRoot = process.env.AGENT_PEERS_DROID_STATE_DIR ?? join(homedir(), ".agent-peers-droid");
+  const droidClaims = await new DroidLaunchClaimStore({ rootDir: droidRoot }).listClaims();
+  const boundDroidClaims = droidClaims.filter((claim): claim is BoundDroidLaunchClaim =>
+    claim.status === "bound" && !!claim.peer_id && !!claim.peer_name && !!claim.mcp_pid
+  );
+  const droidClaimByPeer = new Map(boundDroidClaims.map((claim) => [claim.peer_id, claim]));
+  const droidUnreadCounts = await readUnreadCountsByPeer(droidRoot);
 
   const rows = codexPeers.sort(comparePeers).map((peer) => ({
     peer,
@@ -378,6 +387,47 @@ async function cmdWakeStatus() {
     console.log("tip: run codex-peer repair-wake <name-or-id> for any live Codex peer that should be wakeable.");
     console.log("     run codex-peer retire <name-or-id> to remove stale/confusing names from discovery.");
   }
+
+
+  console.log("");
+  console.log("Wakeable Factory Droid sessions:");
+  if (droidPeers.length === 0 && boundDroidClaims.length === 0) {
+    console.log("  (none)");
+  } else {
+    for (const peer of droidPeers.sort(comparePeers)) {
+      const claim = droidClaimByPeer.get(peer.id);
+      printDroidWakePeer(peer, claim, droidUnreadCounts.get(peer.id) ?? 0, "registered");
+    }
+    const liveDroidIds = new Set(droidPeers.map((peer) => peer.id));
+    for (const claim of boundDroidClaims.filter((item) => !liveDroidIds.has(item.peer_id))) {
+      printDroidWakePeer(undefined, claim, droidUnreadCounts.get(claim.peer_id) ?? 0, "missing");
+    }
+  }
+}
+
+function processIsAlive(pid: number | null | undefined): boolean {
+  if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error && "code" in error && (error as { code?: string }).code === "EPERM";
+  }
+}
+
+function printDroidWakePeer(
+  peer: Peer | undefined,
+  claim: BoundDroidLaunchClaim | undefined,
+  pending: number,
+  broker: "registered" | "missing",
+): void {
+  const launcherLive = processIsAlive(claim?.launcher_pid);
+  const mcpLive = processIsAlive(claim?.mcp_pid);
+  const wakeable = broker === "registered" && launcherLive && mcpLive ? "yes" : "no";
+  const name = peer?.name ?? claim?.peer_name ?? "unknown-droid";
+  const peerId = peer?.id ?? claim?.peer_id ?? "unknown";
+  console.log(`  ${name}  broker=${broker}  session=${launcherLive ? "live" : "dead"}  mcp=${mcpLive ? "live" : "dead"}  wakeable=${wakeable}  unread=${pending}  id=${peerId}`);
+  console.log(`    cwd=${peer?.cwd ?? claim?.cwd ?? "unknown"}  session_id=${claim?.session_id ?? "unknown"}`);
 }
 
 function printWakePeer(peer: Peer, entry: Awaited<ReturnType<WakeRegistry["list"]>>[number] | undefined, pending: number, trueStatus?: string): void {
@@ -551,7 +601,7 @@ async function cmdSuggestName(base: string) {
 }
 
 // ---- Inbox observability (2026-08-10, stranded-mail stabilization) --------
-// The on-disk inbox dirs (codex, hermes, claude) hold durable copies of
+// The on-disk inbox dirs (codex, hermes, droid, claude) hold durable copies of
 // messages keyed by peer UUID. When a peer id dies (eviction + new-UUID
 // re-register before prev_id existed), its inbox file becomes unreachable —
 // 24 messages were sitting invisible in ~/.agent-peers-hermes at the time
@@ -562,6 +612,7 @@ async function cmdSuggestName(base: string) {
 const INBOX_ROOTS: { runtime: string; env?: string; dirname: string }[] = [
   { runtime: "codex", env: "AGENT_PEERS_CODEX_STATE_DIR", dirname: ".agent-peers-codex" },
   { runtime: "hermes", env: "AGENT_PEERS_HERMES_STATE_DIR", dirname: ".agent-peers-hermes" },
+  { runtime: "droid", env: "AGENT_PEERS_DROID_STATE_DIR", dirname: ".agent-peers-droid" },
   { runtime: "claude", dirname: ".agent-peers-claude" },
 ];
 

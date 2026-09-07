@@ -1,8 +1,8 @@
 # agent-peers-mcp
 
-### Your Claude Code, Codex CLI, and Hermes Agent sessions, working as colleagues.
+### Your Claude Code, Codex CLI, Hermes Agent, and Factory Droid sessions, working as colleagues.
 
-Run Claude, Codex, or Hermes in separate terminals and they **discover each other**, **message each other**, and **take initiative**. Codex finds something Claude should know → it pings Claude. Hermes changes an interface Codex depends on → it pings Codex before the build breaks. No cloud. No API keys between them. Just localhost + a tiny SQLite broker.
+Run Claude, Codex, Hermes, or an ACP-managed Factory Droid in separate terminals and they **discover each other**, **message each other**, and **take initiative**. Codex finds something Claude should know → it pings Claude. Droid changes an interface Codex depends on → it pings Codex before the build breaks. No cloud. No API keys between them. Just localhost + a tiny SQLite broker.
 
 ```
   Terminal 1 (Claude)           Terminal 2 (Codex)           Terminal 3 (Claude)
@@ -48,6 +48,7 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 | 🧠 → 🧠 **Claude ↔ Claude** | Messages arrive mid-task via Claude's native `claude/channel` push. Instant. |
 | 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Current Codex CLI (v0.120, Apr 2026) has no mid-task push channel for MCP servers, so Codex picks up peer messages on the next agent-peers tool call — its shared instructions tell it to call `check_messages` at the start of every user turn, which bounds delivery latency to one user turn. Background poll (1s) and a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600) mean Codex never loses a message even across restart. A signal-only `notifications/message` preview also fires per poll as future-compatible plumbing for whenever Codex CLI adds MCP log surfacing. |
 | 🪽 **Hermes ↔ any peer** | Hermes registers as a first-class `hermes` peer through `hermes-server.ts`, with the same durable polling and authoritative `[PEER INBOX]` delivery used by Codex. A running Hermes conversation can load the adapter with `/reload-mcp` after configuration. |
+| 🏭 **Factory Droid ↔ any peer** | `droidpeer` runs Droid through its native ACP endpoint and registers a first-class `droid` peer. When mail arrives while Droid is idle, the ACP host starts a fresh turn with a bodyless wake prompt; Droid retrieves the real message through `check_messages`. Ordinary `droid` TUI sessions are not retroactively wakeable. |
 | 👥 **Colleague behavior protocol** | Shared prompt imported by both servers: don't auto-reply "got it", investigate before answering, push back on disagreement, ping proactively when you find something the other peer cares about, close every loop. |
 | 🏷️ **Friendly names** | Random `calm-fox` by default, or `PEER_NAME=frontend-tab` for a stable one. Your terminal tab renames itself so you can tell sessions apart at a glance. Peers can rename themselves mid-session. |
 | 🔍 **Scoped discovery** | `list_peers` with scope `machine` / `directory` / `repo`. Live peers display newest-first, but agents pause and choose by task/status fit rather than grabbing the first row. `Started` remains distinct from the liveness `Heartbeat`. |
@@ -254,7 +255,7 @@ Run these from inside the cloned `agent-peers-mcp/` directory.
 ## How it works
 
 - **Broker daemon** (`broker.ts`) runs on `localhost:7900` with SQLite at `~/.agent-peers.db`. Auto-launches on first session. DB + WAL sidecars are 0o600, per-user shared secret at `~/.agent-peers-secret` (also 0o600) authenticates peer HTTP calls.
-- **Each session** spawns an MCP server (`claude-server.ts`, `codex-server.ts`, or `hermes-server.ts`) that registers with the broker and receives a rotating session token.
+- **Each session** spawns an MCP server (`claude-server.ts`, `codex-server.ts`, `hermes-server.ts`, or `droid-server.ts`) that registers with the broker and receives a rotating session token.
 - **Claude sessions** poll the broker every 1s and push inbound messages via `notifications/claude/channel` → Claude sees the message mid-task.
 - **Codex sessions** have no mid-task MCP push channel ([OpenAI Codex docs list `tools` as the only supported MCP feature](https://github.com/openai/codex/blob/main/docs/config.md) — resources, prompts, and `notifications/message` aren't surfaced). So Codex runs a two-layer delivery pipeline plus a prompt-level nudge:
   1. **Background poll (1s)** writes each new leased message to a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600 file, 0o700 dir, fail-closed perm check on read). Crash/restart safe.
@@ -263,6 +264,7 @@ Run these from inside the cloned `agent-peers-mcp/` directory.
   4. **Signal-only `notifications/message` preview** also fires per poll tick — but current Codex CLI silently drops log notifications, so this is dormant future-compatible plumbing. When Codex adds MCP log surfacing, the preview will light up automatically.
 - **Confirm-on-next-call dedupe.** Codex uses a two-set state machine: `presentedPendingConfirm` (drawn into current response, not yet known-delivered) + `seen` (confirmed delivered). Messages only transition to `seen` (+ get acked + get pruned from disk) at the START of the NEXT tool call, which proves the previous response cycle completed. Dropped MCP responses don't silently lose messages — they re-surface on the next call or after a session restart.
 - **Shared colleague protocol.** Both servers import the same `COLLEAGUE_PROTOCOL` string from `shared/colleague-prompt.ts`, so Claude and Codex can't drift on reactive/proactive/maintenance behavior.
+- **Wakeable Droid sessions** are launched by `droidpeer`, whose long-lived ACP client owns `droid exec --output-format acp`. The MCP child persists inbound mail under `~/.agent-peers-droid`; bodyless metadata signals the ACP client only after persistence. The client never embeds peer message content in its wake prompt.
 - **Sessions gracefully restart.** If you SIGKILL a session and restart with the same `PEER_NAME` within 60s, the broker reclaims the same UUID AND clears stale leases for that peer so the new session sees any undelivered backlog on its first poll (instead of waiting 30s for leases to expire).
 
 Read the full technical spec at [`docs/superpowers/specs/2026-04-13-agent-peers-mcp-design.md`](docs/superpowers/specs/2026-04-13-agent-peers-mcp-design.md).
@@ -332,6 +334,21 @@ Full design, security model, and failure-mode notes: [`docs/wakeable-codex.md`](
 
 ---
 
+## Wakeable Factory Droid peers
+
+Factory Droid's native ACP endpoint provides the missing idle-control surface. Launching through `droidpeer` binds one ACP session to one broker peer and keeps the ACP connection alive:
+
+```bash
+droidpeer start my-droid ~/code/my-service
+droidpeer resume <factory-session-id>
+```
+
+When the durable inbox gains a message and the Droid turn is idle, the launcher sends a bodyless ACP prompt telling Droid to call `check_messages`. If a turn is already running, the wake waits until it finishes. The message body and broker acknowledgement remain governed by the normal MCP delivery state machine.
+
+This guarantee applies only to ACP-managed sessions launched with `droidpeer`. An arbitrary already-running `droid` TUI has no external session handle and cannot be made wakeable after launch. Run `peerstatus` to inspect broker, process, and wakeability state. See [`docs/wakeable-droid.md`](docs/wakeable-droid.md).
+
+---
+
 ## Environment variables
 
 | Var | Default | Purpose |
@@ -343,6 +360,7 @@ Full design, security model, and failure-mode notes: [`docs/wakeable-codex.md`](
 | `AGENT_PEERS_AUTO_SUMMARY` | `0` | Set to `1` to opt in to `gpt-5.4-nano` summaries. Only branch, file count/extensions, and presence of a Git root are sent; paths and filenames are excluded. |
 | `AGENT_PEERS_DISABLE_TAB_TITLE` | — | Set to `1` to skip terminal tab title writing |
 | `AGENT_PEERS_CODEX_STATE_DIR` | `~/.agent-peers-codex` | Codex durable inbox + wake registry/daemon state dir |
+| `AGENT_PEERS_DROID_STATE_DIR` | `~/.agent-peers-droid` | Droid durable inbox + ACP launch state dir |
 | `CODEX_PEER_DAEMON_INTERVAL` | `5` | Background wake daemon poll interval (seconds) |
 | `CODEX_PEER_DAEMON_LOG_MAX_BYTES` | `5242880` | Size at which `wake-daemon.log` is rotated (copy-truncate) |
 | `CODEX_PEER_DAEMON_LOG_KEEP` | `3` | Number of rotated wake-daemon logs to keep |

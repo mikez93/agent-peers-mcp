@@ -146,6 +146,7 @@ deadlock.
 | Codex | `[PEER INBOX]` block prepended to the next tool result (piggyback); optional `wait_for_peer_messages` (≤300s); wake daemon for idle sessions | `~/.agent-peers-codex/<uuid>.json` |
 | Claude Code | Live channel push while active, plus `check_messages` as the authoritative read (ring buffer for the last 15 min **unioned with all unread durable mail at any age**) | `~/.agent-peers-claude/<uuid>.json` |
 | Hermes | Bounded polling only, waits capped at 60s; `check_messages` canonical | `~/.agent-peers-hermes/<uuid>.json` |
+| Factory Droid | Shared durable piggyback delivery; ACP host wakes an idle managed session with a bodyless prompt | `~/.agent-peers-droid/<uuid>.json` |
 
 ---
 

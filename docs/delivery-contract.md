@@ -14,7 +14,7 @@ pretend. Every message is:
 2. **Leased** to the recipient's MCP (30s lease, re-leased on expiry).
 3. **Persisted** to the recipient's on-disk inbox *before* presentation
    (write-before-push), so a SIGKILL between lease and read loses nothing.
-4. **Acked** back to the broker only after persistence — and for Codex/Hermes,
+4. **Acked** back to the broker only after persistence — and for Codex/Hermes/Droid,
    only on the recipient's *next tool call* (confirm-on-next-call).
 
 Duplicate presentation is possible (lease expiry, crash between persist and
@@ -46,7 +46,7 @@ does anything.
   surfaces are removed only after a LATER call confirms the response landed;
   an aborted/dropped response leaves them in place for re-delivery.
 - Durable registration requires `PEER_NAME` set and
-  `AGENT_PEERS_EPHEMERAL != "1"` (the same guard applies to Codex/Hermes:
+  `AGENT_PEERS_EPHEMERAL != "1"` (the same guard applies to Codex/Hermes/Droid:
   a requested name registers durable unless `AGENT_PEERS_EPHEMERAL=1`).
 
 ### Codex CLI (`codex-server.ts`)
@@ -87,6 +87,23 @@ does anything.
   `AGENT_PEERS_ENABLED: '1'`. Kill switches: flag file
   `~/.agent-peers-hermes/disabled` (all surfaces), or
   `AGENT_PEERS_HERMES_ROLE: passive` per surface.
+
+### Factory Droid (`droid-server.ts` → shared durable transport)
+
+- A wakeable Droid is an explicitly ACP-managed session launched through
+  `droidpeer`; a native pre-existing Droid TUI is not wakeable.
+- The MCP child writes the authoritative inbox to
+  `~/.agent-peers-droid/<peer-uuid>.json`. Adjacent metadata contains only
+  sender/message identifiers and timestamps, never message text or lease tokens.
+- The long-lived ACP host watches the exact peer bound through its private launch
+  claim. When idle mail arrives, it starts a turn with a bodyless prompt directing
+  Droid to call `check_messages`. Mail arriving during a turn queues until the
+  outstanding ACP `session/prompt` completes.
+- If the same unread set remains after a completed turn, the host retries on a
+  bounded 5-minute/30-minute/2-hour schedule. New mail wakes immediately.
+- ACP turn completion does not acknowledge broker mail. The shared delivery state
+  still confirms and acks a presented message only on Droid's next agent-peers
+  tool call, preserving the universal at-least-once contract.
 
 ## Receipts and recovery
 

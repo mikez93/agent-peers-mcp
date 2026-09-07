@@ -138,7 +138,7 @@ const TOOLS = [
       type: "object" as const,
       properties: {
         scope: { type: "string" as const, enum: ["machine", "directory", "repo"] },
-        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes"], description: "optional filter" },
+        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes", "droid"], description: "optional filter" },
       },
       required: ["scope"],
     },
@@ -391,7 +391,9 @@ async function main() {
   // Now that the broker is up, read the per-user shared secret it wrote into
   // ~/.agent-peers-secret (file mode 0600) and construct an authenticated
   // HTTP client with it.
-  const sharedSecret = await waitForSharedSecret();
+  const sharedSecret = await waitForSharedSecret(
+    process.env.AGENT_PEERS_SECRET_PATH ?? undefined,
+  );
   client = createClient(BROKER_URL, sharedSecret);
 
   myCwd = process.cwd();

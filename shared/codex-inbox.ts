@@ -1,8 +1,7 @@
 // shared/codex-inbox.ts
-// Durable on-disk queue of unread peer messages for a Codex session. Lives
-// at ~/.agent-peers-codex/<peer-id>.json (overridable via
-// AGENT_PEERS_CODEX_STATE_DIR) and survives MCP process restarts within the
-// 60s reclaim window.
+// Durable on-disk queue of unread peer messages for Codex, Hermes, or Droid.
+// The runtime selects ~/.agent-peers-<runtime>/<peer-id>.json and may override
+// it with AGENT_PEERS_STATE_DIR or the runtime-specific state-dir variable.
 //
 // SECURITY INVARIANT: this file mirrors the broker's SQLite trust boundary.
 // Message bodies here are identical to rows in ~/.agent-peers.db, which the
@@ -50,7 +49,11 @@ function cloneMessages(messages: LeasedMessage[]): LeasedMessage[] {
 }
 
 function defaultRootDir(): string {
-  const runtime = process.env.AGENT_PEERS_RUNTIME === "hermes" ? "hermes" : "codex";
+  const runtime = process.env.AGENT_PEERS_RUNTIME === "hermes"
+    ? "hermes"
+    : process.env.AGENT_PEERS_RUNTIME === "droid"
+      ? "droid"
+      : "codex";
   return join(homedir(), `.agent-peers-${runtime}`);
 }
 
@@ -98,6 +101,8 @@ export class CodexInboxStore {
   }) {
     const rootDir = opts.rootDir
       ?? process.env.AGENT_PEERS_STATE_DIR
+      ?? (process.env.AGENT_PEERS_RUNTIME === "droid" ? process.env.AGENT_PEERS_DROID_STATE_DIR : undefined)
+      ?? (process.env.AGENT_PEERS_RUNTIME === "hermes" ? process.env.AGENT_PEERS_HERMES_STATE_DIR : undefined)
       ?? process.env.AGENT_PEERS_CODEX_STATE_DIR
       ?? defaultRootDir();
     const safePeerId = encodeURIComponent(opts.peerId);

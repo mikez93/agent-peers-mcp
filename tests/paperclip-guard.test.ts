@@ -76,4 +76,10 @@ describe("activation-gate ordering", () => {
       expect(block).not.toContain("client.register");
     });
   }
+
+  test("droid-server delegates to the guarded shared server", () => {
+    const src = readFileSync(join(REPO, "droid-server.ts"), "utf8");
+    expect(src).toContain('process.env.AGENT_PEERS_RUNTIME = "droid"');
+    expect(src).toContain('import("./codex-server.ts")');
+  });
 });

@@ -40,7 +40,7 @@ afterEach(() => {
 // named-but-ephemeral peer pass `durable: false`.
 function reg(opts: {
   name?: string;
-  peer_type?: "claude" | "codex" | "hermes";
+  peer_type?: "claude" | "codex" | "hermes" | "droid";
   cwd?: string;
   git_root?: string | null;
   tty?: string | null;
@@ -120,6 +120,11 @@ test("registerPeer honors explicit name if unique", () => {
 test("registerPeer accepts Hermes as a first-class peer", () => {
   const { id } = reg({ name: "hermes-tab", peer_type: "hermes" });
   expect(getPeer(db, id)?.peer_type).toBe("hermes");
+});
+
+test("registerPeer accepts Droid as a first-class peer", () => {
+  const { id } = reg({ name: "droid-tab", peer_type: "droid" });
+  expect(getPeer(db, id)?.peer_type).toBe("droid");
 });
 
 test("registerPeer canonicalizes supplied working-session start and bounds future values", () => {
@@ -376,11 +381,12 @@ test("listPeers NEVER returns session_token (critical auth regression)", () => {
 
 test("listPeers peer_type filter", () => {
   reg({});
-  const c = reg({ peer_type: "codex" });
+  reg({ peer_type: "codex" });
+  const d = reg({ peer_type: "droid" });
   const peers = listPeers(db, {
-    scope: "machine", cwd: "/any", git_root: null, peer_type: "codex",
+    scope: "machine", cwd: "/any", git_root: null, peer_type: "droid",
   });
-  expect(peers.map((p) => p.id)).toEqual([c.id]);
+  expect(peers.map((p) => p.id)).toEqual([d.id]);
 });
 
 test("listPeers orders by working-session start, not synchronized heartbeat", () => {

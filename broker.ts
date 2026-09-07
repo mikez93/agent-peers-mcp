@@ -138,7 +138,7 @@ export function initDb(path: string): Database {
     CREATE TABLE IF NOT EXISTS peers (
       id            TEXT PRIMARY KEY,
       name          TEXT NOT NULL UNIQUE,
-      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes')),
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes', 'droid')),
       pid           INTEGER,
       cwd           TEXT,
       git_root      TEXT,
@@ -176,7 +176,7 @@ export function initDb(path: string): Database {
 
   migrate_peers_add_session_token(db);
   migrate_peers_add_hermes_peer_type(db);
-  // MUST stay last among the peers migrations. Both migrations above can
+  // MUST stay after the legacy peers migrations above. Both can
   // rebuild the peers table through a shadow-table copy whose column list is
   // written out literally, so either one would silently drop `durable` if it
   // ran afterwards. Adding the column last means those rebuilds never see it.
@@ -188,6 +188,10 @@ export function initDb(path: string): Database {
   // MUST remain after every migration that can rebuild the peers table from
   // an explicit column list. Existing rows are backfilled from registered_at.
   migrate_peers_add_started_at(db);
+  // MUST remain after all column-adding peers migrations. Expanding the CHECK
+  // constraint requires a table rebuild; this final migration preserves every
+  // column in the current schema instead of resetting newer peer metadata.
+  migrate_peers_add_droid_peer_type(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -287,12 +291,16 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
   // readers/writers see either the old table or the renamed new table, never
   // an in-between state.
   const preserveStartedAt = columnExists(db, "peers", "started_at");
+  const preserveDurable = columnExists(db, "peers", "durable");
+  const preserveHost = columnExists(db, "peers", "host");
   const startedAtDefinition = preserveStartedAt ? ",\n      started_at    TEXT" : "";
+  const durableDefinition = preserveDurable ? ",\n      durable       INTEGER NOT NULL DEFAULT 0" : "";
+  const hostDefinition = preserveHost ? ",\n      host          TEXT" : "";
   db.exec(`
     CREATE TABLE peers_new (
       id            TEXT PRIMARY KEY,
       name          TEXT NOT NULL UNIQUE,
-      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes')),
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes', 'droid')),
       pid           INTEGER,
       cwd           TEXT,
       git_root      TEXT,
@@ -300,13 +308,15 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
       summary       TEXT DEFAULT '',
       session_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
-      last_seen     TEXT NOT NULL${startedAtDefinition}
+      last_seen     TEXT NOT NULL${startedAtDefinition}${durableDefinition}${hostDefinition}
     );
   `);
   const startedAtColumn = preserveStartedAt ? ", started_at" : "";
+  const durableColumn = preserveDurable ? ", durable" : "";
+  const hostColumn = preserveHost ? ", host" : "";
   db.exec(`
-    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen${startedAtColumn})
-    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen${startedAtColumn}
+    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen${startedAtColumn}${durableColumn}${hostColumn})
+    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen${startedAtColumn}${durableColumn}${hostColumn}
     FROM peers
     WHERE session_token IS NOT NULL;
   `);
@@ -417,6 +427,53 @@ function migrate_peers_add_hermes_peer_type(db: Database): void {
     rebuildPeersTableWithNotNullSessionToken(db);
     db.exec("COMMIT");
     console.error("[broker] migration: expanded peer_type constraint to include hermes");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
+  }
+}
+
+function migrate_peers_add_droid_peer_type(db: Database): void {
+  // Unlike the older Hermes rebuild, this migration runs only after durable,
+  // host, and started_at have been added. Keep the complete current row shape
+  // so upgrading the CHECK constraint cannot reset identity or routing state.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = db.query<{ sql: string | null }, []>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'peers'"
+    ).get();
+    if (!row?.sql?.includes("'droid'")) {
+      db.exec(`
+        CREATE TABLE peers_droid_new (
+          id            TEXT PRIMARY KEY,
+          name          TEXT NOT NULL UNIQUE,
+          peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes', 'droid')),
+          pid           INTEGER,
+          cwd           TEXT,
+          git_root      TEXT,
+          tty           TEXT,
+          summary       TEXT DEFAULT '',
+          session_token TEXT NOT NULL,
+          registered_at TEXT NOT NULL,
+          started_at    TEXT,
+          last_seen     TEXT NOT NULL,
+          durable       INTEGER NOT NULL DEFAULT 0,
+          host          TEXT
+        );
+        INSERT INTO peers_droid_new
+          (id, name, peer_type, pid, cwd, git_root, tty, summary,
+           session_token, registered_at, started_at, last_seen, durable, host)
+        SELECT id, name, peer_type, pid, cwd, git_root, tty, summary,
+               session_token, registered_at, started_at, last_seen, durable, host
+        FROM peers;
+        DROP TABLE peers;
+        ALTER TABLE peers_droid_new RENAME TO peers;
+        CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);
+        CREATE INDEX IF NOT EXISTS idx_peers_name ON peers(name);
+      `);
+      console.error("[broker] migration: expanded peer_type constraint to include droid");
+    }
+    db.exec("COMMIT");
   } catch (e) {
     try { db.exec("ROLLBACK"); } catch { /* best effort */ }
     throw e;
@@ -1060,7 +1117,7 @@ function isGuiApp(command: string | undefined): boolean {
 function findAgentMcpServers(table: ProcTable): number[] {
   const pids: number[] = [];
   for (const [pid, command] of table.commandOf) {
-    if (/agent-peers-mcp\/(claude|codex|hermes)-server\.ts/.test(command)) pids.push(pid);
+    if (/agent-peers-mcp\/(claude|codex|hermes|droid)-server\.ts/.test(command)) pids.push(pid);
   }
   return pids;
 }

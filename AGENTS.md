@@ -5,17 +5,18 @@ Working context for an AI agent editing this repo. Updated against `06939e4` (20
 ## Quick Reference
 
 - **Stack**: Bun + TypeScript, SQLite (`bun:sqlite`), MCP SDK. No build step; sources run directly.
-- **Entry points**: `broker.ts` (daemon), `codex-server.ts` / `claude-server.ts` / `hermes-server.ts` (MCP servers), `cli.ts` (ops), `wake-daemon.ts` + `bin/codex-peer` (Codex wake).
-- **Test**: `bun test` (245 tests, 32 files). **Typecheck**: `bun run typecheck`. Both must be clean before you commit.
-- **Runtime state** (not in the repo): `~/.agent-peers.db`, `~/.agent-peers-secret` (0600), `~/.agent-peers-{codex,claude,hermes}/`.
+- **Entry points**: `broker.ts` (daemon), `codex-server.ts` / `claude-server.ts` / `hermes-server.ts` / `droid-server.ts` (MCP servers), `cli.ts` (ops), `wake-daemon.ts` + `bin/codex-peer` (Codex wake), `wakeable-droid.ts` + `bin/droidpeer` (Droid ACP wake).
+- **Test**: `bun test` (299 tests, 39 files). **Typecheck**: `bun run typecheck`. Both must be clean before you commit.
+- **Runtime state** (not in the repo): `~/.agent-peers.db`, `~/.agent-peers-secret` (0600), `~/.agent-peers-{codex,claude,hermes,droid}/`.
 
 ## Component Map
 
 | Area | Files | Deep doc |
 | --- | --- | --- |
 | Broker daemon, HTTP API, schema | `broker.ts`, `shared/ensure-broker.ts`, `shared/shared-secret.ts` | `docs/components/broker.md` |
-| MCP servers + delivery machine | `codex-server.ts`, `claude-server.ts`, `hermes-server.ts`, `shared/delivery-state.ts`, `shared/codex-inbox.ts`, `shared/piggyback.ts`, `shared/hermes-claims.ts`, `shared/paperclip-guard.ts` | `docs/components/mcp-servers-delivery.md` |
+| MCP servers + delivery machine | `codex-server.ts`, `claude-server.ts`, `hermes-server.ts`, `droid-server.ts`, `shared/delivery-state.ts`, `shared/codex-inbox.ts`, `shared/piggyback.ts`, `shared/hermes-claims.ts`, `shared/paperclip-guard.ts` | `docs/components/mcp-servers-delivery.md` |
 | Codex idle wake | `wake-daemon.ts`, `wakeable-codex.ts`, `bin/codex-peer`, `shared/wake-*.ts`, `shared/app-server-client.ts` | `docs/components/wake-subsystem.md` |
+| Droid idle wake | `wakeable-droid.ts`, `bin/droidpeer`, `shared/droid-*.ts` | `docs/wakeable-droid.md` |
 | Operator CLI | `cli.ts` | `docs/components/cli-ops-tests.md` |
 | System design | — | `docs/ARCHITECTURE.md` |
 | **Normative delivery guarantees** | — | **`docs/delivery-contract.md`** |

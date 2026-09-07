@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // codex-server.ts
-// Durable polling MCP stdio server for Codex CLI and Hermes Agent.
-// Defaults to peer_type="codex"; hermes-server.ts selects peer_type="hermes".
+// Durable polling MCP stdio server shared by Codex CLI, Hermes Agent, and
+// Factory Droid. Runtime wrappers select their first-class peer type.
 //
 // DELIVERY PIPELINE — two layers with a strict division of labor, driven
 // by one invariant: no message is acked to the broker (nor pruned from
@@ -79,6 +79,7 @@ import { DeliveryState } from "./shared/delivery-state.ts";
 import { HermesNameClaims } from "./shared/hermes-claims.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
 import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
+import { DroidLaunchClaimStore } from "./shared/droid-launch-claims.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
 import type { PeerId, LeasedMessage, PeerType } from "./shared/types.ts";
 import { paperclipAgentMarker, paperclipRefusalMessage } from "./shared/paperclip-guard.ts";
@@ -87,9 +88,18 @@ const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.AGENT_PEERS_HEARTBEAT_MS ?? "15000", 10);
-const RUNTIME_PEER_TYPE: PeerType = process.env.AGENT_PEERS_RUNTIME === "hermes" ? "hermes" : "codex";
-const RUNTIME_DISPLAY_NAME = RUNTIME_PEER_TYPE === "hermes" ? "Hermes" : "Codex";
+const RUNTIME_PEER_TYPE: PeerType = process.env.AGENT_PEERS_RUNTIME === "hermes"
+  ? "hermes"
+  : process.env.AGENT_PEERS_RUNTIME === "droid"
+    ? "droid"
+    : "codex";
+const RUNTIME_DISPLAY_NAME = RUNTIME_PEER_TYPE === "hermes"
+  ? "Hermes"
+  : RUNTIME_PEER_TYPE === "droid"
+    ? "Factory Droid"
+    : "Codex";
 const RUNTIME_IS_CODEX = RUNTIME_PEER_TYPE === "codex";
+const RUNTIME_IS_DROID = RUNTIME_PEER_TYPE === "droid";
 // Claude/Codex MCP lifetime is the real working-session lineage. Hermes may
 // launch temporary MCP children, so it deliberately omits this value and lets
 // the broker preserve the durable peer's existing start on reclaim.
@@ -173,9 +183,9 @@ session, call \`wait_for_peer_messages\` with a bounded timeout. It keeps
 this same Codex turn alive until messages arrive or the timeout expires; it
 is not the same as waking a fully idle session.
 
-If this is a WAKEABLE Codex session (launched through the transparent
-app-server-backed Codex path — an external
-daemon starts a fresh turn the instant a peer message arrives), do NOT call
+If this is a WAKEABLE ${RUNTIME_DISPLAY_NAME} session (launched through its
+managed wakeable path — an external controller starts a fresh turn the instant
+a peer message arrives), do NOT call
 \`wait_for_peer_messages\` to await a reply: just finish your turn and go
 idle. The daemon wakes you on arrival. Blocking would only pin this turn
 "working" for minutes and make the session look hung. (As a safety net the
@@ -204,7 +214,7 @@ const TOOLS = [
       type: "object" as const,
       properties: {
         scope: { type: "string" as const, enum: ["machine", "directory", "repo"] },
-        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes"] },
+        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes", "droid"] },
       },
       required: ["scope"],
     },
@@ -239,7 +249,7 @@ const TOOLS = [
   {
     name: "wait_for_peer_messages",
     description:
-      `Stand by for incoming peer messages for up to timeout_ms, then surface them through the normal [PEER INBOX] tool-response path. This keeps this same ${RUNTIME_DISPLAY_NAME} turn alive; it is not a fully idle wake mechanism. In a wakeable Codex session this returns immediately; otherwise it performs a bounded wait.`,
+      `Stand by for incoming peer messages for up to timeout_ms, then surface them through the normal [PEER INBOX] tool-response path. This keeps this same ${RUNTIME_DISPLAY_NAME} turn alive; it is not a fully idle wake mechanism. In a wakeable session this returns immediately; otherwise it performs a bounded wait.`,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -879,7 +889,9 @@ async function main() {
 
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
   await ensureBroker(isBrokerAlive, brokerScriptUrl);
-  const sharedSecret = await waitForSharedSecret();
+  const sharedSecret = await waitForSharedSecret(
+    process.env.AGENT_PEERS_SECRET_PATH ?? undefined,
+  );
   client = createClient(BROKER_URL, sharedSecret);
 
   // Hermes profiles set AGENT_PEERS_CWD in their MCP config; without it a
@@ -951,6 +963,12 @@ async function main() {
       cwd: myCwd,
       gitRoot: myGitRoot,
       tty,
+    });
+  } else if (RUNTIME_IS_DROID) {
+    isWakeableSession = await bindDroidLaunchClaim({
+      peerId: myId,
+      peerName: myName,
+      cwd: myCwd,
     });
   }
   setTabTitle(`peer:${myName}`);
@@ -1050,6 +1068,12 @@ async function main() {
             gitRoot: myGitRoot,
             tty,
           });
+        } else if (RUNTIME_IS_DROID) {
+          isWakeableSession = await bindDroidLaunchClaim({
+            peerId: myId,
+            peerName: myName,
+            cwd: myCwd,
+          });
         }
         log(`Rejoined the network as ${myName} (id=${myId})`);
       } catch (e) {
@@ -1079,6 +1103,35 @@ async function main() {
   // Note: all signal handlers + 'exit' handler are already armed at the top
   // of main(), before any setTabTitle() call — so a terminal close during
   // startup also clears the title.
+}
+
+async function bindDroidLaunchClaim(opts: {
+  peerId: PeerId;
+  peerName: string;
+  cwd: string;
+}): Promise<boolean> {
+  const claimId = process.env.AGENT_PEERS_DROID_LAUNCH_CLAIM_ID;
+  if (!claimId) {
+    log("Droid registered without an ACP launch claim; this session is not wakeable");
+    return false;
+  }
+
+  try {
+    const rootDir = process.env.AGENT_PEERS_STATE_DIR
+      ?? process.env.AGENT_PEERS_DROID_STATE_DIR;
+    const claims = new DroidLaunchClaimStore({ rootDir });
+    await claims.bindClaim(claimId, {
+      peerId: opts.peerId,
+      peerName: opts.peerName,
+      mcpPid: process.pid,
+      cwd: opts.cwd,
+    });
+    log(`bound ACP launch claim ${claimId} to ${opts.peerName} (${opts.peerId})`);
+    return true;
+  } catch (error) {
+    log(`Droid ACP launch claim binding failed; session is not wakeable: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
 }
 
 async function registerWakeableSessionIfEnabled(opts: {
