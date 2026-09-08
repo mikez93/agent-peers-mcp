@@ -72,6 +72,17 @@ test("argument parser supports start and exact resume command forms", () => {
   expect(parseDroidLauncherArgs(["start", "--autonomy-level", "low"]).autonomyLevel).toBe("auto-low");
 });
 
+test("ordinary launcher syntax supports bare start and exact resume flags without accepting ambiguous selectors", () => {
+  expect(parseDroidLauncherArgs([])).toEqual(parseDroidLauncherArgs(["start"]));
+  expect(parseDroidLauncherArgs(["--cwd", "/tmp", "--resume", "factory-session"])).toMatchObject({ cwd: "/tmp", cwdExplicit: true, sessionId: "factory-session" });
+  expect(parseDroidLauncherArgs(["--resume=factory-session"])).toMatchObject({ sessionId: "factory-session", cwdExplicit: false });
+  expect(() => parseDroidLauncherArgs(["--resume"])).toThrow("requires a value");
+  expect(() => parseDroidLauncherArgs(["--resume="])).toThrow("requires a Factory session id");
+  expect(() => parseDroidLauncherArgs(["--resume", "one", "--resume", "two"])).toThrow("only one resume selector");
+  expect(() => parseDroidLauncherArgs(["start", "--resume", "one"])).toThrow("only one resume selector");
+  expect(() => parseDroidLauncherArgs(["--wat"])).toThrow("unknown option: --wat");
+});
+
 test("wake controller retries unchanged unread mail on bounded backoff and resets for new mail", async () => {
   let now = 1_000;
   let state: BodylessWakeState = { pendingCount: 1, lastMessageId: 42 };

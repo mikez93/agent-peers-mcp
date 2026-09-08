@@ -15,10 +15,18 @@ handle with which to start a turn.
 ## Launch and resume
 
 ```bash
+droidpeer
+droidpeer --resume <factory-session-id>
+droid-peer --resume <factory-session-id>
 droidpeer start [peer-name] [cwd]
 droidpeer start --cwd <repo-path>
 droidpeer resume <factory-session-id> [peer-name] [cwd]
 ```
+
+Bare `droidpeer` starts in the current directory. `--resume` (or `-r`) accepts
+the session ID printed by native Droid; `droid-peer` is an executable alias.
+This command hosts the wakeable ACP session and waits for peer messages. It
+does not open the native interactive Droid TUI.
 
 The launcher starts `droid exec --output-format acp`, negotiates ACP v1, and
 creates or resumes one Factory session. It injects `droid-server.ts` as a stdio

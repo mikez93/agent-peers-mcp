@@ -99,7 +99,7 @@ export class DroidAcpClient {
       clientInfo: {
         name: "agent-peers-droid",
         title: "Agent Peers Droid",
-        version: "0.1.1",
+        version: "0.1.2",
       },
     }) as AcpInitializeResult;
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 // Start a managed Factory Droid ACP session that agent-peers can wake.
 
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 export {};
 const argv = process.argv.slice(2);
-const USAGE = "droidpeer start [peer-name] [cwd] [options] | droidpeer resume <session-id> [peer-name] [cwd] [options]";
+const USAGE = "droidpeer [options] | droidpeer --resume <session-id> [options] | droidpeer start [peer-name] [cwd] [options] | droidpeer resume <session-id> [peer-name] [cwd] [options]";
 
 if (argv.length === 1 && ["-v", "-V", "--version"].includes(argv[0]!)) {
   console.log(VERSION);
@@ -15,7 +15,10 @@ if (argv.includes("--help") || argv.includes("-h")) {
   console.log("bin: ~/.local/bin/droidpeer");
   console.log("description: Start or resume a wakeable Factory Droid peer over ACP.");
   console.log(`usage: ${USAGE}`);
+  console.log("default: start a wakeable ACP host in the current directory; this does not open the native Droid TUI.");
+  console.log("alias: droid-peer accepts the same arguments.");
   console.log("options:");
+  console.log("  --resume, -r SESSION_ID    Resume an exact Factory session (also: resume SESSION_ID)");
   console.log("  --model ID                 ACP session model (env: DROID_PEER_MODEL)");
   console.log("  --reasoning-effort LEVEL   ACP reasoning effort (env: DROID_PEER_REASONING_EFFORT)");
   console.log("  --autonomy-level LEVEL     low|medium|high or ACP value (env: DROID_PEER_AUTONOMY_LEVEL)");
@@ -24,7 +27,9 @@ if (argv.includes("--help") || argv.includes("-h")) {
   console.log("  --droid PATH               Droid executable (default: PATH lookup)");
   console.log("  --poll-ms MS               Inbox metadata poll interval (default: 1000)");
   console.log("  --claim-timeout-ms MS      MCP binding deadline (default: 15000)");
-  console.log("examples[2]:");
+  console.log("examples[4]:");
+  console.log("  - droidpeer");
+  console.log("  - droidpeer --resume <session-id>");
   console.log("  - droidpeer start reviewer ~/code/service");
   console.log("  - droidpeer resume <session-id> reviewer ~/code/service");
   process.exit(0);

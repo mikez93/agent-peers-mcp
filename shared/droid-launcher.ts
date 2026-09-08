@@ -77,8 +77,9 @@ export function parseDroidLauncherArgs(argv: string[]): DroidLauncherOptions {
     cwdExplicit: false,
   };
   const command = args[0];
-  if (command === "start") {
-    args.shift();
+  const implicitStart = command === undefined || command.startsWith("-");
+  if (command === "start" || implicitStart) {
+    if (!implicitStart) args.shift();
     if (args[0] && !args[0].startsWith("-")) opts.peerName = args.shift();
     if (args[0] && !args[0].startsWith("-")) {
       opts.cwd = args.shift()!;
@@ -104,6 +105,15 @@ export function parseDroidLauncherArgs(argv: string[]): DroidLauncherOptions {
       opts.cwdExplicit = true;
     }
     else if (arg === "--name") opts.peerName = requireValue(args, ++i, arg);
+    else if (arg === "--resume" || arg === "-r" || arg.startsWith("--resume=")) {
+      if (!implicitStart || opts.sessionId) {
+        throw new DroidLauncherUsageError("use only one resume selector; do not combine --resume with start or resume");
+      }
+      opts.sessionId = arg.startsWith("--resume=")
+        ? arg.slice("--resume=".length)
+        : requireValue(args, ++i, arg);
+      if (!opts.sessionId) throw new DroidLauncherUsageError("--resume requires a Factory session id");
+    }
     else if (arg === "--session-id") {
       throw new DroidLauncherUsageError("--session-id is not accepted; use the resume command");
     }
