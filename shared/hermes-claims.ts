@@ -50,7 +50,7 @@ function isProcessAlive(pid: number | null | undefined): boolean {
  *  vouches for the lock if its process STARTED BEFORE the lock was acquired
  *  (2s tolerance — ps lstart has 1s precision). If `ps` can't answer (EPERM'd
  *  zombie, race), fall back to pid-liveness alone — the conservative side. */
-function ownerStillHoldsClaim(pid: number | null | undefined, acquiredAt: string | undefined): boolean {
+export function ownerStillHoldsClaim(pid: number | null | undefined, acquiredAt: string | undefined): boolean {
   if (!isProcessAlive(pid)) return false;
   if (!acquiredAt) return true;
   const acquired = Date.parse(acquiredAt);

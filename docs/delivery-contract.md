@@ -90,18 +90,21 @@ does anything.
 
 ### Factory Droid (`droid-server.ts` → shared durable transport)
 
-- A wakeable Droid is an explicitly ACP-managed session launched through
-  `droidpeer`; a native pre-existing Droid TUI is not wakeable.
+- A wakeable Droid is a managed session launched through `droidpeer`: native
+  terminal chat by default, ACP with `--headless` or redirected IO. A pre-existing
+  unmanaged Droid TUI is not wakeable.
 - The MCP child writes the authoritative inbox to
   `~/.agent-peers-droid/<peer-uuid>.json`. Adjacent metadata contains only
   sender/message identifiers and timestamps, never message text or lease tokens.
-- The long-lived ACP host watches the exact peer bound through its private launch
+- The long-lived host watches the exact peer bound through its private launch
   claim. When idle mail arrives, it starts a turn with a bodyless prompt directing
   Droid to call `check_messages`. Mail arriving during a turn queues until the
-  outstanding ACP `session/prompt` completes.
+  outstanding turn completes. Native queued human input also defers wake.
 - If the same unread set remains after a completed turn, the host retries on a
   bounded 5-minute/30-minute/2-hour schedule. New mail wakes immediately.
-- ACP turn completion does not acknowledge broker mail. The shared delivery state
+- Canceling a native peer turn suppresses retries for unchanged unread mail;
+  it does not acknowledge mail. Native permissions remain under user control.
+- Turn completion does not acknowledge broker mail. The shared delivery state
   still confirms and acks a presented message only on Droid's next agent-peers
   tool call, preserving the universal at-least-once contract.
 

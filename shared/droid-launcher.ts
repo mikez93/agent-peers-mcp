@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultPeerName } from "./peer-identity.ts";
 import { isValidName, NAME_MAX_LEN } from "./names.ts";
+import { acquireDroidSession } from "./droid-session-owner.ts";
 
 import {
   DroidAcpClient,
@@ -22,6 +23,8 @@ const IS_POSIX = platform() !== "win32";
 const FILE_MODE = 0o600;
 
 export interface DroidLauncherOptions {
+  headless?: boolean;
+  settingsExplicit?: boolean;
   cwd: string;
   /** False only when the CLI supplied no cwd for a resume operation. */
   cwdExplicit?: boolean;
@@ -100,7 +103,8 @@ export function parseDroidLauncherArgs(argv: string[]): DroidLauncherOptions {
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i]!;
-    if (arg === "--cwd" || arg === "-C") {
+    if (arg === "--headless") opts.headless = true;
+    else if (arg === "--cwd" || arg === "-C") {
       opts.cwd = requireValue(args, ++i, arg);
       opts.cwdExplicit = true;
     }
@@ -118,9 +122,9 @@ export function parseDroidLauncherArgs(argv: string[]): DroidLauncherOptions {
       throw new DroidLauncherUsageError("--session-id is not accepted; use the resume command");
     }
     else if (arg === "--droid") opts.droidCommand = requireValue(args, ++i, arg);
-    else if (arg === "--model") opts.model = requireValue(args, ++i, arg);
-    else if (arg === "--reasoning-effort") opts.reasoningEffort = requireValue(args, ++i, arg);
-    else if (arg === "--autonomy-level") opts.autonomyLevel = requireValue(args, ++i, arg);
+    else if (arg === "--model") { opts.model = requireValue(args, ++i, arg); opts.settingsExplicit = true; }
+    else if (arg === "--reasoning-effort") { opts.reasoningEffort = requireValue(args, ++i, arg); opts.settingsExplicit = true; }
+    else if (arg === "--autonomy-level") { opts.autonomyLevel = requireValue(args, ++i, arg); opts.settingsExplicit = true; }
     else if (arg === "--poll-ms") opts.pollMs = positiveInt(requireValue(args, ++i, arg), arg);
     else if (arg === "--claim-timeout-ms") opts.claimTimeoutMs = positiveInt(requireValue(args, ++i, arg), arg);
     else throw new DroidLauncherUsageError(`unknown option: ${arg}`);
@@ -291,6 +295,11 @@ export class DroidWakeController {
   async waitForIdle(): Promise<void> {
     await this.inFlight?.catch(() => {});
   }
+
+  /** A human cancellation must not restart the same unread set on a timer. */
+  suppressCurrentUnread(): void {
+    this.attempts = this.retryScheduleMs.length + 1;
+  }
 }
 
 export interface DroidLauncherDependencies {
@@ -340,6 +349,7 @@ export async function runDroidLauncher(
   let sessionId: string | null = null;
   const stopped = new AbortController();
   let exitCode: number | null = null;
+  let releaseSession: (() => Promise<void>) | undefined;
   const abortHandler = () => {
     stopped.abort();
     if (sessionId) void client?.cancel(sessionId).catch(() => {});
@@ -348,6 +358,7 @@ export async function runDroidLauncher(
   signal?.addEventListener("abort", abortHandler, { once: true });
 
   try {
+    if (effectiveOpts.sessionId) releaseSession = await acquireDroidSession(stateRoot, effectiveOpts.sessionId);
     client = deps.clientFactory?.(effectiveOpts) ?? new DroidAcpClient(spawnDroidAcpTransport({
       cwd: effectiveOpts.cwd,
       droidCommand: effectiveOpts.droidCommand,
@@ -363,6 +374,7 @@ export async function runDroidLauncher(
     sessionId = await untilStopped(effectiveOpts.sessionId
       ? resumeExactSession(client, initialized, effectiveOpts.sessionId, effectiveOpts.cwd, [mcpServer])
       : client.newSession({ cwd: effectiveOpts.cwd, mcpServers: [mcpServer] }), stopped.signal);
+    if (!releaseSession) releaseSession = await acquireDroidSession(stateRoot, sessionId);
     await untilStopped(configureDroidSession(client, sessionId, effectiveOpts), stopped.signal);
     await claims.waitForBinding(claim.claim_id, { timeoutMs: effectiveOpts.claimTimeoutMs, signal: stopped.signal });
     // The MCP child can bind during session/new or session/resume. Finalize
@@ -394,6 +406,7 @@ export async function runDroidLauncher(
       }
     } finally {
       await claims.removeClaim(claim.claim_id);
+      await releaseSession?.();
     }
   }
 }

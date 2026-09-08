@@ -17,7 +17,7 @@ async function run(...args: string[]): Promise<{ exitCode: number; stdout: strin
 
 test("version flags are bare fast-path output", async () => {
   for (const flag of ["-v", "-V", "--version"]) {
-    expect(await run(flag)).toEqual({ exitCode: 0, stdout: "0.1.2\n", stderr: "" });
+    expect(await run(flag)).toEqual({ exitCode: 0, stdout: "0.2.0\n", stderr: "" });
   }
 });
 
