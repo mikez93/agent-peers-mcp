@@ -70,6 +70,31 @@ function message(id: number, to: string, from = "sender"): LeasedMessage {
     lease_token: `lease-${id}` };
 }
 
+test("terminal notification during an empty poll cannot park a new waiter afterward", async () => {
+  const f = await fixture();
+  await f.call("a");
+  const owner = [...f.owners.values()][0]!, entered = deferred(), release = deferred();
+  f.port.poll = async () => { entered.resolve(); await release.promise; return []; };
+  const waiting = f.call("a", "wait_for_peer_messages", { timeout_ms: 60_000 }).catch(error => error as Error);
+  await entered.promise;
+  const draining = f.adapter.drainFenced(meta("a"), owner);
+  release.resolve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      Promise.all([waiting, draining]).then(([error]) => error as Error),
+      new Promise<Error>(resolve => { timer = setTimeout(() => resolve(new Error("drain_stalled")), 100); }),
+    ]);
+    expect(result.message).toBe("conversation_closing");
+    expect(f.adapter.resources()).toEqual({ identities: 0, calls: 0, waiters: 0, timers: 0, pendingAcks: 0 });
+    expect(f.acks).toEqual([]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    await f.adapter.stop();
+    await Promise.all([waiting, draining]);
+  }
+});
+
 test("all six tools select immutable per-call identity, never model arguments", async () => {
   const f = await fixture();
   for (const tool of HERMES_CONVERSATION_TOOLS) {

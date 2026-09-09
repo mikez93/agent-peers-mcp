@@ -50,9 +50,15 @@ export class HermesConversationBroker implements ConversationBrokerPort {
   }
 
   async bind(context: Readonly<HermesConversationContext>): Promise<ConversationCredential> {
+    return this.bindObserved(context, this.options.evidence(context));
+  }
+
+  // Synchronous transaction seam for the opt-in lifecycle port. Its caller
+  // supplies authenticated host evidence, not model arguments or environment.
+  bindObserved(context: Readonly<HermesConversationContext>, observation: LiveConversationEvidence): ConversationCredential {
     // The caller owns the authority seam: synthetic lifecycle fixtures or
     // strict runtime dispatch observations, never model identity arguments.
-    const evidence = structuredClone(this.options.evidence(context));
+    const evidence = structuredClone(observation);
     if (conversationKey(evidence.context) !== conversationKey(context)
         || evidence.context.session_id !== context.session_id
         || evidence.context.backend_id !== context.backend_id

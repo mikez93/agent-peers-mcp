@@ -158,6 +158,9 @@ export class HermesConversationAdapter {
             return (await slot.inbox!.getUnreadMessages()).some(m =>
               !slot.delivery.isBlocked(m.id) && this.matches(m, args.from));
           });
+          // Close may have notified existing waiters while this poll yielded.
+          // Check again before parking, without relying on another timer tick.
+          check();
           if (found || this.now() >= deadline) break;
           await this.wait(deadline, signal);
         }
@@ -246,6 +249,10 @@ export class HermesConversationAdapter {
   }
   tick(): void {
     if (!this.stopped) this.options.onTick?.();
+    this.wakeWaiters();
+  }
+
+  private wakeWaiters(): void {
     for (const waiter of [...this.waiters]) waiter.wake();
   }
 
@@ -287,6 +294,21 @@ export class HermesConversationAdapter {
       // possibly-successful remote release. Restart/resume must reauthenticate.
       throw error;
     }
+  }
+
+  // T2 caller commits the terminal broker fence FIRST. This drains only local
+  // calls/state and must not issue a second release or infer acknowledgment.
+  async drainFenced(meta: unknown, owner: { peer_id: string; backend_id: string; adapter_id: string; generation: number }): Promise<void> {
+    const key = conversationKey(parseHermesConversationContext(meta, this.expected));
+    const slot = this.slots.get(key);
+    if (!slot) return;
+    if (slot.owner && (slot.owner.peer_id !== owner.peer_id || slot.owner.backend_id !== owner.backend_id
+        || slot.owner.adapter_id !== owner.adapter_id || slot.owner.generation > owner.generation)) return;
+    slot.closing = true;
+    // Local cancellation must not depend on unrelated maintenance succeeding.
+    this.wakeWaiters();
+    if (slot.calls) await new Promise<void>(resolve => { slot.drained.add(resolve); });
+    if (this.slots.get(key) === slot) this.slots.delete(key);
   }
 
   resources(): { identities: number; calls: number; waiters: number; timers: number; pendingAcks: number } {

@@ -109,14 +109,62 @@ additional agent tool calls or model turns keep them alive. Other fixtures prove
 exact close/reap delisting, token revocation without ack, stale/duplicate/unknown
 evidence refusal, observation-anchored leases, immutable pass entry and CAS races.
 
-**Not yet covered:** production authenticated inventory translation, persistent
-provenance schema migration, token/peer recreation after expiry or backend
-replacement, actual loaded-adapter call drainage, and cross-surface host liveness.
-The fixture transactional port uses the real binding store plus visible-row
-renewal/release SQL, not a new live broker endpoint. The new-backend test checks
-the proposed change and does not claim successful mailbox reactivation.
+The original engine fixture uses the real binding store plus visible-row
+renewal/release SQL. Its new-backend test checks the proposed change and does not
+claim successful mailbox reactivation. The paired port below extends the evidence
+to same-backend recovery and real adapter drainage.
 
 Generic native CLI/cron hook context may use `runtime_context` with the six
 unprefixed identity fields and omitted absent UI ID (Kepler9727/Vector9734).
 It remains a hint. A finalizer hook before a successful durable terminal write
 cannot itself authorize release or prove liveness.
+
+## Atomic broker pairing and local drainage
+
+`shared/hermes-conversation-lifecycle-port.ts` pairs the normalized engine with
+the real broker and adapter, still **without a production importer**. Its
+explicit fixture schema records host sequence provenance; it is not a migration
+or permission to relabel live T1 dispatch counters.
+
+Expected-binding comparison, binding renewal/release, visible peer/token state
+and provenance update share one immediate SQLite transaction. Renewal reuses
+the broker's synchronous `bindObserved` transaction, including inbox registration,
+status restoration and old-epoch lease reset. This is a trusted local evidence
+seam, not an HTTP route accepting model-supplied identity.
+
+A terminal transaction revokes visibility and credentials before local calls
+drain. `drainFenced` cancels only the matching or older local epoch, wakes parked
+waiters without running unrelated maintenance, and waits for actual call
+completion before deleting that slot. A poll that yields across close checks
+cancellation again before parking; it does not need another scheduler tick.
+Neither release nor drainage confirms a message.
+
+Keep the lifecycle port for the adapter lifetime. It retains one latest pending
+drain per peer and retries failed cleanup even when terminal evidence is
+unchanged or a fresh host observation renews the binding. Successful cleanup
+removes only that exact pending entry; an old completion cannot remove a newer
+obligation. These are process-local cleanup obligations, not a durable journal:
+process death itself discards local calls. Durable identity and mail remain in
+the existing broker/inbox stores.
+
+The paired tests use real temporary SQLite databases, broker functions, disk
+inboxes and adapter calls. They verify:
+
+- After expiry and removal of the collected peer/token, fresh host evidence
+  restores the same UUID/status with a new credential epoch. The old credential
+  is refused, mail is reoffered, and only a later request in the new epoch acks.
+- Close revokes the peer/token while an actual poll is blocked. Drainage waits;
+  the old call is cancelled and unread mail remains available after exact resume.
+- Automatic reap drains a parked waiter; a close during an empty poll cannot
+  create a waiter after the terminal notification, even with no running timer.
+- A provenance-write failure rolls the transaction back; an expected-binding
+  race cannot release a newer epoch. An old drain cannot evict a resumed slot,
+  and a fresh resume survives an earlier close finishing.
+- Failed postcommit cleanup is retried without another release or ack, and a
+  failing maintenance hook cannot strand terminal local cleanup.
+
+The last two cleanup defects were independently reproduced and captured as
+failing regressions before correction. This extends the earlier binding-only
+proof; it does **not** establish production authenticated inventory translation,
+provenance migration/bootstrap, all cross-backend or replacement-adapter handoffs,
+real host process death, cross-surface liveness, or live wake acceptance.
