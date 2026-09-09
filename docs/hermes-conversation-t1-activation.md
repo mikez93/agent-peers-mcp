@@ -21,8 +21,12 @@ children. They are **not** a live Hermes acceptance receipt.
 
 ## Required paired source and configuration
 
-1. Use Vector's published Agent Peers commit, not an unreviewed working tree.
-   Use Kepler's superseding T1 package that **forces both**
+1. Agent Peers source: `0b42a1ab5bbfedcf0875271f511a03b07628076e`.
+   Paired host source supplied by Kepler9672:
+   `7ec7864550549968fb226d6dba568d367caf55b4`,
+   tree `760a56600ab5b678c4175c4993aec1543549eb64`, package
+   `~/Hermes/maintainers/kepler/patches/hermes-conversation-meta-20260909-home`.
+   This superseding T1 package **forces both**
    `AGENT_PEERS_HERMES_BACKEND_ID` and `AGENT_PEERS_HERMES_HOME` into stdio
    children after configuration overrides. The earlier `2e59e917` host package
    does not suffice for the home bridge.
@@ -42,6 +46,10 @@ children. They are **not** a live Hermes acceptance receipt.
    The parent serve sets `1`. Parent gateway/cron instances keep it absent or
    explicitly `0`, so their child adapter stays legacy. Do not put a literal
    `1` into the shared profile MCP config: that would also opt in gateways.
+   Kepler9671 verified the actual interpolation/environment chain: ordinary
+   serve parent `1` reaches the child; profile-scoped `0` overrides it, and a
+   multiplex-scope miss preserves the literal placeholder. Before the canary,
+   verify the selected profile/external scope has no conflicting V2 overlay.
 
 The adapter reads `AGENT_PEERS_DB` (default `~/.agent-peers.db`), requires an
 existing owner-only 0600 regular file and equally private WAL/SHM/journal
