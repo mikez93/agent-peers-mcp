@@ -1,9 +1,10 @@
 # T2 exact-wake coordinator fixtures
 
 Tracking: `bd-1con`. This is source-stage work, not a live wake release.
-No production entry point imports `shared/hermes-conversation-wake.ts`.
-No broker migration, daemon replacement, service flag, or real inference is
-enabled by these files.
+The runtime imports these modules but selects their composition only through
+a programmatically injected authenticated host bridge. The standard launcher
+supplies none. No new service flag, daemon replacement or real inference is
+enabled merely by importing these files.
 
 ## Boundary
 
@@ -82,8 +83,8 @@ actual peer UUID; it never asks a model to report its identity from `list_peers`
 
 ## OPEN-idle lifecycle preparation
 
-`shared/hermes-conversation-lifecycle.ts` is a separate **fixture-stage**
-reconciliation engine, also without a production importer. It normalizes no
+`shared/hermes-conversation-lifecycle.ts` is the shared reconciliation engine.
+It normalizes no
 particular Hermes RPC. Its input is an authenticated complete inventory with
 home/backend identity, observation time, and explicit per-conversation state,
 reason and host sequence. Unknown/incomplete/stale input abstains; missing rows
@@ -122,7 +123,7 @@ cannot itself authorize release or prove liveness.
 ## Atomic broker pairing and local drainage
 
 `shared/hermes-conversation-lifecycle-port.ts` pairs the normalized engine with
-the real broker and adapter, still **without a production importer**. Its
+the real broker and adapter, now used by the injected runtime composition. Its
 explicit fixture schema records host sequence provenance; it is not a migration
 or permission to relabel live T1 dispatch counters.
 
@@ -168,3 +169,69 @@ failing regressions before correction. This extends the earlier binding-only
 proof; it does **not** establish production authenticated inventory translation,
 provenance migration/bootstrap, all cross-backend or replacement-adapter handoffs,
 real host process death, cross-surface liveness, or live wake acceptance.
+
+## Runtime composition and paired activation dependencies
+
+`startHermesConversationRuntime({ createHostBridge })` composes the adapter, one
+long-lived lifecycle port and the wake coordinator. This programmatic dependency
+is not an environment-controlled module loader or public identity-injection
+endpoint. Standard `hermes-server.ts` supplies no bridge and retains T1 behavior.
+
+Containment, private database validation and exclusive backend process claims
+precede bridge construction. Preparation requests inventory before stdio connects
+and never admits a turn. The existing adapter scheduler then runs non-overlapping
+lifecycle/wake passes. Observation calls are bounded and abortable. Stop aborts
+transport work, drains local calls and closes the bridge/server/database while
+retaining mailbox and uncertain-attempt state. It neither cancels accepted host
+turns nor acknowledges mail.
+
+First T2 bind/renew requires positive authenticated `observe` evidence, not a
+dispatch counter. The same backend cannot silently cross counter namespaces:
+forward cutover needs a reviewed namespace change, and a host-marked backend
+refuses T1 rollback without a new backend UUID. That UUID does not replace an
+unresolved wake attempt; its original request must be reconciled first.
+
+For same-backend MCP replacement, the verified current process claim plus fresh
+host evidence recovers inactive/expired live bindings without a model tool call,
+advancing generation/token fencing. An exact already-reaped binding may transfer
+local adapter ownership without creating a visible peer/token, allowing a
+separately fenced cold-resume request. A live lease, missing provenance or lost
+process claim cannot be bypassed.
+
+Strict whole-inventory validation and successful lifecycle decisions gate wake
+candidates. Future/incomplete/malformed evidence or a failed transaction cannot
+be bypassed by another snapshot. Binding/unread state and local closing state are
+rechecked at the bridge admission boundary. Host-side atomic admission/start
+fencing remains separately required.
+
+The real stdio tests use a **synthetic host**, not Hermes. They prove zero
+transport starts on preparation failure/cancellation, bodyless wake routing,
+graceful and MCP-only SIGKILL replacement from retained host context before
+another tool call, and rollback under a new
+backend UUID with the same mailbox/unread message. They do not prove actual model
+wake, host admission persistence, user transport preservation or native liveness.
+
+### Exact remaining host methods (Kepler9751)
+
+The typed bridge is `HermesConversationHostBridge` in
+`shared/hermes-conversation-composition.ts`. Final authenticated wire translation,
+factory construction and a replayed host source pin remain required:
+
+1. `observe(exactContext, signal)`: positive registry/readback ownership, host
+   lifecycle generation and **request-start** time. GUI checkpoint `329d93de36`
+   is not all-host inventory. Native CLI/cron positive authority is unimplemented;
+   `runtime_context` hints must yield unknown/no bind, never a T1 fallback.
+2. `inventory(knownRoots, signal)`: complete normalized scope, exact live/terminal
+   states/reasons and unknown handling; batch/deduplicate terminal lookups limited
+   to 128 roots per host request.
+3. `admit(request, signal)` / `reconcile(request, signal)`: exact context,
+   lifecycle generation, monotonic attempt sequence/UUID and durable receipt.
+   These host methods are unimplemented. They must fence close/disposal before
+   enqueue and again before start, preserve hidden queued/display/terminal-callback
+   fields, and never rebind user transport.
+4. `close()`: release bridge transport/resources without cancelling accepted work.
+
+Do not substitute ordinary `prompt.submit`/`session.resume` or guess missing
+native authority. Assemble the paired activation package after these methods
+and source replay are frozen. Preserve the new broker, retained mail, v1 exclusion
+and durable crons throughout rollback. Marco owns live acceptance and retirement.

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
@@ -32,9 +32,9 @@ function meta(id: string, session = id) {
   return { "hermes/home": home, "hermes/backend_id": backend, "hermes/conversation_id": id,
     "hermes/session_id": session, "hermes/platform": "desktop" };
 }
-async function connect(overrides: Record<string, string> = {}) {
+async function connect(overrides: Record<string, string> = {}, entry = "../hermes-server.ts") {
   const transport = new StdioClientTransport({
-    command: process.execPath, args: [join(import.meta.dir, "../hermes-server.ts")],
+    command: process.execPath, args: [join(import.meta.dir, entry)],
     cwd: root, stderr: "pipe",
     env: { PATH: process.env.PATH ?? "", AGENT_PEERS_ENABLED: "1",
       AGENT_PEERS_HERMES_V2: "1", AGENT_PEERS_HERMES_HOME: home,
@@ -50,6 +50,70 @@ async function connect(overrides: Record<string, string> = {}) {
 function binding(id: string) {
   return db.query<ConversationBinding, [string]>("SELECT * FROM hermes_conversations WHERE conversation_id=?").get(id)!;
 }
+
+test.each(["fail", "stop"])("injected host %s during preparation closes resources before stdio startup", async mode => {
+  await expect(connect({ FIXTURE_HOST_MODE: mode }, "fixtures/hermes-runtime-composition.ts")).rejects.toThrow();
+  expect(existsSync(join(root, "host-closed"))).toBe(true);
+  expect(JSON.parse(readFileSync(join(root, "host-closed"), "utf8")).starts).toBe(0);
+  expect(db.query<{ n: number }, []>("SELECT COUNT(*) n FROM hermes_adapter_processes").get()!.n).toBe(0);
+  expect(db.query<{ n: number }, []>("SELECT COUNT(*) n FROM peers").get()!.n).toBe(0);
+});
+
+test("composed MCP SIGKILL replacement recovers before any replacement tool call", async () => {
+  const old = await connect({}, "fixtures/hermes-runtime-composition.ts");
+  await old.client.callTool({ name: "set_summary", arguments: { summary: "crash recovery A" }, _meta: meta("a") });
+  const a = binding("a");
+  const sender = registerPeer(db, { peer_type: "claude", name: "fixture-sender", pid: process.pid,
+    cwd: root, git_root: null, tty: null, summary: "" });
+  const sent = sendMessage(db, { from_id: sender.id, session_token: sender.session_token,
+    to_id_or_name: a.peer_id, text: "CRASH_PRIVATE_A" });
+  process.kill(old.transport.pid!, "SIGKILL");
+  await old.client.close(); await old.transport.close();
+  const replacement = await connect({}, "fixtures/hermes-runtime-composition.ts");
+  expect(binding("a")).toMatchObject({ peer_id: a.peer_id, state: "active",
+    generation: a.generation + 1, summary: "crash recovery A" });
+  expect(binding("a").adapter_id).not.toBe(a.adapter_id);
+  expect(db.query<{ n: number }, []>("SELECT COUNT(*) n FROM hermes_adapter_processes").get()!.n).toBe(1);
+  expect(db.query<{ pid: number }, [string]>("SELECT pid FROM hermes_adapter_processes WHERE backend_id=?")
+    .get(backend)!.pid).toBe(replacement.transport.pid!);
+  expect(db.query<{ acked: number }, [number]>("SELECT acked FROM messages WHERE id=?")
+    .get(sent.message_id!)!.acked).toBe(0);
+});
+
+test("real stdio composition routes bodyless wake and rollback requires a new counter namespace", async () => {
+  const { client, transport } = await connect({}, "fixtures/hermes-runtime-composition.ts");
+  await client.callTool({ name: "set_summary", arguments: { summary: "host-owned A" }, _meta: meta("a") });
+  const a = binding("a");
+  expect(db.query("SELECT 1 FROM hermes_lifecycle_sequences WHERE peer_id=? AND backend_id=?")
+    .get(a.peer_id, backend)).not.toBeNull();
+  const sender = registerPeer(db, { peer_type: "claude", name: "fixture-owner", durable: true,
+    pid: process.pid, cwd: root, git_root: null, tty: null, summary: "" });
+  const sent = sendMessage(db, { from_id: sender.id, session_token: sender.session_token,
+    to_id_or_name: a.peer_id, text: "PRIVATE_A" });
+  for (let i = 0; i < 30 && !existsSync(join(root, "host-admissions.jsonl")); i++) await Bun.sleep(100);
+  const admissions = readFileSync(join(root, "host-admissions.jsonl"), "utf8");
+  expect(admissions).not.toContain("PRIVATE_A");
+  expect(JSON.parse(admissions.trim())).toMatchObject({ peer_id: a.peer_id, hidden: true, queued: true });
+  await client.close(); await transport.close();
+  for (let i = 0; i < 30 && !existsSync(join(root, "host-closed")); i++) await Bun.sleep(10);
+  expect(existsSync(join(root, "host-closed"))).toBe(true);
+  const resumed = await connect({}, "fixtures/hermes-runtime-composition.ts");
+  expect(binding("a")).toMatchObject({ peer_id: a.peer_id, state: "active", generation: a.generation + 1, summary: "host-owned A" });
+  expect(binding("a").adapter_id).not.toBe(a.adapter_id);
+  await resumed.client.close(); await resumed.transport.close();
+  for (let i = 0; i < 30 && db.query<{ n: number }, []>("SELECT COUNT(*) n FROM hermes_adapter_processes").get()!.n; i++) {
+    await Bun.sleep(10);
+  }
+  expect(db.query<{ n: number }, []>("SELECT COUNT(*) n FROM hermes_adapter_processes").get()!.n).toBe(0);
+  await expect(connect()).rejects.toThrow();
+  const replacement = "77ab3c4a-2e1b-4d4a-a5b4-88009412f722";
+  const t1 = await connect({ AGENT_PEERS_HERMES_BACKEND_ID: replacement });
+  expect(JSON.stringify(await t1.client.callTool({
+    name: "check_messages", _meta: { ...meta("a"), "hermes/backend_id": replacement },
+  }))).toContain("PRIVATE_A");
+  expect(binding("a").peer_id).toBe(a.peer_id);
+  expect(db.query<{ acked: number }, [number]>("SELECT acked FROM messages WHERE id=?").get(sent.message_id!)!.acked).toBe(0);
+});
 
 test("real v2 stdio registers only after strict metadata and multiplexes private A/B mail", async () => {
   const { client, transport } = await connect();

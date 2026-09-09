@@ -1,5 +1,5 @@
-// Opt-in T1 bootstrap. First strict MCP metadata is dispatch authority only,
-// NOT a claim that T2 host lifecycle events or autonomous wake are available.
+// Multiplex bootstrap. Default T1 metadata is dispatch authority only.
+// T2 composition requires an explicitly injected authenticated host bridge.
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
@@ -16,12 +16,20 @@ import { paperclipAgentMarker } from "./paperclip-guard.ts";
 import { getGitRoot } from "./peer-context.ts";
 import { canonicalProfileHome, type HermesConversationContext } from "./hermes-conversation-context.ts";
 import { validateConversationDbFiles } from "./hermes-conversation-db-files.ts";
+import { HermesConversationComposition, type HermesConversationHostBridge } from "./hermes-conversation-composition.ts";
 
-export async function startHermesConversationRuntime(options: { resolveGitRoot?: typeof getGitRoot } = {}): Promise<void> {
+export async function startHermesConversationRuntime(options: {
+  resolveGitRoot?: typeof getGitRoot;
+  // Programmatic injection only until the authenticated host wire is frozen.
+  // No environment flag or model argument can manufacture a bridge.
+  createHostBridge?: (scope: Readonly<{ home: string; backend_id: string }>) => HermesConversationHostBridge;
+} = {}): Promise<void> {
   const env = Object.freeze({ ...process.env });
   const stateRoot = env.AGENT_PEERS_STATE_DIR ?? env.AGENT_PEERS_HERMES_STATE_DIR ?? join(homedir(), ".agent-peers-hermes");
   let db: Database | undefined;
   let adapter: HermesConversationAdapter | undefined;
+  let composition: HermesConversationComposition | undefined;
+  let host: HermesConversationHostBridge | undefined;
   let server: Server | undefined;
   let ownedBackend: string | undefined;
   const adapterId = randomUUID();
@@ -33,17 +41,24 @@ export async function startHermesConversationRuntime(options: { resolveGitRoot?:
       process.stdin.off("end", onEnd);
       process.stdin.off("error", onEnd);
       for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(signal, onEnd);
-      await adapter?.stop();
+      let cleanupError: unknown;
+      try {
+        if (composition) await composition.stop();
+        else { await adapter?.stop(); await host?.close(); }
+      } catch (error) { cleanupError = error; }
       const backendId = ownedBackend;
-      if (db && backendId) db.transaction(() => {
-        db!.query(`UPDATE hermes_conversations SET state='suspended',owner_lease_until=0,updated_at=?
-          WHERE backend_id=? AND adapter_id=? AND state='active'`).run(Date.now(), backendId, adapterId);
-        db!.query("DELETE FROM hermes_adapter_processes WHERE backend_id=? AND adapter_id=?")
-          .run(backendId, adapterId);
-      }).immediate();
-      await server?.close();
-      db?.close();
-      db = undefined;
+      try {
+        if (db && backendId) db.transaction(() => {
+          db!.query(`UPDATE hermes_conversations SET state='suspended',owner_lease_until=0,updated_at=?
+            WHERE backend_id=? AND adapter_id=? AND state='active'`).run(Date.now(), backendId, adapterId);
+          db!.query("DELETE FROM hermes_adapter_processes WHERE backend_id=? AND adapter_id=?")
+            .run(backendId, adapterId);
+        }).immediate();
+      } finally {
+        try { await server?.close(); }
+        finally { db?.close(); db = undefined; }
+      }
+      if (cleanupError) throw cleanupError;
     })();
     return closing;
   };
@@ -83,6 +98,11 @@ export async function startHermesConversationRuntime(options: { resolveGitRoot?:
     validateConversationDbFiles(dbPath);
     db.exec("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;");
     db.query("SELECT id FROM peers LIMIT 1").get();
+    if (!options.createHostBridge && db.query(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hermes_lifecycle_sequences'").get()
+      && db.query("SELECT 1 FROM hermes_lifecycle_sequences WHERE backend_id=? LIMIT 1").get(backend)) {
+      throw new Error("host_counter_backend_requires_bridge_or_new_backend");
+    }
     installHermesConversationBrokerSchema(db);
     db.exec(`CREATE TABLE IF NOT EXISTS hermes_adapter_processes (
       backend_id TEXT PRIMARY KEY, adapter_id TEXT NOT NULL, pid INTEGER NOT NULL,
@@ -133,7 +153,29 @@ export async function startHermesConversationRuntime(options: { resolveGitRoot?:
       },
       releaseEvidence: () => { throw new Error("host_lifecycle_unavailable_in_t1"); },
     });
-    adapter = new HermesConversationAdapter({
+    const onTick = () => {
+      if (process.ppid !== parent) { onEnd(); return; }
+      try {
+        validateConversationDbFiles(dbPath);
+        broker.bindings.expire();
+        adapter?.evictExpired(owner => {
+          const binding = broker.bindings.get(owner.peer_id);
+          return !binding || binding.state !== "active" || binding.generation !== owner.generation;
+        });
+        if (composition) void composition.tick().catch(onEnd);
+      } catch { onEnd(); }
+    };
+    if (options.createHostBridge) {
+      host = options.createHostBridge(Object.freeze({ home, backend_id: backend }));
+      composition = new HermesConversationComposition(db, broker, host, {
+        home, backend_id: backend, adapter_id: adapterId, inboxRoot: stateRoot, onTick,
+        ownsBackend: () => !!db?.query(`SELECT 1 FROM hermes_adapter_processes
+          WHERE backend_id=? AND adapter_id=? AND pid=? AND home=?`).get(backend, adapterId, process.pid, home),
+      });
+      adapter = composition.adapter;
+      await composition.prepare();
+      if (closing) { await closing; return; }
+    } else adapter = new HermesConversationAdapter({
       home, backend_id: backend, inboxRoot: stateRoot, broker,
       onRequest: context => {
         const row = db!.query<{ observation: number }, [string, string]>(`UPDATE hermes_adapter_processes SET
@@ -143,15 +185,7 @@ export async function startHermesConversationRuntime(options: { resolveGitRoot?:
         if (!row) throw new Error("adapter_process_not_owner");
         observations.set(context, row.observation);
       },
-      onTick: () => {
-        if (process.ppid !== parent) { onEnd(); return; }
-        validateConversationDbFiles(dbPath);
-        broker.bindings.expire();
-        adapter?.evictExpired(owner => {
-          const binding = broker.bindings.get(owner.peer_id);
-          return !binding || binding.state !== "active" || binding.generation !== owner.generation;
-        });
-      },
+      onTick,
     });
     server = createHermesConversationMcp(adapter);
     await server.connect(new StdioServerTransport());

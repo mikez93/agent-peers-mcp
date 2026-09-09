@@ -1,4 +1,4 @@
-// Fixture-stage T2 reconciliation. No runtime importer or host RPC translation.
+// T2 reconciliation shared by fixtures and the injected runtime composition.
 // The input is authenticated host evidence, never a model's tool arguments.
 import {
   HERMES_SNAPSHOT_MAX_AGE_MS, type ConversationBinding, type ConversationState,
@@ -56,6 +56,25 @@ function copyContext(context: Readonly<HermesConversationContext>, expected: { h
   ), expected);
 }
 
+export function freezeLifecycleInventory(inventory: LifecycleInventory,
+  scope: Readonly<{ home: string; backend_id: string }>, now = Date.now()): Readonly<LifecycleInventory> | null {
+  if (inventory.home !== scope.home || inventory.backend_id !== scope.backend_id) throw new Error("lifecycle_scope_mismatch");
+  if (inventory.inventory_complete !== true || !Number.isSafeInteger(inventory.observed_at)
+      || inventory.observed_at > now || now - inventory.observed_at > HERMES_SNAPSHOT_MAX_AGE_MS) return null;
+  const keys = new Set<string>();
+  const observations = inventory.observations.map(row => {
+    const context = copyContext(row.context, scope), key = conversationKey(context);
+    if (keys.has(key)) throw new Error("ambiguous_lifecycle_inventory");
+    keys.add(key);
+    if (!Number.isSafeInteger(row.lifecycle_generation) || row.lifecycle_generation < 0
+        || !["live", "closed", "reaped", "unknown"].includes(row.state)
+        || row.end_reason !== null && typeof row.end_reason !== "string") throw new Error("invalid_lifecycle_observation");
+    return Object.freeze({ context, lifecycle_generation: row.lifecycle_generation, state: row.state, end_reason: row.end_reason });
+  });
+  return Object.freeze({ home: scope.home, backend_id: scope.backend_id, observed_at: inventory.observed_at,
+    inventory_complete: true, observations: Object.freeze(observations) });
+}
+
 export class HermesConversationLifecycleReconciler {
   private readonly scope: Readonly<{ home: string; backend_id: string; adapter_id: string }>;
   constructor(scope: { home: string; backend_id: string; adapter_id: string },
@@ -65,30 +84,12 @@ export class HermesConversationLifecycleReconciler {
   }
 
   reconcile(inventory: LifecycleInventory): LifecycleDecision[] {
-    const now = this.now();
-    if (inventory.home !== this.scope.home || inventory.backend_id !== this.scope.backend_id) {
-      throw new Error("lifecycle_scope_mismatch");
-    }
-    if (inventory.inventory_complete !== true || !Number.isSafeInteger(inventory.observed_at)
-        || inventory.observed_at > now || now - inventory.observed_at > HERMES_SNAPSHOT_MAX_AGE_MS) {
-      return [];
-    }
+    const frozen = freezeLifecycleInventory(inventory, this.scope, this.now());
+    if (!frozen) return [];
     // Freeze the whole pass before a binding read or an apply callback. Missing
     // rows never become close commands, even in an allegedly complete inventory.
-    const observedAt = inventory.observed_at;
-    const rows = new Map<string, Readonly<LifecycleObservation>>();
-    for (const row of inventory.observations) {
-      const context = copyContext(row.context, this.scope);
-      const key = conversationKey(context);
-      if (rows.has(key)) throw new Error("ambiguous_lifecycle_inventory");
-      if (!Number.isSafeInteger(row.lifecycle_generation) || row.lifecycle_generation < 0
-          || !["live", "closed", "reaped", "unknown"].includes(row.state)
-          || row.end_reason !== null && typeof row.end_reason !== "string") {
-        throw new Error("invalid_lifecycle_observation");
-      }
-      rows.set(key, Object.freeze({ context, lifecycle_generation: row.lifecycle_generation,
-        state: row.state, end_reason: row.end_reason }));
-    }
+    const observedAt = frozen.observed_at;
+    const rows = new Map(frozen.observations.map(row => [conversationKey(row.context), row]));
     const bindings = this.ports.bindings().map(binding => Object.freeze({ ...binding }));
     const results: LifecycleDecision[] = [];
     for (const binding of bindings) {

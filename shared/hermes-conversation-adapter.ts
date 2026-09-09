@@ -311,6 +311,11 @@ export class HermesConversationAdapter {
     if (this.slots.get(key) === slot) this.slots.delete(key);
   }
 
+  canWake(context: Readonly<HermesConversationContext>): boolean {
+    return !this.stopped && context.home === this.expected.home && context.backend_id === this.expected.backend_id
+      && !this.slots.get(conversationKey(context))?.closing;
+  }
+
   resources(): { identities: number; calls: number; waiters: number; timers: number; pendingAcks: number } {
     return { identities: this.slots.size, calls: [...this.slots.values()].reduce((n, s) => n + s.calls, 0),
       waiters: this.waiters.size, timers: this.timer ? 1 : 0,

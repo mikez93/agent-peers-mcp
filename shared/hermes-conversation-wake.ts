@@ -1,4 +1,4 @@
-// T2 fixture-only coordinator (bd-1con). No production entry point imports this.
+// T2 coordinator (bd-1con), selected only with an injected authenticated host.
 // Ports require authenticated lifecycle evidence and host-side atomic, idempotent,
 // non-owning admission. A successful submission never acknowledges broker mail.
 import type { Database } from "bun:sqlite";

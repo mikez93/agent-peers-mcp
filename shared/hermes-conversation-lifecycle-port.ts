@@ -1,5 +1,5 @@
-// Fixture-only pairing of the normalized lifecycle engine with real broker and
-// adapter seams. No runtime imports this or installs its provenance table yet.
+// Pairing of the normalized lifecycle engine with real broker and adapter seams.
+// Runtime installation requires a programmatically injected authenticated host.
 import type { Database } from "bun:sqlite";
 import type { HermesConversationAdapter } from "./hermes-conversation-adapter.ts";
 import type { HermesConversationBroker } from "./hermes-conversation-broker.ts";
