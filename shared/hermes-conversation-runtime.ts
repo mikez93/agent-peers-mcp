@@ -1,5 +1,5 @@
 // Multiplex bootstrap. Default T1 metadata is dispatch authority only.
-// T2 composition requires an explicitly injected authenticated host bridge.
+// T2 composition requires a host-issued attachment or an injected test bridge.
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
@@ -17,11 +17,12 @@ import { getGitRoot } from "./peer-context.ts";
 import { canonicalProfileHome, type HermesConversationContext } from "./hermes-conversation-context.ts";
 import { validateConversationDbFiles } from "./hermes-conversation-db-files.ts";
 import { HermesConversationComposition, type HermesConversationHostBridge } from "./hermes-conversation-composition.ts";
+import { createHermesAttachmentBridge } from "./hermes-runtime-attachment.ts";
 
 export async function startHermesConversationRuntime(options: {
   resolveGitRoot?: typeof getGitRoot;
-  // Programmatic injection only until the authenticated host wire is frozen.
-  // No environment flag or model argument can manufacture a bridge.
+  // Tests may inject a bridge. Production consumes only a host-issued private
+  // attachment after containment/DB/process gates, with an exact-scope handshake.
   createHostBridge?: (scope: Readonly<{ home: string; backend_id: string }>) => HermesConversationHostBridge;
 } = {}): Promise<void> {
   const env = Object.freeze({ ...process.env });
@@ -35,8 +36,10 @@ export async function startHermesConversationRuntime(options: {
   const adapterId = randomUUID();
   const parent = process.ppid;
   let closing: Promise<void> | undefined;
+  const startup = new AbortController();
   const close = (): Promise<void> => {
     if (closing) return closing;
+    startup.abort();
     closing = (async () => {
       process.stdin.off("end", onEnd);
       process.stdin.off("error", onEnd);
@@ -98,7 +101,8 @@ export async function startHermesConversationRuntime(options: {
     validateConversationDbFiles(dbPath);
     db.exec("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;");
     db.query("SELECT id FROM peers LIMIT 1").get();
-    if (!options.createHostBridge && db.query(
+    const attachment = env.AGENT_PEERS_HERMES_ATTACHMENT;
+    if (!options.createHostBridge && attachment === undefined && db.query(
       "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hermes_lifecycle_sequences'").get()
       && db.query("SELECT 1 FROM hermes_lifecycle_sequences WHERE backend_id=? LIMIT 1").get(backend)) {
       throw new Error("host_counter_backend_requires_bridge_or_new_backend");
@@ -165,8 +169,11 @@ export async function startHermesConversationRuntime(options: {
         if (composition) void composition.tick().catch(onEnd);
       } catch { onEnd(); }
     };
-    if (options.createHostBridge) {
-      host = options.createHostBridge(Object.freeze({ home, backend_id: backend }));
+    if (options.createHostBridge || attachment !== undefined) {
+      const scope = Object.freeze({ home, backend_id: backend });
+      host = options.createHostBridge ? options.createHostBridge(scope)
+        : await createHermesAttachmentBridge(attachment!, scope, startup.signal);
+      if (closing) { await host.close(); await closing; return; }
       composition = new HermesConversationComposition(db, broker, host, {
         home, backend_id: backend, adapter_id: adapterId, inboxRoot: stateRoot, onTick,
         ownsBackend: () => !!db?.query(`SELECT 1 FROM hermes_adapter_processes

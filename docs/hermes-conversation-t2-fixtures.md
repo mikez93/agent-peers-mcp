@@ -1,10 +1,10 @@
 # T2 exact-wake coordinator fixtures
 
 Tracking: `bd-1con`. This is source-stage work, not a live wake release.
-The runtime imports these modules but selects their composition only through
-a programmatically injected authenticated host bridge. The standard launcher
-supplies none. No new service flag, daemon replacement or real inference is
-enabled merely by importing these files.
+The runtime selects composition through a host-issued private attachment or a
+programmatically injected test bridge. Without either it retains T1 behavior
+(except the existing host-counter rollback refusal). No new service flag,
+daemon replacement or real inference is enabled merely by importing these files.
 
 ## Boundary
 
@@ -175,7 +175,9 @@ real host process death, cross-surface liveness, or live wake acceptance.
 `startHermesConversationRuntime({ createHostBridge })` composes the adapter, one
 long-lived lifecycle port and the wake coordinator. This programmatic dependency
 is not an environment-controlled module loader or public identity-injection
-endpoint. Standard `hermes-server.ts` supplies no bridge and retains T1 behavior.
+endpoint. Standard `hermes-server.ts` now constructs the GUI bridge when the
+host supplies `AGENT_PEERS_HERMES_ATTACHMENT`; invalid references fail startup
+rather than silently falling back to T1.
 
 Containment, private database validation and exclusive backend process claims
 precede bridge construction. Preparation requests inventory before stdio connects
@@ -250,7 +252,7 @@ rather than inventing a normalized completion/close policy. RPC 4004/5036,
 timeouts and aborts yield unavailable/unknown, not an empty authoritative inbox.
 
 The bridge's `admit` and `reconcile` methods **reject as unavailable**. It has no
-production factory/import or live activation. Tests feed pinned-shape synthetic
+live activation. Its original tests feed pinned-shape synthetic
 RPC results and compose the translator with the actual broker/adapter: metadata
 is translated, but no host turn is admitted and unread mail is not acknowledged.
 Neither those fixtures nor an injected transport prove authentication or real
@@ -259,8 +261,8 @@ host RPC cancellation.
 ### Exact remaining host methods
 
 The typed bridge is `HermesConversationHostBridge` in
-`shared/hermes-conversation-composition.ts`. Final authenticated wire translation,
-factory construction and a replayed final host source pin remain required:
+`shared/hermes-conversation-composition.ts`. Final native/admission wire
+translation and a replayed final host source pin remain required:
 
 1. `observe(exactContext, signal)`: positive registry/readback ownership, host
    lifecycle generation and **request-start** time. GUI checkpoint `329d93de36`
@@ -279,3 +281,73 @@ Do not substitute ordinary `prompt.submit`/`session.resume` or guess missing
 native authority. Assemble the paired activation package after these methods
 and source replay are frozen. Preserve the new broker, retained mail, v1 exclusion
 and durable crons throughout rollback. Marco owns live acceptance and retirement.
+
+## Host-issued authenticated attachment
+
+`shared/hermes-runtime-attachment.ts` pairs the GUI translator with the existing
+authenticated `/api/ws` route, pinned to Hermes
+`976c118bcd3c39c5ddd242459251df8bb879d618` (tree
+`ecf26f5a1a6e541268618fd45a06fe1e1773d84f`). The host publishes a canonical
+private descriptor after actual loopback bind and forces its reference after
+child configuration overrides. It does not add another authentication scheme.
+
+The factory reads only the supplied reference. It requires an owner-only0700
+parent and regular, single-link0600 file, checks the opened descriptor and
+named inode, bounds its read, and verifies version/scope/auth fields. Endpoint
+validation precedes URL normalization: only literal IPv4 loopback or `[::1]`,
+explicit port, `/api/ws`, and the one matching UUIDv4 marker are accepted.
+Credentials are added in memory; filesystem, parsing, socket and RPC errors
+never propagate private descriptor contents, paths or authenticated URLs.
+
+Connection plus first `gateway.ping` has one five-second deadline. The ping
+must return the exact home/backend; there is no `gateway.ready` wait. Subsequent
+requests are result-only, ID-correlated and bounded, with local abort/late-reply
+fencing. The attachment omits profile selectors. Close terminates only its
+socket, settles pending requests and never deletes the host-owned descriptor.
+The host's non-owning route preserves dispatched workers on socket loss;
+accepted-turn preservation remains unproved until admission exists.
+
+The standard launcher constructs this bridge only after containment, private
+database validation and exclusive backend claim. Missing/invalid supplied
+references fail startup with no T1 fallback. A shutdown during handshake aborts
+construction and releases the claim. An absent reference retains the earlier
+T1 path and host-counter rollback guard.
+
+The new fixture suite covers actual loopback token/internal handshakes,
+permission/link/path/scope/endpoint refusals before dialing, refused upgrades,
+redirect refusal, malformed/oversize/error responses, correlation, cancellation,
+deadlines, remote socket loss, descriptor reuse and real standard stdio startup.
+The upgrade-refusal fixtures model ASGI's preaccept HTTP403, not real host
+authentication. Remote socket loss uses a disposable child process because
+Bun1.3.14's in-process server-side close leaves `pendingWebSockets=1` and its
+`stop()` promise unresolved. These tests do not claim Hermes backend-death
+continuity, native lifecycle authority, admission, model turns or live rollout.
+
+`tests/fixtures/hermes-attachment-consumer.ts` is the bounded descriptor consumer
+for the separate Python-host pairing harness. It uses the actual factory,
+checks complete scoped inventory and idempotent close without deleting the
+reference, and emits only a content-free success marker or failure exit.
+
+Kepler9788 reports paired **2/2 token/internal PASS**, retries0, using real
+uvicorn plus the production Python route at the frozen host pin. Both cases
+invoke that actual Bun consumer under minimal environment/temporary HOME.
+Consumer SHA256 `6f33745cd0a8f3e9e354028540fac2b3e56e6ce6841c50dd4e8f6ed4a5a587ec`;
+factory SHA256 `20e32d2ed57905fe96f88f6082ba15413287bc3f9a0ce08faf2881f8c674a6c4`,
+stable before/after. This proves factory-to-Python authentication, exact
+**empty** inventory, idempotent close and descriptor retention. It does not
+prove populated lifecycle ownership, the complete MCP composition against
+Python, unread/ack, native authority, admission or resource-cycle acceptance.
+The local pairing harness is Kepler-owned
+`tmp/hermes-attachment-pair-20260909/test_pair.py`, SHA256
+`9c160cb4c3ae35c33718b6690489a55af6ceca87a570f7b39c696f5f55884bb2`.
+
+Final local validation: 43 attachment tests, 58 combined attachment/runtime
+tests with260 assertions, and full522 tests/55files3662 assertions; TypeScript
+and diff checks pass. Independent source review (including final cleanup delta)
+is clear. Independent QA initially passed56 combined tests/234 assertions, then
+rechecked the final43 attachment tests/189 assertions and typecheck, including
+exact error/stack/stderr redaction, nonregular-directory refusal and
+post-handshake timeout. Wrong-owner rejection,
+successful IPv6 dialing and explicit zero-stdio-start instrumentation during the
+attachment handshake remain source-checked or separate-fixture evidence rather
+than direct cases here. No production activation is implied by these results.
