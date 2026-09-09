@@ -92,14 +92,17 @@ No raw token or message-body contents belong in the activation receipt.
    Begin with Ezra's two-chat proof. Do not bounce all owner services blindly.
    Plist edits require unloading/reloading the definition, not just kickstart:
 
-   ```sh
-   launchctl bootout "gui/$(id -u)/ai.hermes.serve-ezra"
-   sleep 3
-   launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/ai.hermes.serve-ezra.plist"
-   ```
+   Record the old PID and listener before `launchctl bootout`. Observe that exact
+   process's exit and the listener's disappearance before `launchctl bootstrap`
+   loads the changed plist. A fixed sleep is not an exit or readiness gate.
+   After bootstrap, verify the new source, environment and protected readiness.
 
    Apply the same approved, sequential procedure to the other selected serves.
-   Gateways, durable cron identities and Desktop app are not in this restart set.
+   This canary restart set does not include gateways or the Desktop app. Kepler's
+   shared-source inventory includes seven holders: Marco must explicitly choose
+   rolling adoption if any remain on previously loaded code, or coordinate their
+   separate restart. Do not report fleet-wide adoption from the canary. Retain
+   durable cron identities and their legacy configuration in either case.
 4. Reconnect the Desktop to the promoted serve. Run normal owner turns in two
    Ezra chats. Each sets a distinct synthetic status through `set_summary`;
    send private synthetic mail to each resulting UUID, then verify that only
