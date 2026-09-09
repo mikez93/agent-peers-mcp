@@ -211,19 +211,63 @@ another tool call, and rollback under a new
 backend UUID with the same mailbox/unread message. They do not prove actual model
 wake, host admission persistence, user transport preservation or native liveness.
 
-### Exact remaining host methods (Kepler9751)
+### Frozen GUI translator subset (Kepler9759/9760)
+
+`shared/hermes-gui-lifecycle-bridge.ts` implements the GUI observation/inventory
+translation against reviewed Hermes commit
+`329d93de36cd32806e4fd4922ebc735eb307b37a`:
+`tui_gateway/methods_lifecycle.py:161–249`,
+`hermes_state_runtime_lifecycle.py`, and the reclaim-reason set in
+`tui_gateway/session_lifecycle.py:286`.
+
+The caller provides the **existing authenticated, response-ID-correlated**
+JSON-RPC transport. `request()` resolves the result object only and rejects RPC
+errors. The bridge does not open sockets, read credentials or provide a new
+authentication factory. Its sole wire method is `session.lifecycle_snapshot`,
+with optional existing profile selector and at most 128 unique
+`conversation_ids`. A profile selector is never synthesized from canonical home;
+returned home/backend must match the bridge scope exactly.
+
+Local `observe()` selects an exact six-field Desktop row from this snapshot.
+It is not a new RPC. Unsupported/native/compute surfaces remain unknown. Missing
+rows and the short `{conversation_id,state:"unknown"}` terminal form never
+create identity or imply close. Sequence must be positive, live activity flags
+must be booleans, and durable terminal end fingerprints must be numeric.
+`changed_at` may be newer than request-start `observed_at`; it is not freshness.
+The end fingerprint is opaque, not converted into a freshness timestamp.
+
+Larger terminal lookup sets use sequential 128-root batches under one five-second
+deadline. Repeated whole-GUI live inventories must agree (including activity
+flags); changes, malformed/error responses or partial inventory discard the
+entire aggregate. Identical live rows are deduplicated and the oldest
+request-start time is retained. This is deliberately conservative, not an atomic
+snapshot across requests. `inventory_complete` only describes the captured GUI
+registry, never native or fleet completeness.
+
+Only `idle_timeout`, `lru_evict`, and `ws_orphan_reap` map to `automatic_reap`;
+`tui_close` maps to `explicit_close`. Other durable end reasons currently abstain,
+rather than inventing a normalized completion/close policy. RPC 4004/5036,
+timeouts and aborts yield unavailable/unknown, not an empty authoritative inbox.
+
+The bridge's `admit` and `reconcile` methods **reject as unavailable**. It has no
+production factory/import or live activation. Tests feed pinned-shape synthetic
+RPC results and compose the translator with the actual broker/adapter: metadata
+is translated, but no host turn is admitted and unread mail is not acknowledged.
+Neither those fixtures nor an injected transport prove authentication or real
+host RPC cancellation.
+
+### Exact remaining host methods
 
 The typed bridge is `HermesConversationHostBridge` in
 `shared/hermes-conversation-composition.ts`. Final authenticated wire translation,
-factory construction and a replayed host source pin remain required:
+factory construction and a replayed final host source pin remain required:
 
 1. `observe(exactContext, signal)`: positive registry/readback ownership, host
    lifecycle generation and **request-start** time. GUI checkpoint `329d93de36`
    is not all-host inventory. Native CLI/cron positive authority is unimplemented;
    `runtime_context` hints must yield unknown/no bind, never a T1 fallback.
-2. `inventory(knownRoots, signal)`: complete normalized scope, exact live/terminal
-   states/reasons and unknown handling; batch/deduplicate terminal lookups limited
-   to 128 roots per host request.
+2. `inventory(knownRoots, signal)`: the frozen GUI subset above is translated.
+   Native positive authority and final cross-surface integration remain open.
 3. `admit(request, signal)` / `reconcile(request, signal)`: exact context,
    lifecycle generation, monotonic attempt sequence/UUID and durable receipt.
    These host methods are unimplemented. They must fence close/disposal before
