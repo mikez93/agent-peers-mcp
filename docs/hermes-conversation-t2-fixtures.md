@@ -79,3 +79,44 @@ the private mailbox; missing inventory is unknown, not close. This reconciler is
 not implemented by the wake module. Its candidates must come from that reconciled
 binding authority before live T2 activation. The coordinator already receives the
 actual peer UUID; it never asks a model to report its identity from `list_peers`.
+
+## OPEN-idle lifecycle preparation
+
+`shared/hermes-conversation-lifecycle.ts` is a separate **fixture-stage**
+reconciliation engine, also without a production importer. It normalizes no
+particular Hermes RPC. Its input is an authenticated complete inventory with
+home/backend identity, observation time, and explicit per-conversation state,
+reason and host sequence. Unknown/incomplete/stale input abstains; missing rows
+never generate close commands.
+
+The caller supplies a synchronous local transactional `apply` port. That port
+must compare the expected binding epoch/state/segment/order, maintain visible
+peer/token state on renewal, revoke it on terminal release, and persist host
+sequence provenance atomically. This is a required integration contract, not
+permission to call the T1 asynchronous broker binding method without awaiting it.
+
+T1 bindings have dispatch-order provenance. The same backend cannot silently
+reinterpret that number as a host counter. A new backend UUID can reset the
+counter only after old live ownership has expired and a newer observation
+proves the exact conversation. Terminal evidence cannot release a different
+backend's owner. Same-backend adapter replacement still needs a verified
+ownership handoff; this preparatory engine abstains rather than guessing.
+
+The controlled-clock test renews two actual broker binding/listing rows every
+15 seconds for ten simulated minutes. Both retain their own status and epoch,
+and the synthetic unread message row remains byte-for-byte equivalent. No
+additional agent tool calls or model turns keep them alive. Other fixtures prove
+exact close/reap delisting, token revocation without ack, stale/duplicate/unknown
+evidence refusal, observation-anchored leases, immutable pass entry and CAS races.
+
+**Not yet covered:** production authenticated inventory translation, persistent
+provenance schema migration, token/peer recreation after expiry or backend
+replacement, actual loaded-adapter call drainage, and cross-surface host liveness.
+The fixture transactional port uses the real binding store plus visible-row
+renewal/release SQL, not a new live broker endpoint. The new-backend test checks
+the proposed change and does not claim successful mailbox reactivation.
+
+Generic native CLI/cron hook context may use `runtime_context` with the six
+unprefixed identity fields and omitted absent UI ID (Kepler9727/Vector9734).
+It remains a hint. A finalizer hook before a successful durable terminal write
+cannot itself authorize release or prove liveness.
