@@ -37,6 +37,11 @@ if (existsSync(disabledFlag)) {
   process.env.AGENT_PEERS_ENABLED ??= "1";
 }
 
-await import("./codex-server.ts");
+if (process.env.AGENT_PEERS_HERMES_V2 === "1") {
+  const { startHermesConversationRuntime } = await import("./shared/hermes-conversation-runtime.ts");
+  await startHermesConversationRuntime();
+} else {
+  await import("./codex-server.ts");
+}
 
 export {};

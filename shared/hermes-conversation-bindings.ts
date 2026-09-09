@@ -67,6 +67,13 @@ export function installHermesConversationSchema(db: Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_hermes_conversations_state_lease
       ON hermes_conversations(state, owner_lease_until);
+    CREATE TABLE IF NOT EXISTS hermes_conversation_segments (
+      peer_id TEXT NOT NULL REFERENCES hermes_conversations(peer_id),
+      session_id TEXT NOT NULL,
+      PRIMARY KEY(peer_id,session_id)
+    );
+    INSERT OR IGNORE INTO hermes_conversation_segments
+      SELECT peer_id,current_session_id FROM hermes_conversations;
   `);
 }
 
@@ -117,6 +124,7 @@ export class HermesConversationBindings {
       const now = this.validateEvidence(evidence);
       const ctx = evidence.context;
       const old = this.byKey(ctx);
+      if (old) this.checkSegment(old, ctx.session_id);
       if (old?.state === "disposed" || old?.state === "orphaned") {
         throw new Error("conversation_not_resumable");
       }
@@ -155,8 +163,15 @@ export class HermesConversationBindings {
         ctx.backend_id, evidence.adapter_id, (old?.generation ?? 0) + 1,
         evidence.lifecycle_generation, evidence.observed_at + HERMES_OWNER_LEASE_MS,
         evidence.observed_at, old?.created_at ?? now, now);
+      this.db.query("INSERT OR IGNORE INTO hermes_conversation_segments VALUES (?,?)").run(peerId, ctx.session_id);
       return this.get(peerId)!;
     })();
+  }
+
+  private checkSegment(row: ConversationBinding, sessionId: string): void {
+    if (row.current_session_id !== sessionId && this.db.query(
+      "SELECT 1 FROM hermes_conversation_segments WHERE peer_id=? AND session_id=?",
+    ).get(row.peer_id, sessionId)) throw new Error("superseded_conversation_segment");
   }
 
   private availableName(context: HermesConversationContext, profile: string): string {
@@ -173,6 +188,7 @@ export class HermesConversationBindings {
     this.db.transaction(() => {
       const now = this.validateEvidence(evidence);
       const row = this.checkOwner(owner);
+      this.checkSegment(row, evidence.context.session_id);
       if (conversationKey(row) !== conversationKey(evidence.context)
           || row.backend_id !== evidence.context.backend_id || row.adapter_id !== evidence.adapter_id
           || evidence.lifecycle_generation < row.lifecycle_generation
@@ -188,6 +204,8 @@ export class HermesConversationBindings {
         WHERE peer_id = ?`).run(evidence.context.session_id, evidence.context.platform,
         evidence.lifecycle_generation, evidence.observed_at,
         evidence.observed_at + HERMES_OWNER_LEASE_MS, now, row.peer_id);
+      this.db.query("INSERT OR IGNORE INTO hermes_conversation_segments VALUES (?,?)")
+        .run(row.peer_id, evidence.context.session_id);
     })();
   }
 
@@ -206,7 +224,8 @@ export class HermesConversationBindings {
     observedAt: number,
   ): void {
     this.db.transaction(() => {
-      const row = this.checkOwner(owner);
+      const row = this.checkOwner(owner, false);
+      if (row.state !== "active" && row.state !== "suspended") throw new Error("stale_conversation_owner");
       this.validateEvidence({ context: { ...row, session_id: row.current_session_id },
         adapter_id: row.adapter_id, lifecycle_generation: lifecycleGeneration, observed_at: observedAt });
       if (lifecycleGeneration <= row.lifecycle_generation || observedAt < row.observed_at) {
@@ -242,8 +261,8 @@ export class HermesConversationBindings {
 export function dormantMailboxNotice(state: ConversationState): string | undefined {
   const notices: Partial<Record<ConversationState, string>> = {
     closed: "queued to dormant mailbox; recipient closed, will not be woken",
-    reaped: "queued to dormant mailbox; automatic reap, exact-session resume pending",
-    suspended: "queued to dormant mailbox; backend unavailable, wake pending",
+    reaped: "queued to dormant mailbox; automatic reap, exact-session resume required; no autonomous wake",
+    suspended: "queued to dormant mailbox; backend unavailable; no autonomous wake",
     orphaned: "queued to orphaned mailbox; chat deleted, operator action required",
   };
   return notices[state];

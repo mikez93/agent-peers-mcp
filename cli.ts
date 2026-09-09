@@ -154,6 +154,7 @@ async function cmdSend(targetNameOrId: string, message: string) {
   let exitCode = 0;
   let sendError: string | null = null;
   let messageId: number | undefined;
+  let notice: string | undefined;
   try {
     const res = await client.sendMessage({
       from_id: reg.id, session_token: reg.session_token, to_id_or_name: targetNameOrId, text: message,
@@ -163,6 +164,7 @@ async function cmdSend(targetNameOrId: string, message: string) {
       exitCode = 1;
     } else {
       messageId = res.message_id;
+      notice = res.notice;
     }
   } finally {
     try {
@@ -176,6 +178,7 @@ async function cmdSend(targetNameOrId: string, message: string) {
     process.exit(exitCode);
   }
   console.log(`sent (id=${messageId}, from=${reg.name})`);
+  if (notice) console.log(notice);
 }
 
 async function cmdRename(target: string, newName: string) {
@@ -731,6 +734,7 @@ async function cmdStrandedMessages() {
 
 async function cmdGcInboxes(apply: boolean, minAgeDays: number) {
   const { rename } = await import("node:fs/promises");
+  const { findConversation } = await import("./shared/hermes-conversation-fence.ts");
   const inboxes = await readAllInboxFiles();
   const db = await openDbReadonly();
   const cutoff = Date.now() - minAgeDays * 24 * 3600_000;
@@ -738,6 +742,9 @@ async function cmdGcInboxes(apply: boolean, minAgeDays: number) {
   let tooRecent = 0;
   try {
     for (const box of inboxes) {
+      // A collected visible row is not a dead conversation mailbox. Explicit
+      // v2 disposal owns its archive/reconciliation, not legacy mtime GC.
+      if (findConversation(db, box.peerId)) continue;
       const row = db.query("SELECT id FROM peers WHERE id = ?").get(box.peerId);
       if (row) continue;                 // live or retained peer: keep
       if (box.mtimeMs > cutoff) {        // too recent: keep (may be mid-write)

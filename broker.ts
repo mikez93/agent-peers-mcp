@@ -16,6 +16,8 @@ import type {
   RenamePeerRequest, RenamePeerResponse,
 } from "./shared/types.ts";
 import { appendSuffixWithinLimit, generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
+import { findConversation, hasConversationSchema, withConversationFence } from "./shared/hermes-conversation-fence.ts";
+import { dormantMailboxNotice, type ConversationOwner } from "./shared/hermes-conversation-bindings.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
@@ -504,6 +506,7 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
 }
 
 function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse {
+  if (req.prev_id && findConversation(db, req.prev_id)) throw new Error("conversation_mailbox_requires_exact_binding");
   const ts = nowIso();
   const requestedStartedAt = canonicalStartedAt(req.started_at, ts);
   // Every register (fresh or reclaim) issues a new session_token. Reclaim
@@ -526,7 +529,7 @@ function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse
   // is provably gone may reclaim immediately; this preserves its UUID and
   // queued mailbox across an ordinary process restart without waiting for the
   // stale timer. Live, uninspectable, and remote-host peers remain age-gated.
-  if (req.name && isValidName(req.name)) {
+  if (req.name && isValidName(req.name) && !findConversation(db, req.name)) {
     const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
     const existing = db.query<
       { pid: number | null; host: string | null },
@@ -583,6 +586,7 @@ function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   for (const candidate of nameCandidates(req.name)) {
+    if (findConversation(db, candidate)) continue;
     try {
       insert.run(
         id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
@@ -618,6 +622,7 @@ function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse
  *  is inside the same single-user trust boundary (the shared secret file). */
 function repointOrphanedMail(db: Database, prevId: string | undefined, newId: string): void {
   if (!prevId || prevId === newId) return;
+  if (findConversation(db, prevId)) throw new Error("conversation_mailbox_requires_exact_binding");
   const prevRow = db.query("SELECT id FROM peers WHERE id = ?").get(prevId);
   if (prevRow) return; // previous incarnation's row still exists — not ours to move
   const moved = db.query(
@@ -649,19 +654,32 @@ function repointOrphanedMail(db: Database, prevId: string | undefined, newId: st
 // deletes every peer, and each surviving client would then heartbeat into a
 // deleted row — succeeding, silently, forever, while invisible to the network.
 // The row count is the only evidence that the heartbeat landed. Report it.
-export function heartbeatPeer(db: Database, id: string, session_token: string): boolean {
+export function heartbeatPeer(db: Database, id: string, session_token: string, owner?: ConversationOwner): boolean {
+  return withConversationFence(db, id, session_token, owner, () => heartbeatPeerInner(db, id, session_token));
+}
+function heartbeatPeerInner(db: Database, id: string, session_token: string): boolean {
   const info = db.query("UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?")
     .run(nowIso(), id, session_token);
   return (info.changes ?? 0) > 0;
 }
 
-export function unregisterPeer(db: Database, id: string, session_token: string): void {
+export function unregisterPeer(db: Database, id: string, session_token: string, owner?: ConversationOwner): void {
+  withConversationFence(db, id, session_token, owner, () => unregisterPeerInner(db, id, session_token));
+}
+function unregisterPeerInner(db: Database, id: string, session_token: string): void {
   // Messages stay as orphans (spec §5.1).
   db.query("DELETE FROM peers WHERE id = ? AND session_token = ?")
     .run(id, session_token);
 }
 
-export function setPeerSummary(db: Database, id: string, session_token: string, summary: string): void {
+export function setPeerSummary(db: Database, id: string, session_token: string, summary: string, owner?: ConversationOwner): void {
+  withConversationFence(db, id, session_token, owner, () => {
+    setPeerSummaryInner(db, id, session_token, summary);
+    if (owner) db.query("UPDATE hermes_conversations SET summary = ?, updated_at = ? WHERE peer_id = ?")
+      .run(summary, Date.now(), id);
+  });
+}
+function setPeerSummaryInner(db: Database, id: string, session_token: string, summary: string): void {
   db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ? AND session_token = ?")
     .run(summary, nowIso(), id, session_token);
 }
@@ -705,6 +723,10 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
   const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
   clauses.push("last_seen >= ?");
   params.push(cutoff);
+  if (hasConversationSchema(db)) {
+    clauses.push(`NOT EXISTS (SELECT 1 FROM hermes_conversations hc WHERE hc.peer_id = peers.id
+      AND (hc.state != 'active' OR hc.owner_lease_until <= ${Date.now()}))`);
+  }
 
   if (req.scope === "directory") {
     clauses.push("cwd = ?");
@@ -756,7 +778,10 @@ function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
   return getPeerByName(db, to_id_or_name);
 }
 
-export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
+export function sendMessage(db: Database, req: SendMessageRequest, owner?: ConversationOwner): SendMessageResponse {
+  return withConversationFence(db, req.from_id, req.session_token, owner, () => sendMessageInner(db, req));
+}
+function sendMessageInner(db: Database, req: SendMessageRequest): SendMessageResponse {
   // Atomic sender auth + target resolution + liveness check + insert, all in
   // a single transaction so nothing can unregister or re-register between
   // steps and orphan a "successful" message (Codex round-D TOCTOU fix).
@@ -775,6 +800,23 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
       ).get(req.from_id, req.session_token);
       if (!row) return { ok: false, error: `unauthorized sender: ${req.from_id}` };
       return { ok: false, error: `sender stale: ${row.name}` };
+    }
+
+    const conversation = findConversation(db, req.to_id_or_name);
+    if (conversation) {
+      if (conversation.state === "disposed") return { ok: false, error: "conversation mailbox disposed" };
+      const backlog = db.query<{ n: number }, [string]>(
+        "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND acked = 0",
+      ).get(conversation.peer_id)!.n;
+      if (backlog >= MAX_QUEUED_PER_DURABLE_PEER) {
+        return { ok: false, error: `conversation mailbox full: ${backlog} undelivered (limit 500); message not queued` };
+      }
+      const inserted = db.query<{ id: number }, [string, string, string, string, string]>(
+        "INSERT INTO messages (from_id, to_id, text, sent_at, message_uid) VALUES (?, ?, ?, ?, ?) RETURNING id",
+      ).get(req.from_id, conversation.peer_id, req.text, nowStr, randomUUID())!;
+      const state = conversation.state === "active" && conversation.owner_lease_until <= Date.now()
+        ? "suspended" : conversation.state;
+      return { ok: true, message_id: inserted.id, notice: dormantMailboxNotice(state) };
     }
 
     // 2. Target resolution + deliverability + insert in ONE statement, so
@@ -832,7 +874,10 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
 
 // ----- Poll (lease) -----
 
-export function pollMessages(db: Database, id: string, session_token: string): LeasedMessage[] {
+export function pollMessages(db: Database, id: string, session_token: string, owner?: ConversationOwner): LeasedMessage[] {
+  return withConversationFence(db, id, session_token, owner, () => pollMessagesInner(db, id, session_token));
+}
+function pollMessagesInner(db: Database, id: string, session_token: string): LeasedMessage[] {
   const now = new Date();
   const nowStr = now.toISOString();
   const leaseUntil = new Date(now.getTime() + LEASE_DURATION_MS).toISOString();
@@ -888,7 +933,10 @@ export function pollMessages(db: Database, id: string, session_token: string): L
 
 // ----- Ack -----
 
-export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesResponse {
+export function ackMessages(db: Database, req: AckMessagesRequest, owner?: ConversationOwner): AckMessagesResponse {
+  return withConversationFence(db, req.id, req.session_token, owner, () => ackMessagesInner(db, req));
+}
+function ackMessagesInner(db: Database, req: AckMessagesRequest): AckMessagesResponse {
   if (req.lease_tokens.length === 0) return { ok: true, acked: 0, stale: 0, results: [] };
   const now = nowIso();
   // Atomic auth via subquery: the UPDATE only affects messages whose to_id
@@ -948,7 +996,19 @@ export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesR
 
 // ----- Rename -----
 
-export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResponse {
+export function renamePeer(db: Database, req: RenamePeerRequest, owner?: ConversationOwner): RenamePeerResponse {
+  return withConversationFence(db, req.id, req.session_token, owner, () => {
+    const reservation = findConversation(db, req.new_name);
+    if (reservation && reservation.peer_id !== req.id) return { ok: false, error: "name reserved by conversation" };
+    const result = renamePeerInner(db, req);
+    if (owner && result.ok) {
+      db.query("UPDATE hermes_conversations SET name = ?, updated_at = ? WHERE peer_id = ?")
+        .run(result.name!, Date.now(), req.id);
+    }
+    return result;
+  });
+}
+function renamePeerInner(db: Database, req: RenamePeerRequest): RenamePeerResponse {
   if (!isValidName(req.new_name)) return { ok: false, error: "invalid name" };
   // Atomic auth + rename: session_token is bound in the WHERE, so a
   // reclaim-rotated row is unchangeable by a stale session. Zero changes
@@ -1021,8 +1081,11 @@ export function gcOldMessages(db: Database): number {
   // will ever reclaim must not accumulate forever (5,202 orphans did).
   const ackedCutoff = new Date(Date.now() - MESSAGE_RETENTION_MS).toISOString();
   const unackedCutoff = new Date(Date.now() - UNACKED_RETENTION_MS).toISOString();
+  const conversationExemption = hasConversationSchema(db)
+    ? " AND NOT EXISTS (SELECT 1 FROM hermes_conversations hc WHERE hc.peer_id = messages.to_id)"
+    : "";
   const info = db.query(
-    `DELETE FROM messages WHERE (acked = 1 AND sent_at < ?) OR (acked = 0 AND sent_at < ?)`
+    `DELETE FROM messages WHERE (acked = 1 AND sent_at < ?) OR (acked = 0 AND sent_at < ?${conversationExemption})`
   ).run(ackedCutoff, unackedCutoff);
   return info.changes ?? 0;
 }

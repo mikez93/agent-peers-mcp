@@ -697,7 +697,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
           from_id: myId!, session_token: mySession!, to_id_or_name: to_id, text: message,
         });
         if (!res.ok) return { text: `Send failed: ${res.error}`, isError: true };
-        return { text: `Message sent (id=${res.message_id}).` };
+        return { text: `Message sent (id=${res.message_id}).${res.notice ? ` ${res.notice}` : ""}` };
       }
 
       case "set_summary": {

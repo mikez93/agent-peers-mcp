@@ -235,7 +235,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       if (!res.ok) {
         return { content: [{ type: "text" as const, text: `Send failed: ${res.error}` }], isError: true };
       }
-      return { content: [{ type: "text" as const, text: `Message sent (id=${res.message_id}).` }] };
+      return { content: [{ type: "text" as const, text: `Message sent (id=${res.message_id}).${res.notice ? ` ${res.notice}` : ""}` }] };
     }
 
     case "set_summary": {

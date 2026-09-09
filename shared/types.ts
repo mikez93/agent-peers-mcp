@@ -99,6 +99,8 @@ export interface SendMessageResponse {
   ok: boolean;
   error?: string;
   message_id?: number;
+  /** Queued is not delivered or woken, especially for a saved conversation. */
+  notice?: string;
 }
 
 export interface PollMessagesRequest { id: PeerId; session_token: string; }
