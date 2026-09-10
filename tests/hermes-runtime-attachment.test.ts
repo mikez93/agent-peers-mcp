@@ -7,6 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { initDb } from "../broker.ts";
 import { createHermesAttachmentBridge } from "../shared/hermes-runtime-attachment.ts";
 import type { HermesGuiLifecycleBridge } from "../shared/hermes-gui-lifecycle-bridge.ts";
+import type { WakeRequest } from "../shared/hermes-conversation-wake.ts";
 
 const backend_id = "77ab3c4a-2e1b-4d4a-a5b4-88009412f721";
 const attachment_id = "347a20b0-34c9-456b-a0aa-43407b7b3b5f";
@@ -26,7 +27,12 @@ beforeEach(() => {
   chmodSync(root, 0o700);
   requests = []; sockets = new Set(); connections = 0; fetchMode = "";
   handler = (ws, request) => ws.send(JSON.stringify({ jsonrpc: "2.0", id: request.id,
-    result: request.method === "gateway.ping" ? { ok: true, home, backend_id } : snapshot() }));
+    result: request.method === "gateway.ping" ? { ok: true, home, backend_id }
+      : request.method === "session.lifecycle_snapshot" ? snapshot()
+      : { attempt_id: request.params.attempt_id, attempt_sequence: request.params.attempt_sequence,
+        context: request.params.context.platform === "cli"
+          ? { ...request.params.context, ui_session_id: null } : request.params.context,
+        state: request.method === "session.wake_admit" ? "accepted" : "started" } }));
   server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     fetch(req, server) {
@@ -66,6 +72,13 @@ function snapshot() {
   return { home, backend_id, observed_at: Date.now(), inventory_complete: true,
     sessions: [], terminal: [], unknown_runtime_ids: [] };
 }
+function wakeRequest(): WakeRequest {
+  return { attempt_id: "a28d2451-b3dc-4309-9bad-d19a0f17db04", attempt_sequence: 1,
+    peer_id: "peer-native", context: { home, backend_id, conversation_id: "native",
+      session_id: "native", platform: "cli" }, binding_generation: 2,
+    expected_lifecycle_generation: 3, resume: false, queued: true, hidden: true,
+    notice: "Check pending mail." };
+}
 async function connect(signal = new AbortController().signal) {
   const bridge = await createHermesAttachmentBridge(path, { home, backend_id }, signal);
   bridges.push(bridge);
@@ -89,6 +102,15 @@ test.each(["token", "internal"])("actual loopback %s auth, ping first, snapshot 
   expect(readFileSync(path)).toEqual(before);
   await connect();
   expect(requests.map(r => r.method)).toEqual(["gateway.ping", "session.lifecycle_snapshot", "gateway.ping"]);
+});
+
+test("actual attachment forwards exact admit/reconcile requests and correlated receipts", async () => {
+  const bridge = await connect(), request = wakeRequest();
+  expect(await bridge.admit(request, new AbortController().signal)).toMatchObject({ state: "accepted" });
+  expect(await bridge.reconcile(request, new AbortController().signal)).toMatchObject({ state: "started" });
+  expect(requests.slice(1).map(row => row.method)).toEqual(["session.wake_admit", "session.wake_reconcile"]);
+  expect(requests.slice(1).map(row => row.params)).toEqual([request, request]);
+  expect(existsSync(path)).toBe(true);
 });
 
 test.each(["mode", "parent", "symlink", "hardlink", "directory", "relative", "missing", "oversize", "json", "scope", "backend", "version", "credential"])(

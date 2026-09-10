@@ -3,6 +3,7 @@ import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, realpat
 import { isIP } from "node:net";
 import { dirname, isAbsolute } from "node:path";
 import { HermesGuiLifecycleBridge, type HermesLifecycleRpc } from "./hermes-gui-lifecycle-bridge.ts";
+import type { WakeRequest } from "./hermes-conversation-wake.ts";
 
 type Scope = Readonly<{ home: string; backend_id: string }>;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -134,9 +135,21 @@ class AttachmentRpc implements HermesLifecycleRpc {
   }
 
   request(method: "session.lifecycle_snapshot",
-    params: Readonly<{ profile?: string; conversation_ids: readonly string[] }>, signal: AbortSignal): Promise<unknown> {
-    if (method !== "session.lifecycle_snapshot" || params.profile !== undefined) return Promise.reject(fail("scope_refused"));
-    return this.call(method, { conversation_ids: params.conversation_ids }, signal);
+    params: Readonly<{ profile?: string; conversation_ids: readonly string[] }>, signal: AbortSignal): Promise<unknown>;
+  request(method: "session.wake_admit" | "session.wake_reconcile",
+    params: Readonly<WakeRequest>, signal: AbortSignal): Promise<unknown>;
+  request(method: string, params: Readonly<{ profile?: string; conversation_ids?: readonly string[] }> | Readonly<WakeRequest>,
+    signal: AbortSignal): Promise<unknown> {
+    if (method === "session.lifecycle_snapshot") {
+      if ("profile" in params && params.profile !== undefined || !("conversation_ids" in params)) {
+        return Promise.reject(fail("scope_refused"));
+      }
+      return this.call(method, { conversation_ids: params.conversation_ids }, signal);
+    }
+    if (!["session.wake_admit", "session.wake_reconcile"].includes(method) || "profile" in params) {
+      return Promise.reject(fail("scope_refused"));
+    }
+    return this.call(method, params, signal);
   }
 
   async close(): Promise<void> {

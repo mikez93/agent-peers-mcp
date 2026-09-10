@@ -213,28 +213,32 @@ another tool call, and rollback under a new
 backend UUID with the same mailbox/unread message. They do not prove actual model
 wake, host admission persistence, user transport preservation or native liveness.
 
-### Frozen GUI translator subset (Kepler9759/9760)
+### Reviewed lifecycle and wake translator (Kepler9908)
 
-`shared/hermes-gui-lifecycle-bridge.ts` implements the GUI observation/inventory
-translation against reviewed Hermes commit
-`329d93de36cd32806e4fd4922ebc735eb307b37a`:
-`tui_gateway/methods_lifecycle.py:161–249`,
-`hermes_state_runtime_lifecycle.py`, and the reclaim-reason set in
-`tui_gateway/session_lifecycle.py:286`.
+`shared/hermes-gui-lifecycle-bridge.ts` translates the reviewed Hermes commit
+`65d7a5b06a08703dbaab079476dfdca24cb894d4` (tree
+`907fd4dd1b99e8c0dc9619292df6637792186a27`), applied after
+`64871a018a753f79eced5df994bfcb9915d48319`. The ordered host pair extends the
+earlier `329d93de36` GUI snapshot with same-process native ownership, durable
+native terminal evidence, and fenced wake admission/receipt methods. The final
+host patch makes native CLI/cron snapshot identity consistent: both live and
+terminal rows omit `ui_session_id`, while durable wake receipts retain the
+internal wire normalization `ui_session_id:null`.
 
 The caller provides the **existing authenticated, response-ID-correlated**
 JSON-RPC transport. `request()` resolves the result object only and rejects RPC
 errors. The bridge does not open sockets, read credentials or provide a new
-authentication factory. Its sole wire method is `session.lifecycle_snapshot`,
-with optional existing profile selector and at most 128 unique
-`conversation_ids`. A profile selector is never synthesized from canonical home;
-returned home/backend must match the bridge scope exactly.
+authentication factory. Its methods are `session.lifecycle_snapshot`,
+`session.wake_admit`, and `session.wake_reconcile`. Snapshot calls retain the
+128-root batching rule. Attachment-bound calls omit profile selectors; returned
+home/backend must match the bridge scope exactly.
 
-Local `observe()` selects an exact six-field Desktop row from this snapshot.
-It is not a new RPC. Unsupported/native/compute surfaces remain unknown. Missing
-rows and the short `{conversation_id,state:"unknown"}` terminal form never
-create identity or imply close. Sequence must be positive, live activity flags
-must be booleans, and durable terminal end fingerprints must be numeric.
+Local `observe()` selects the exact context from the snapshot. Desktop/TUI rows
+must carry `ui_session_id`; native CLI/cron rows must omit it. Inventing or
+borrowing the other shape invalidates the whole inventory. Missing rows and the
+short `{conversation_id,state:"unknown"}` terminal form never create identity or
+imply close. Sequence must be positive, live activity flags must be booleans,
+and durable terminal end fingerprints must be numeric.
 `changed_at` may be newer than request-start `observed_at`; it is not freshness.
 The end fingerprint is opaque, not converted into a freshness timestamp.
 
@@ -243,53 +247,49 @@ deadline. Repeated whole-GUI live inventories must agree (including activity
 flags); changes, malformed/error responses or partial inventory discard the
 entire aggregate. Identical live rows are deduplicated and the oldest
 request-start time is retained. This is deliberately conservative, not an atomic
-snapshot across requests. `inventory_complete` only describes the captured GUI
-registry, never native or fleet completeness.
+snapshot across requests. `inventory_complete` describes the host's captured
+same-process GUI/native registry, never fleet completeness.
 
 Only `idle_timeout`, `lru_evict`, and `ws_orphan_reap` map to `automatic_reap`;
-`tui_close` maps to `explicit_close`. Other durable end reasons currently abstain,
-rather than inventing a normalized completion/close policy. RPC 4004/5036,
-timeouts and aborts yield unavailable/unknown, not an empty authoritative inbox.
+`tui_close` and `cli_close` map to `explicit_close`. Cron completion and other
+durable end reasons abstain. The coordinator separately refuses automatic-reap
+cron resurrection. RPC 4004/5036, timeouts and aborts yield unavailable/unknown,
+not an empty authoritative inbox.
 
-The bridge's `admit` and `reconcile` methods **reject as unavailable**. It has no
-live activation. Its original tests feed pinned-shape synthetic
-RPC results and compose the translator with the actual broker/adapter: metadata
-is translated, but no host turn is admitted and unread mail is not acknowledged.
-Neither those fixtures nor an injected transport prove authentication or real
-host RPC cancellation.
+Wake calls require the exact `WakeRequest`: no extra fields, positive safe
+generations, exact scoped context, `queued`/`hidden` true, and bounded IDs/notice.
+Receipts must contain only attempt ID/sequence/context/state and match the request.
+Hermes persists native receipt contexts with `ui_session_id:null`; the translator
+requires and normalizes that host shape back to the omitted-UI MCP context.
+Mismatched, malformed, late or aborted receipts never advance uncertainty.
 
-### Exact remaining host methods
+The host persists accepted before effects. Live GUI work stays behind human FIFO
+without rebinding the foreground transport; idle CLI uses an exact consumed
+envelope; cron defers. Pre-start ownership is rechecked, terminal callbacks
+persist completed/cancelled, and same-attempt reconcile reads the durable receipt.
+Only authoritative automatic reap can invoke the host's internal detached resume.
+Closing the attachment may discard the RPC result but does not cancel accepted
+work. No broker message is acknowledged by lifecycle or wake receipts.
 
-The typed bridge is `HermesConversationHostBridge` in
-`shared/hermes-conversation-composition.ts`. Final native/admission wire
-translation and a replayed final host source pin remain required:
+### Remaining paired activation
 
-1. `observe(exactContext, signal)`: positive registry/readback ownership, host
-   lifecycle generation and **request-start** time. GUI checkpoint `329d93de36`
-   is not all-host inventory. Native CLI/cron positive authority is unimplemented;
-   `runtime_context` hints must yield unknown/no bind, never a T1 fallback.
-2. `inventory(knownRoots, signal)`: the frozen GUI subset above is translated.
-   Native positive authority and final cross-surface integration remain open.
-3. `admit(request, signal)` / `reconcile(request, signal)`: exact context,
-   lifecycle generation, monotonic attempt sequence/UUID and durable receipt.
-   These host methods are unimplemented. They must fence close/disposal before
-   enqueue and again before start, preserve hidden queued/display/terminal-callback
-   fields, and never rebind user transport.
-4. `close()`: release bridge transport/resources without cancelling accepted work.
-
-Do not substitute ordinary `prompt.submit`/`session.resume` or guess missing
-native authority. Assemble the paired activation package after these methods
-and source replay are frozen. Preserve the new broker, retained mail, v1 exclusion
-and durable crons throughout rollback. Marco owns live acceptance and retirement.
+The source bridge contract is now complete for reviewed GUI/native lifecycle and
+host wake admission. Remaining work is one replayed host package plus real
+cross-surface acceptance: populated Desktop/native identity, unread routing,
+accepted/started/completed behavior, close/reap races, backend/MCP replacement,
+resource cycles, and the 30-second idle-ready goal. Preserve retained mail, v1
+exclusion and durable crons through rollback. Marco owns live acceptance and
+retirement; source import alone is not deployment permission.
 
 ## Host-issued authenticated attachment
 
-`shared/hermes-runtime-attachment.ts` pairs the GUI translator with the existing
-authenticated `/api/ws` route, pinned to Hermes
-`976c118bcd3c39c5ddd242459251df8bb879d618` (tree
-`ecf26f5a1a6e541268618fd45a06fe1e1773d84f`). The host publishes a canonical
-private descriptor after actual loopback bind and forces its reference after
-child configuration overrides. It does not add another authentication scheme.
+`shared/hermes-runtime-attachment.ts` pairs the translator with the existing
+authenticated `/api/ws` route. The ordered `64871a018a + 65d7a5b06a` host
+preserves the original `976c118bcd` descriptor/path/ping contract and adds the
+two allowlisted wake methods. The host publishes a canonical private descriptor after actual loopback
+bind and forces its reference after child configuration overrides. Standalone
+native CLI hosts use one process-lifetime attachment-only loopback listener.
+It does not add another authentication scheme.
 
 The factory reads only the supplied reference. It requires an owner-only0700
 parent and regular, single-link0600 file, checks the opened descriptor and
@@ -304,8 +304,7 @@ must return the exact home/backend; there is no `gateway.ready` wait. Subsequent
 requests are result-only, ID-correlated and bounded, with local abort/late-reply
 fencing. The attachment omits profile selectors. Close terminates only its
 socket, settles pending requests and never deletes the host-owned descriptor.
-The host's non-owning route preserves dispatched workers on socket loss;
-accepted-turn preservation remains unproved until admission exists.
+The host's non-owning route preserves accepted dispatched workers on socket loss.
 
 The standard launcher constructs this bridge only after containment, private
 database validation and exclusive backend claim. Missing/invalid supplied
@@ -321,33 +320,47 @@ The upgrade-refusal fixtures model ASGI's preaccept HTTP403, not real host
 authentication. Remote socket loss uses a disposable child process because
 Bun1.3.14's in-process server-side close leaves `pendingWebSockets=1` and its
 `stop()` promise unresolved. These tests do not claim Hermes backend-death
-continuity, native lifecycle authority, admission, model turns or live rollout.
+continuity, host-side execution correctness, model turns or live rollout.
 
 `tests/fixtures/hermes-attachment-consumer.ts` is the bounded descriptor consumer
 for the separate Python-host pairing harness. It uses the actual factory,
-checks complete scoped inventory and idempotent close without deleting the
-reference, and emits only a content-free success marker or failure exit.
+checks populated scoped inventory, exact observation, admit/reconcile receipts,
+idempotent close and retained descriptor, and emits only a content-free success
+marker or failure exit.
 
-Kepler9788 reports paired **2/2 token/internal PASS**, retries0, using real
-uvicorn plus the production Python route at the frozen host pin. Both cases
-invoke that actual Bun consumer under minimal environment/temporary HOME.
-Consumer SHA256 `6f33745cd0a8f3e9e354028540fac2b3e56e6ce6841c50dd4e8f6ed4a5a587ec`;
-factory SHA256 `20e32d2ed57905fe96f88f6082ba15413287bc3f9a0ce08faf2881f8c674a6c4`,
-stable before/after. This proves factory-to-Python authentication, exact
-**empty** inventory, idempotent close and descriptor retention. It does not
-prove populated lifecycle ownership, the complete MCP composition against
-Python, unread/ack, native authority, admission or resource-cycle acceptance.
-The local pairing harness is Kepler-owned
-`tmp/hermes-attachment-pair-20260909/test_pair.py`, SHA256
-`9c160cb4c3ae35c33718b6690489a55af6ceca87a570f7b39c696f5f55884bb2`.
+Final paired replay is **2/2 token/internal PASS** against ordered Hermes commits
+`64871a018a + 65d7a5b06a`, final tree `907fd4dd1b99e8c0dc9619292df6637792186a27`.
+It uses real Uvicorn plus the production `/api/ws` route, the actual Bun factory
+and consumer, a temporary SessionDB, and mixed live CLI/TUI ownership. Both auth
+modes prove exact TUI observe, accepted→started→completed, one host-seam model
+dispatch, foreground transport preservation, idempotent close and descriptor
+retention. Raw native wake receipts contain `ui_session_id:null`; after
+`cli_close`, the real native terminal snapshot omits the UI field.
 
-Final local validation: 43 attachment tests, 58 combined attachment/runtime
-tests with260 assertions, and full522 tests/55files3662 assertions; TypeScript
-and diff checks pass. Independent source review (including final cleanup delta)
-is clear. Independent QA initially passed56 combined tests/234 assertions, then
-rechecked the final43 attachment tests/189 assertions and typecheck, including
-exact error/stack/stderr redaction, nonregular-directory refusal and
-post-handshake timeout. Wrong-owner rejection,
-successful IPv6 dialing and explicit zero-stdio-start instrumentation during the
-attachment handshake remain source-checked or separate-fixture evidence rather
-than direct cases here. No production activation is implied by these results.
+Exact pairing artifacts:
+
+- Translator SHA256
+  `71c9b5157ea06427b430172b80af4c867b33ac387bcb1f485b682ae9dd2f0496`.
+- Attachment factory SHA256
+  `f5698955b9b1b5d5d7eb890854aa65ef35d2491749d454a06b8e5dc6773d97c7`.
+- Consumer SHA256
+  `13e95646b640756aa39e0a4d9b288f874d2fe2fd4a48026d9ddc263dc4e9977a`.
+- Harness
+  `tmp/hermes-attachment-pair-20260909/test_pair_wake.py`, SHA256
+  `30c62a2db952d9a236646318e93d4428c21f540169f64249094f729563b4d6dd`.
+- Ordered host patch 2 SHA256
+  `ddb2f5f4e04b0b2e79bd6042d895b429037d818cb477616617dce75b22ca10c1`.
+
+Final Peers validation passes the focused six-file gate at 122 tests/538
+assertions, the final translator/attachment gate at 65/298, and the full suite at
+529 tests across 55 files/3687 assertions. TypeScript and diff checks pass; the
+previous fixed-port broker test also passes isolated and in the full run, with
+no listener left on port7949. Independent source review is clear after the
+native receipt normalization correction. Independent QA passes65/298 plus
+typecheck/diff and targeted negative probes for native UI shape and close fencing.
+
+The pairing mocks only the model body at the host dispatch seam. It does not
+prove a live Desktop renderer, production broker/service activation, cron tick,
+backend-death continuity, automatic-reap cold resume, resource-cycle acceptance
+or the 30-second idle-ready objective. No production activation or v1 retirement
+is implied by these results.
