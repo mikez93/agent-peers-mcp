@@ -8,13 +8,17 @@ if (process.argv[2] === "daemon") {
     const frame = JSON.parse(String(raw));
     if (process.env.DROID_NATIVE_TEST_MODE === "malformed") { process.send?.("not-json"); return; }
     let result = {};
-    if (frame.method === "daemon.initialize_session") {
+    if (frame.method === "daemon.initialize_session" || frame.method === "daemon.load_session") {
       // Reproduce Factory's filesystem-over-session precedence. The local
       // fixed-name entry must not replace the unique claim-bound connection.
       const merged = new Map(frame.params.mcpServers.map((server: any) => [server.name, server]));
       merged.set("agent-peers", { name: "agent-peers", env: {} });
       const owned = [...merged.values()].filter((server: any) => server.env.AGENT_PEERS_DROID_LAUNCH_CLAIM_ID);
       if (owned.length !== 1) { process.exit(2); return; }
+      if (process.env.DROID_NATIVE_EXPECT_AUTONOMY
+        && frame.params.autonomyLevel !== process.env.DROID_NATIVE_EXPECT_AUTONOMY) {
+        process.exit(3); return;
+      }
       const env = (owned[0] as any).env;
       const claims = new DroidLaunchClaimStore({ rootDir: env.AGENT_PEERS_DROID_STATE_DIR });
       await claims.bindClaim(env.AGENT_PEERS_DROID_LAUNCH_CLAIM_ID, {
@@ -30,7 +34,9 @@ if (process.argv[2] === "daemon") {
     const frame = JSON.parse(String(raw));
     if (frame.id === "init") setTimeout(() => process.exit(0), 100);
   });
+  const resumeAt = process.argv.indexOf("--resume");
+  const sessionId = resumeAt >= 0 ? process.argv[resumeAt + 1]! : randomUUID();
   process.send?.(JSON.stringify({ jsonrpc: "2.0", factoryApiVersion: "1.0.0", factoryProtocolVersion: "test",
-    type: "request", id: "init", method: "daemon.initialize_session",
-    params: { sessionId: randomUUID(), cwd: process.cwd(), token: "fixture-only" } }));
+    type: "request", id: "init", method: resumeAt >= 0 ? "daemon.load_session" : "daemon.initialize_session",
+    params: { sessionId, cwd: process.cwd(), token: "fixture-only" } }));
 }

@@ -69,7 +69,19 @@ test("argument parser supports start and exact resume command forms", () => {
   expect(() => parseDroidLauncherArgs(["start", "--session-id", "unexpected"])).toThrow("use the resume command");
   expect(() => parseDroidLauncherArgs(["resume", "expected", "--session-id", "overridden"])).toThrow("use the resume command");
   expect(() => parseDroidLauncherArgs(["start", "--poll-ms", "1.5"])).toThrow("positive integer");
+  expect(parseDroidLauncherArgs(["start"]).autonomyLevel).toBe("auto-high");
   expect(parseDroidLauncherArgs(["start", "--autonomy-level", "low"]).autonomyLevel).toBe("auto-low");
+});
+
+test("empty autonomy environment still defaults managed sessions to High", () => {
+  const prior = process.env.DROID_PEER_AUTONOMY_LEVEL;
+  process.env.DROID_PEER_AUTONOMY_LEVEL = "";
+  try {
+    expect(parseDroidLauncherArgs(["--resume", "saved"]).autonomyLevel).toBe("auto-high");
+  } finally {
+    if (prior === undefined) delete process.env.DROID_PEER_AUTONOMY_LEVEL;
+    else process.env.DROID_PEER_AUTONOMY_LEVEL = prior;
+  }
 });
 
 test("ordinary launcher syntax supports bare start and exact resume flags without accepting ambiguous selectors", () => {

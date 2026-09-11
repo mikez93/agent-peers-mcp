@@ -74,7 +74,7 @@ export function parseDroidLauncherArgs(argv: string[]): DroidLauncherOptions {
     cwd: process.cwd(),
     model: process.env.DROID_PEER_MODEL,
     reasoningEffort: process.env.DROID_PEER_REASONING_EFFORT,
-    autonomyLevel: process.env.DROID_PEER_AUTONOMY_LEVEL,
+    autonomyLevel: process.env.DROID_PEER_AUTONOMY_LEVEL || "high",
     pollMs: 1_000,
     claimTimeoutMs: 15_000,
     cwdExplicit: false,
@@ -124,7 +124,7 @@ export function parseDroidLauncherArgs(argv: string[]): DroidLauncherOptions {
     else if (arg === "--droid") opts.droidCommand = requireValue(args, ++i, arg);
     else if (arg === "--model") { opts.model = requireValue(args, ++i, arg); opts.settingsExplicit = true; }
     else if (arg === "--reasoning-effort") { opts.reasoningEffort = requireValue(args, ++i, arg); opts.settingsExplicit = true; }
-    else if (arg === "--autonomy-level") { opts.autonomyLevel = requireValue(args, ++i, arg); opts.settingsExplicit = true; }
+    else if (arg === "--autonomy-level") opts.autonomyLevel = requireValue(args, ++i, arg);
     else if (arg === "--poll-ms") opts.pollMs = positiveInt(requireValue(args, ++i, arg), arg);
     else if (arg === "--claim-timeout-ms") opts.claimTimeoutMs = positiveInt(requireValue(args, ++i, arg), arg);
     else throw new DroidLauncherUsageError(`unknown option: ${arg}`);

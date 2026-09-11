@@ -7,10 +7,41 @@ import { DroidLaunchClaimStore } from "../shared/droid-launch-claims.ts";
 import { acquireDroidSession } from "../shared/droid-session-owner.ts";
 import { parseDroidLauncherArgs } from "../shared/droid-launcher.ts";
 
-test("native resume rejects explicit settings rather than silently ignoring them", async () => {
+test("native resume rejects explicit model settings rather than silently ignoring them", async () => {
   const opts = parseDroidLauncherArgs(["--resume", "saved", "--model", "explicit-model"]);
   expect(opts.settingsExplicit).toBe(true);
-  await expect(runNativeDroidLauncher(opts, new AbortController().signal)).rejects.toThrow("retains saved settings");
+  await expect(runNativeDroidLauncher(opts, new AbortController().signal)).rejects.toThrow("retains saved model and reasoning settings");
+});
+
+
+
+test("native resume accepts an explicit autonomy override", () => {
+  const opts = parseDroidLauncherArgs(["--resume", "saved", "--autonomy-level", "high"]);
+  expect(opts.settingsExplicit).toBeUndefined();
+  expect(opts.autonomyLevel).toBe("auto-high");
+});
+
+test("native resume reapplies managed High autonomy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-resume-autonomy-"));
+  const stateRoot = join(root, "state");
+  const priorRoot = process.env.AGENT_PEERS_DROID_STATE_DIR;
+  const priorExpected = process.env.DROID_NATIVE_EXPECT_AUTONOMY;
+  process.env.AGENT_PEERS_DROID_STATE_DIR = stateRoot;
+  process.env.DROID_NATIVE_EXPECT_AUTONOMY = "high";
+  try {
+    await new DroidLaunchClaimStore({ rootDir: stateRoot }).saveSession({
+      session_id: "saved", cwd: root, requested_peer_name: "test-native",
+    });
+    const opts = parseDroidLauncherArgs(["--resume", "saved"]);
+    opts.droidCommand = join(import.meta.dir, "fixtures/droid-native-agent.ts");
+    opts.pollMs = 10;
+    opts.claimTimeoutMs = 2000;
+    expect(await runNativeDroidLauncher(opts, new AbortController().signal)).toBe(0);
+  } finally {
+    if (priorRoot === undefined) delete process.env.AGENT_PEERS_DROID_STATE_DIR; else process.env.AGENT_PEERS_DROID_STATE_DIR = priorRoot;
+    if (priorExpected === undefined) delete process.env.DROID_NATIVE_EXPECT_AUTONOMY; else process.env.DROID_NATIVE_EXPECT_AUTONOMY = priorExpected;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("native launcher binds canonical cwd and removes its claim and owned processes on normal exit", async () => {

@@ -22,13 +22,13 @@ if (argv.includes("--help") || argv.includes("-h")) {
   console.log("  --resume, -r SESSION_ID    Resume an exact Factory session (also: resume SESSION_ID)");
   console.log("  --model ID                 New native / ACP model (env: DROID_PEER_MODEL)");
   console.log("  --reasoning-effort LEVEL   New native / ACP effort (env: DROID_PEER_REASONING_EFFORT)");
-  console.log("  --autonomy-level LEVEL     low|medium|high or ACP value (env: DROID_PEER_AUTONOMY_LEVEL)");
+  console.log("  --autonomy-level LEVEL     low|medium|high or ACP value (default: high; env: DROID_PEER_AUTONOMY_LEVEL)");
   console.log("  --name NAME                Override AGENTS.md persona-repo-droid default");
   console.log("  --cwd, -C DIR              Working directory (default: current directory)");
   console.log("  --droid PATH               Droid executable (default: PATH lookup)");
   console.log("  --poll-ms MS               Inbox metadata poll interval (default: 1000)");
   console.log("  --claim-timeout-ms MS      MCP binding deadline (default: 15000)");
-  console.log("native resume: retains saved directory/settings; change settings inside Droid's UI.");
+  console.log("native resume: retains saved directory/model/reasoning; managed autonomy defaults to high.");
   console.log("examples[4]:");
   console.log("  - droidpeer");
   console.log("  - droidpeer --resume <session-id>");

@@ -18,7 +18,7 @@ export async function runNativeDroidLauncher(opts: DroidLauncherOptions, signal:
   // Factory canonicalizes cwd (notably /tmp -> /private/tmp on macOS).
   const cwd = await realpath(opts.sessionId && opts.cwdExplicit === false && saved ? saved.cwd : opts.cwd);
   if (opts.sessionId && opts.settingsExplicit) {
-    throw new DroidLauncherUsageError("Native resume retains saved settings. Omit model/reasoning/autonomy options and change them in Droid's native UI, or use --headless.");
+    throw new DroidLauncherUsageError("Native resume retains saved model and reasoning settings. Omit those options and change them in Droid's native UI, or use --headless.");
   }
   if (opts.sessionId && saved && cwd !== await realpath(saved.cwd)) {
     throw new DroidLauncherUsageError("Native resume retains the saved working directory. Start a new droidpeer session to change repositories.");
@@ -85,8 +85,12 @@ export async function runNativeDroidLauncher(opts: DroidLauncherOptions, signal:
         if (frame.method === "daemon.initialize_session") {
           if (opts.model) params.modelId = opts.model;
           if (opts.reasoningEffort) params.reasoningEffort = opts.reasoningEffort;
-          if (opts.autonomyLevel) params.autonomyLevel = opts.autonomyLevel.replace(/^auto-/, "");
         }
+        // Managed peers run unattended between human turns. Reapply the launch
+        // autonomy on resume so an old session cannot silently restore a lower
+        // setting and stall on routine confirmation prompts. Factory's hard
+        // denylist, sandbox, and organization-policy checks remain authoritative.
+        if (opts.autonomyLevel) params.autonomyLevel = opts.autonomyLevel.replace(/^auto-/, "");
         return { ...frame, params };
       },
       sessionReady: async (sessionId) => {

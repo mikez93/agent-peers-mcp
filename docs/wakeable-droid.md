@@ -37,10 +37,13 @@ Factory's internal IPC contract was verified on **Droid 0.213.0**; it is not a
 documented stable third-party TUI attachment API. Re-run the native smoke test
 after a Droid upgrade. The headless fallback uses `droid exec --output-format acp`.
 
-Model, reasoning, and autonomy options configure new native sessions. Native
-resume retains saved settings and ignores environment defaults; explicit setting
-flags are rejected with guidance to use the native UI. A native managed session
-keeps its saved directory; start another session to change repositories. Session
+Model and reasoning options configure new native sessions. Native resume retains
+those saved settings; explicit model or reasoning flags are rejected with guidance
+to use the native UI. Managed autonomy defaults to `high` for both new and resumed
+sessions, and `DROID_PEER_AUTONOMY_LEVEL` or `--autonomy-level` can override it.
+This removes routine approval stalls but does not bypass Factory's denylist,
+sandbox, or organization-policy checks. A native managed session keeps its saved
+directory; start another session to change repositories. Session
 switching and directory changes inside the TUI are rejected to protect mailbox
 identity. A second managed launcher cannot open an already-owned session.
 Same-session reload also requires exiting and resuming in a fresh launcher.
@@ -84,8 +87,8 @@ cancellation nor queue deletion acknowledges unread broker mail.
   guess by cwd or display name.
 - The wake prompt never includes sender text, message content, or broker lease
   tokens.
-- Native permission requests and user answers pass through unchanged. The relay
-  never auto-approves tools; peer work can pause for your native approval.
+- Native permission requests and user answers pass through unchanged. High autonomy
+  suppresses routine confirmations, while Factory can still pause on hard safety checks.
 - In headless mode, ACP permission requests fail closed except for the six local Agent Peers MCP
   operations, which are approved for one call at a time so an idle peer can
   read and answer its inbox. Shell, filesystem, browser, connector, and unknown
