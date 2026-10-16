@@ -158,6 +158,23 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
         continue;
       }
 
+      // A user may have started a turn while the ledger was being persisted.
+      // Restore an unsent claim so this skip spends neither an attempt nor a
+      // cooldown. This narrows, but cannot atomically eliminate, the gap
+      // between observing idle and turn/start (which can append to a busy turn).
+      let finalReason: string | null;
+      try {
+        finalReason = validateThread(entry, await client.readThread(entry.thread_id));
+      } catch (error) {
+        await ledger.release(signature, claim.previous);
+        throw error;
+      }
+      if (finalReason) {
+        await ledger.release(signature, claim.previous);
+        results.push(await annotatedSkip(entry, finalReason));
+        continue;
+      }
+
       const wakeId = randomUUID();
       try {
         const wake = await client.startWakeTurn({
@@ -295,14 +312,17 @@ class WakeLedger {
     this.now = opts.now ?? (() => new Date());
   }
 
-  async claim(signature: string): Promise<{ claimed: boolean; reason?: string }> {
+  async claim(signature: string): Promise<
+    | { claimed: false; reason: string }
+    | { claimed: true; previous: WakeLedgerRecord | null }
+  > {
     await this.ensureDir();
     const path = this.pathFor(signature);
     const existing = await this.read(path);
 
     if (!existing) {
       await this.write(path, { signature, status: "claimed", attempts: 1, updated_at: this.now().toISOString() });
-      return { claimed: true };
+      return { claimed: true, previous: null };
     }
 
     const attempts = Number.isFinite(existing.attempts) && existing.attempts > 0 ? existing.attempts : 1;
@@ -325,7 +345,13 @@ class WakeLedger {
     }
 
     await this.write(path, { signature, status: "claimed", attempts: attempts + 1, updated_at: this.now().toISOString() });
-    return { claimed: true };
+    return { claimed: true, previous: existing };
+  }
+
+  async release(signature: string, previous: WakeLedgerRecord | null): Promise<void> {
+    const path = this.pathFor(signature);
+    if (previous) await this.write(path, previous);
+    else await unlink(path);
   }
 
   async mark(signature: string, status: WakeLedgerStatus, error?: string): Promise<void> {

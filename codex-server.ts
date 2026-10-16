@@ -79,6 +79,7 @@ import { createAsyncLock } from "./shared/async-lock.ts";
 import { DeliveryState } from "./shared/delivery-state.ts";
 import { HermesNameClaims } from "./shared/hermes-claims.ts";
 import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
+import { CodexDesktopWakeRegistration, desktopWakeEligible, type DesktopWakePeer } from "./shared/codex-desktop-wake.ts";
 import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
 import { DroidLaunchClaimStore } from "./shared/droid-launch-claims.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
@@ -129,6 +130,7 @@ let myName: string | null = null;
 let mySession: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let myTty: string | null = null;
 let inboxStore: CodexInboxStore | null = null;
 let pollInFlight: Promise<void> | null = null;
 // True once this MCP has registered the session in the wake registry, i.e. an
@@ -138,6 +140,11 @@ let pollInFlight: Promise<void> | null = null;
 // pings). We short-circuit it to a no-op for wakeable sessions; see the
 // wait_for_peer_messages handler.
 let isWakeableSession = false;
+let desktopWakeRegistration: CodexDesktopWakeRegistration | null = null;
+
+function desktopWakePeer(): DesktopWakePeer {
+  return { peerId: myId!, peerName: myName!, sessionToken: mySession!, gitRoot: myGitRoot, tty: myTty };
+}
 
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
@@ -746,6 +753,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         if (RUNTIME_IS_DROID) {
           await bindDroidLaunchClaim({ peerId: myId!, peerName: myName, cwd: myCwd });
         }
+        if (desktopWakeRegistration) {
+          isWakeableSession = await desktopWakeRegistration.refresh(desktopWakePeer());
+        }
         setTabTitle(`peer:${myName}`);
         return { text: `Renamed to ${myName}` };
       }
@@ -755,31 +765,36 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     }
   }, {
     signal: extra?.signal,
-    beforeReadQueue: name === "wait_for_peer_messages"
-      ? async () => {
-          const plan = planWaitForPeerMessages({
-            isWakeable: isWakeableSession,
-            rawTimeout: (args as { timeout_ms?: unknown } | undefined)?.timeout_ms,
-            defaultMs: WAIT_FOR_MESSAGES_DEFAULT_MS,
-            maxMs: WAIT_FOR_MESSAGES_MAX_MS,
-          });
-          // Wakeable sessions get woken on demand by the daemon; blocking here
-          // would pin the turn "working" for up to the timeout and make the
-          // session look hung. Skip the wait entirely — pending mail is already
-          // surfaced by the broker poll that ran before this hook.
-          if (plan.kind === "skip-wakeable") {
-            log(`wait_for_peer_messages skipped: wakeable session (would have waited ${plan.timeoutMs}ms)`);
-            waitResult = { didWait: false, found: false, timeoutMs: plan.timeoutMs, skippedWakeable: true };
-            return;
-          }
-          const from = (args as { from?: unknown } | undefined)?.from;
-          const found = await waitForFreshPeerMessages(
-            plan.timeoutMs,
-            typeof from === "string" && from.length > 0 ? from : undefined,
-          );
-          waitResult = { didWait: true, found, timeoutMs: plan.timeoutMs };
-        }
-      : undefined,
+    beforeReadQueue: async () => {
+      // withPiggyback already captured arrivalGen synchronously. Never
+      // move discovery ahead of that barrier, or a concurrent response
+      // could be wrongly confirmed while socket discovery is awaiting.
+      if (desktopWakeRegistration) {
+        isWakeableSession = await desktopWakeRegistration.observe(req.params._meta, desktopWakePeer());
+      }
+      if (name !== "wait_for_peer_messages") return;
+      const plan = planWaitForPeerMessages({
+        isWakeable: isWakeableSession,
+        rawTimeout: (args as { timeout_ms?: unknown } | undefined)?.timeout_ms,
+        defaultMs: WAIT_FOR_MESSAGES_DEFAULT_MS,
+        maxMs: WAIT_FOR_MESSAGES_MAX_MS,
+      });
+      // Wakeable sessions get woken on demand by the daemon; blocking here
+      // would pin the turn "working" for up to the timeout and make the
+      // session look hung. Skip the wait entirely — pending mail is already
+      // surfaced by the broker poll that ran before this hook.
+      if (plan.kind === "skip-wakeable") {
+        log(`wait_for_peer_messages skipped: wakeable session (would have waited ${plan.timeoutMs}ms)`);
+        waitResult = { didWait: false, found: false, timeoutMs: plan.timeoutMs, skippedWakeable: true };
+        return;
+      }
+      const from = (args as { from?: unknown } | undefined)?.from;
+      const found = await waitForFreshPeerMessages(
+        plan.timeoutMs,
+        typeof from === "string" && from.length > 0 ? from : undefined,
+      );
+      waitResult = { didWait: true, found, timeoutMs: plan.timeoutMs };
+    },
   });
 });
 
@@ -905,6 +920,13 @@ async function main() {
   myCwd = process.env.AGENT_PEERS_CWD || process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+  myTty = tty;
+  if (desktopWakeEligible(RUNTIME_PEER_TYPE, process.env)) {
+    desktopWakeRegistration = new CodexDesktopWakeRegistration({
+      parentPid: initialParentPid, mcpPid: process.pid, cwd: myCwd,
+      onError: error => log(`desktop wake registration unavailable: ${error instanceof Error ? error.message : String(error)}`),
+    });
+  }
 
   // ---- One peer per logical Hermes agent (name-claim election) ----------
   // Gateway and serve both load this server with the same PEER_NAME. Exactly
@@ -1150,6 +1172,12 @@ async function registerWakeableSessionIfEnabled(opts: {
   gitRoot: string | null;
   tty: string | null;
 }): Promise<void> {
+  if (desktopWakeRegistration) {
+    // Startup has no thread metadata yet. On broker rejoin this republishes
+    // the exact validated binding with the new peer/session token.
+    isWakeableSession = await desktopWakeRegistration.refresh(opts);
+    return;
+  }
   const hints = await resolveWakeRegistrationHints(opts);
   if (!hints) return;
 

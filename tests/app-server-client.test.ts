@@ -1,8 +1,20 @@
 import { afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { CodexAppServerWsClient, formatThreadStatus } from "../shared/app-server-client.ts";
 
 const stoppers: Array<() => void> = [];
+
+function makeUnixSocketPath(): { directory: string; path: string } {
+  const directory = mkdtempSync(join(tmpdir(), "app-server-client-"));
+  return { directory, path: join(directory, "app.sock") };
+}
+
+function unixWebSocketUrl(socketPath: string): string {
+  return `ws+unix://${socketPath}`;
+}
 
 test("formatThreadStatus renders each status as a stable operator token", () => {
   // The one bit of logic in `codexpeer live`'s true-status probe: active threads
@@ -47,6 +59,109 @@ test("request rejects when the app-server upgrades but never responds (request t
   stoppers.push(() => server.stop(true));
 
   const client = new CodexAppServerWsClient(`ws://127.0.0.1:${server.port}`, { timeoutMs: 150 });
+  const start = Date.now();
+  await expect(client.listLoadedThreads()).rejects.toThrow(/timed out/);
+  expect(Date.now() - start).toBeLessThan(2_000);
+  client.close();
+});
+
+test("connects over a Unix socket and performs the stable wake RPCs", async () => {
+  const { directory, path } = makeUnixSocketPath();
+  const seen: Array<{ method?: string; params?: unknown }> = [];
+  const thread = {
+    id: "thread-unix",
+    cwd: "/repo",
+    path: "/rollout.jsonl",
+    status: { type: "idle" as const },
+  };
+  const server = Bun.serve({
+    unix: path,
+    fetch(req, srv) {
+      if (srv.upgrade(req)) return undefined;
+      return new Response("not a websocket", { status: 400 });
+    },
+    websocket: {
+      message(ws, raw) {
+        const request = JSON.parse(String(raw)) as { id: number; method?: string; params?: unknown };
+        seen.push(request);
+        const result = request.method === "thread/loaded/list"
+          ? { data: ["thread-unix"] }
+          : request.method === "thread/read"
+            ? { thread }
+            : request.method === "turn/start"
+              ? { turn: { id: "turn-unix" } }
+              : {};
+        ws.send(JSON.stringify({ id: request.id, result }));
+      },
+    },
+  });
+  stoppers.push(() => {
+    server.stop(true);
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const client = new CodexAppServerWsClient(unixWebSocketUrl(path));
+  expect(await client.listLoadedThreads()).toEqual(["thread-unix"]);
+  expect(await client.readThread("thread-unix")).toEqual(thread);
+  expect(await client.startWakeTurn({
+    threadId: "thread-unix",
+    clientUserMessageId: "message-unix",
+    prompt: "Wake prompt",
+    wakeId: "wake-unix",
+    pendingSignature: "signature-unix",
+  })).toEqual({ turnId: "turn-unix" });
+
+  expect(seen.map((request) => request.method)).toEqual([
+    "initialize",
+    "thread/loaded/list",
+    "thread/read",
+    "turn/start",
+  ]);
+  expect(seen[0]?.params).toEqual({
+    clientInfo: { name: "agent-peers-wake-daemon", version: "0.1.0" },
+    capabilities: {},
+  });
+  expect(seen[1]?.params).toEqual({});
+  expect(seen[2]?.params).toEqual({ threadId: "thread-unix", includeTurns: false });
+  expect(seen[3]?.params).toEqual({
+    threadId: "thread-unix",
+    clientUserMessageId: "message-unix",
+    input: [{ type: "text", text: "Wake prompt", text_elements: [] }],
+  });
+  for (const request of seen) {
+    const serialized = JSON.stringify(request.params);
+    expect(serialized).not.toMatch(/approvalPolicy|sandbox|model|reasoning/i);
+  }
+  client.close();
+});
+
+test("a missing Unix app-server socket fails within the connect timeout", async () => {
+  const { directory, path } = makeUnixSocketPath();
+  rmSync(directory, { recursive: true, force: true });
+
+  const client = new CodexAppServerWsClient(unixWebSocketUrl(path), { timeoutMs: 300 });
+  const start = Date.now();
+  await expect(client.listLoadedThreads()).rejects.toThrow();
+  expect(Date.now() - start).toBeLessThan(2_000);
+  client.close();
+});
+
+test("an unanswered Unix app-server request times out", async () => {
+  const { directory, path } = makeUnixSocketPath();
+  const server = Bun.serve({
+    unix: path,
+    fetch(req, srv) {
+      if (srv.upgrade(req)) return undefined;
+      return new Response("not a websocket", { status: 400 });
+    },
+    websocket: { open() {}, message() {} },
+  });
+  stoppers.push(() => {
+    server.stop(true);
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const client = new CodexAppServerWsClient(unixWebSocketUrl(path), { timeoutMs: 150 });
   const start = Date.now();
   await expect(client.listLoadedThreads()).rejects.toThrow(/timed out/);
   expect(Date.now() - start).toBeLessThan(2_000);

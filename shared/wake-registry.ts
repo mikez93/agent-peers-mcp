@@ -1,8 +1,8 @@
 // shared/wake-registry.ts
 // Durable registry for Codex sessions launched in wakeable app-server mode.
 
-import { createHash } from "node:crypto";
-import { access, chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { access, chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -54,12 +54,78 @@ async function atomicWriteJson<T>(path: string, value: T): Promise<void> {
     try { await chmod(dir, DIR_MODE); } catch { /* best effort */ }
   }
 
-  const tempPath = `${path}.tmp`;
-  await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
-  if (IS_POSIX) {
-    try { await chmod(tempPath, FILE_MODE); } catch { /* best effort */ }
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
+    await rename(tempPath, path);
+  } finally {
+    await unlink(tempPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
   }
-  await rename(tempPath, path);
+}
+
+// Only ESRCH proves a dead owner. Unknown/partial records and reused live PIDs
+// fail closed; lock age alone never licenses stealing a writer's lock.
+async function reclaimDeadLock(lockPath: string): Promise<void> {
+  const guardPath = `${lockPath}.reclaim`;
+  let guard;
+  try {
+    guard = await open(guardPath, "wx", FILE_MODE);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
+    throw error;
+  }
+  try {
+    // Re-read *after* acquiring the reclaim guard. Rename/unlink based on a
+    // prior observation can remove a fresh winner when two reclaimers race.
+    let owner: { owner_pid?: number };
+    try {
+      owner = JSON.parse(await readFile(lockPath, "utf8"));
+    } catch (error) {
+      if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    const pid = owner?.owner_pid;
+    if (!Number.isInteger(pid) || !pid || pid <= 0) return;
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") await unlink(lockPath);
+    }
+  } finally {
+    await guard.close();
+    await unlink(guardPath);
+  }
+  // A crash while holding the reclaim guard deliberately fails closed on
+  // future dead-owner recovery rather than introducing recursive lock theft.
+}
+
+async function acquireFileLock(filePath: string): Promise<() => Promise<void>> {
+  await mkdir(dirname(filePath), { recursive: true, mode: DIR_MODE });
+  const lockPath = `${filePath}.lock`;
+  const deadline = performance.now() + 2_000;
+  for (;;) {
+    let handle;
+    try {
+      handle = await open(lockPath, "wx", FILE_MODE);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (performance.now() >= deadline) throw new Error(`Wake registry lock timed out: ${lockPath}`);
+      await reclaimDeadLock(lockPath);
+      await Bun.sleep(10);
+      continue;
+    }
+    try {
+      await handle.writeFile(JSON.stringify({ owner_pid: process.pid }));
+    } catch (error) {
+      await handle.close();
+      await unlink(lockPath);
+      throw error;
+    }
+    await handle.close();
+    return async () => { await unlink(lockPath); };
+  }
 }
 
 function cloneEntry(entry: WakeRegistryEntry): WakeRegistryEntry {
@@ -105,9 +171,7 @@ export class WakeRegistry {
   }
 
   async init(): Promise<void> {
-    await this.withLock(async () => {
-      this.state = await this.readStateFromDisk();
-    });
+    await this.withLock(async () => {});
   }
 
   async list(opts: { includeStale?: boolean } = {}): Promise<WakeRegistryEntry[]> {
@@ -226,7 +290,15 @@ export class WakeRegistry {
 
     await previous;
     try {
-      return await fn();
+      const releaseFileLock = await acquireFileLock(this.filePath);
+      try {
+        // All readers and mutations use the latest committed snapshot. Never
+        // persist a cached instance snapshot over another process's rows.
+        this.state = await this.readStateFromDisk();
+        return await fn();
+      } finally {
+        await releaseFileLock();
+      }
     } finally {
       release();
     }
