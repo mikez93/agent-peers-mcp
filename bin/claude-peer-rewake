@@ -1,0 +1,183 @@
+#!/usr/bin/python3 -I
+"""Idle wake for Claude Code sessions that run without the agent-peers channel.
+
+Claude Code only pushes agent-peers mail mid-session when it was launched with
+`--dangerously-load-development-channels server:agent-peers` (the terminal
+`agentpeers` alias). The Claude desktop app launches its sessions without that
+flag and offers no setting for it, so those sessions only saw mail when they
+happened to call check_messages.
+
+Checked first: channels (`--channels` / SDK `channels` / `channel_enable`) and
+the desktop app's launch options. The app never enables a channel, so this uses
+the documented hook feature instead: an `asyncRewake` command hook "that exits
+with code 2 wakes Claude immediately even when the session is idle"
+(code.claude.com/docs/en/hooks, Run hooks in the background > Limitations).
+
+Run as an async-rewake Stop and StopFailure hook (not SessionStart: in SDK
+mode an async SessionStart hook holds the session until it exits, so a new
+session is armed when its first turn ends). One waiter per session:
+  * finds its session's agent-peers MCP child exactly (hook ancestor = Claude
+    process; its claude-server.ts child PID = broker peers.pid);
+  * watches the bodyless unread metadata the MCP server already writes
+    (~/.agent-peers-claude/<peer>.metadata.json);
+  * exits 2 naming only senders and message ids it has not announced before,
+    so Claude calls check_messages. It never reads bodies and never acks, so
+    check_messages stays the only delivery path.
+It exits 0 at once when the session already has the agent-peers channel or
+runs with -p/--print, and exits 0 when the session process is gone, when no
+peer row appears within UNREGISTERED_SECONDS, or at its own time limit.
+"""
+import fcntl
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+INBOX_ROOT = os.environ.get("AGENT_PEERS_STATE_DIR", os.path.join(HOME, ".agent-peers-claude"))
+STATE_DIR = os.path.join(INBOX_ROOT, "rewake")
+DB_PATH = os.environ.get("AGENT_PEERS_DB", os.path.join(HOME, ".agent-peers.db"))
+POLL_SECONDS = 3
+# Stay under the hook's configured timeout so Claude Code never has to cancel us.
+MAX_SECONDS = int(os.environ.get("CLAUDE_PEER_REWAKE_MAX_SECONDS", "86000"))
+UNREGISTERED_SECONDS = 60
+
+
+def processes():
+    out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    table = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) >= 2:
+            table[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) == 3 else "")
+    return table
+
+
+def is_peer_server(command):
+    return "agent-peers-mcp/claude-server.ts" in command
+
+
+def find_session(table):
+    """Walk up from this hook to the Claude process that owns a claude-server.ts child."""
+    pid = os.getppid()
+    for _ in range(6):
+        if pid <= 1 or pid not in table:
+            return None, None, None
+        children = [c for c, (pp, cmd) in table.items() if pp == pid and is_peer_server(cmd)]
+        if len(children) == 1:
+            return pid, table[pid][1], children[0]
+        pid = table[pid][0]
+    return None, None, None
+
+
+def headless(command):
+    return any(arg in ("-p", "--print") for arg in command.split())
+
+
+def has_channel(command):
+    args = command.split()
+    for i, arg in enumerate(args):
+        if arg in ("--channels", "--dangerously-load-development-channels"):
+            for value in args[i + 1:]:
+                if value.startswith("--"):
+                    break
+                if value == "server:agent-peers":
+                    return True
+    return False
+
+
+def peer_id_for(server_pid):
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute(
+                "SELECT id FROM peers WHERE pid = ? AND peer_type = 'claude' ORDER BY last_seen DESC LIMIT 1",
+                (server_pid,),
+            ).fetchone()
+        finally:
+            con.close()
+        return row[0] if row else None
+    except sqlite3.Error:
+        return None
+
+
+def unread_metadata(peer_id):
+    try:
+        with open(os.path.join(INBOX_ROOT, f"{peer_id}.metadata.json")) as f:
+            return json.load(f).get("unread", [])
+    except (OSError, ValueError):
+        return []
+
+
+def load_announced(path):
+    try:
+        with open(path) as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+
+def save_announced(path, ids):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(ids)[-500:], f)
+    os.replace(tmp, path)
+
+
+def main():
+    try:
+        sys.stdin.read()
+    except OSError:
+        pass
+    table = processes()
+    claude_pid, claude_cmd, server_pid = find_session(table)
+    if claude_pid is None or has_channel(claude_cmd) or headless(claude_cmd):
+        return 0
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    week_ago = time.time() - 7 * 86400
+    for name in os.listdir(STATE_DIR):  # drop state left by sessions that have exited
+        path = os.path.join(STATE_DIR, name)
+        stem = name[:-5] if name.endswith(".lock") else ""
+        stale_lock = stem.isdigit() and int(stem) not in table
+        try:
+            stale_announced = name.endswith(".announced.json") and os.path.getmtime(path) < week_ago
+            if stale_lock or stale_announced:
+                os.unlink(path)
+        except OSError:
+            pass
+    lock = open(os.path.join(STATE_DIR, f"{claude_pid}.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0  # this session already has a waiter
+    started = time.time()
+    deadline = started + MAX_SECONDS
+    while time.time() < deadline:
+        try:
+            os.kill(claude_pid, 0)
+        except OSError:
+            return 0
+        peer_id = peer_id_for(server_pid)
+        if not peer_id and time.time() - started > UNREGISTERED_SECONDS:
+            return 0  # this session's MCP server never registered (disabled or refused)
+        if peer_id:
+            announced_path = os.path.join(STATE_DIR, f"{peer_id}.announced.json")
+            announced = load_announced(announced_path)
+            fresh = [m for m in unread_metadata(peer_id) if m.get("id") not in announced]
+            if fresh:
+                save_announced(announced_path, announced | {m["id"] for m in fresh})
+                senders = sorted({m.get("from_name") or m.get("from_id", "unknown") for m in fresh})
+                ids = ", ".join(str(m["id"]) for m in fresh)
+                sys.stderr.write(
+                    f"Agent Peers: {len(fresh)} new peer message(s) from {', '.join(senders)} (ids {ids}). "
+                    "Call the agent-peers check_messages tool to read them, then handle them as a colleague would.\n"
+                )
+                return 2
+        time.sleep(POLL_SECONDS)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

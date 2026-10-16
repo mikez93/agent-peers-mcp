@@ -400,10 +400,25 @@ async function cmdWakeStatus() {
       const claim = selectDroidClaim(boundDroidClaims, peer, processIsAlive);
       printDroidWakePeer(peer, claim, droidUnreadCounts.get(peer.id) ?? 0, "registered");
     }
+    // Claims for peers the broker no longer knows: show only those whose launcher or
+    // MCP process is still alive, newest claim per peer. Dead leftovers used to print
+    // once per stale claim file, burying the live rows.
     const liveDroidIds = new Set(droidPeers.map((peer) => peer.id));
+    const missingByPeer = new Map<string, (typeof boundDroidClaims)[number]>();
+    let hiddenDead = 0;
     for (const claim of boundDroidClaims.filter((item) => !liveDroidIds.has(item.peer_id))) {
+      if (!processIsAlive(claim.launcher_pid) && !processIsAlive(claim.mcp_pid)) {
+        hiddenDead += 1;
+        continue;
+      }
+      const prior = missingByPeer.get(claim.peer_id);
+      if (!prior || claim.updated_at > prior.updated_at) missingByPeer.set(claim.peer_id, claim);
+    }
+    for (const claim of missingByPeer.values()) {
       printDroidWakePeer(undefined, claim, droidUnreadCounts.get(claim.peer_id) ?? 0, "missing");
     }
+    if (droidPeers.length === 0 && missingByPeer.size === 0) console.log("  (none)");
+    if (hiddenDead > 0) console.log(`  (${hiddenDead} claim(s) for exited Droid sessions hidden)`);
   }
 }
 

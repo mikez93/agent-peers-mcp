@@ -6,14 +6,25 @@
 //   2. A launchd-owner broker evicts the incumbent (SIGTERM via /health pid)
 //      and takes the port.
 
-import { test, expect } from "bun:test";
+import { test, expect, afterEach } from "bun:test";
 import { readFileSync } from "node:fs";
 
 const BROKER = new URL("../broker.ts", import.meta.url).pathname;
-const PORT = 7949;
+// A fresh random port per test: a fixed port let one failed run leave its
+// broker listening, and every later run then failed against that squatter.
+let PORT = 0;
+const children: Array<ReturnType<typeof Bun.spawn>> = [];
+
+afterEach(async () => {
+  // Assertion failures skip the in-test kills; never leak a broker past a test.
+  for (const child of children.splice(0)) {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await child.exited;
+  }
+});
 
 function spawnBroker(args: string[], dbPath: string, secretPath: string) {
-  return Bun.spawn(["bun", BROKER, ...args], {
+  const child = Bun.spawn(["bun", BROKER, ...args], {
     stdio: ["ignore", "ignore", "pipe"],
     env: {
       PATH: process.env.PATH ?? "",
@@ -23,6 +34,8 @@ function spawnBroker(args: string[], dbPath: string, secretPath: string) {
       AGENT_PEERS_SECRET_PATH: secretPath,
     },
   });
+  children.push(child);
+  return child;
 }
 
 async function healthPid(): Promise<number | null> {
@@ -43,6 +56,7 @@ async function waitFor(pred: () => Promise<boolean>, ms: number): Promise<boolea
 }
 
 test("client-owner broker yields with exit 0 when the port is taken; launchd-owner evicts the squatter", async () => {
+  PORT = 20_000 + Math.floor(Math.random() * 20_000);
   const stamp = Date.now();
   const db1 = `/tmp/agent-peers-own-a-${stamp}.db`;
   const db2 = `/tmp/agent-peers-own-b-${stamp}.db`;
@@ -62,7 +76,9 @@ test("client-owner broker yields with exit 0 when the port is taken; launchd-own
 
   // 2. launchd-owner broker evicts the incumbent and takes the port.
   const launchd = spawnBroker(["--owner=launchd"], db2, secret);
-  const evicted = await waitFor(async () => (await healthPid()) === launchd.pid, 10_000);
+  // Eviction finds the holder with lsof and retries every 2s; on a loaded
+  // machine (load average 40+) lsof alone can take seconds, so allow 25s.
+  const evicted = await waitFor(async () => (await healthPid()) === launchd.pid, 25_000);
   expect(evicted).toBe(true);
   const incumbentExit = await incumbent.exited; // SIGTERM → clean exit path
   expect(incumbentExit).toBe(0);
@@ -75,9 +91,10 @@ test("client-owner broker yields with exit 0 when the port is taken; launchd-own
 
   launchd.kill("SIGTERM");
   await launchd.exited;
-}, 30_000);
+}, 45_000);
 
 test("/ready requires the shared secret and reports identity", async () => {
+  PORT = 20_000 + Math.floor(Math.random() * 20_000);
   const stamp = Date.now();
   const db = `/tmp/agent-peers-ready-${stamp}.db`;
   const secretPath = `/tmp/agent-peers-ready-secret-${stamp}`;

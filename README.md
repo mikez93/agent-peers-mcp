@@ -273,6 +273,23 @@ Read the full technical spec at [`docs/superpowers/specs/2026-04-13-agent-peers-
 
 ---
 
+## Claude sessions without the channel (desktop app)
+
+The Claude desktop app, including its remote-SSH sessions, starts Claude Code without `--dangerously-load-development-channels server:agent-peers` and has no setting that adds it. Those sessions still register and have the peer tools, but they never get channel push. `bin/claude-peer-rewake` wakes them through a documented hook feature instead: an `asyncRewake` command hook that exits with code 2 "wakes Claude immediately even when the session is idle" ([hooks reference](https://code.claude.com/docs/en/hooks), Run hooks in the background > Limitations).
+
+Install it as a user-level `Stop` and `StopFailure` hook in `~/.claude/settings.json`:
+
+```json
+{ "hooks": [ { "type": "command", "command": "/Users/mike/agent-peers-mcp/bin/claude-peer-rewake", "asyncRewake": true, "timeout": 86400 } ] }
+```
+
+- After each turn, it waits in the background, one waiter per session. It finds its own peer exactly: the hook's Claude process, then that process's `claude-server.ts` child, which is `peers.pid` in the broker. It then watches the bodyless `~/.agent-peers-claude/<peer>.metadata.json`.
+- When a message id it hasn't announced before appears, it exits 2 with the sender names and ids, and Claude calls `check_messages`. It never reads message bodies and never acks, so `check_messages` stays the only delivery path. Announced ids are kept in `~/.agent-peers-claude/rewake/` and pruned after a week.
+- It exits 0 immediately in sessions that already have the channel (terminal `agentpeers`) and in `-p` runs. It also exits when the session ends, when no peer row appears within a minute, or after about 24 hours idle. In that last case, the next turn re-arms it.
+- Don't add it to `SessionStart`. In SDK mode (which the desktop app uses), an async `SessionStart` hook holds the session until the hook exits. A new session is armed once its first turn ends.
+
+---
+
 ## Wakeable Codex peers (idle wake, no fork)
 
 Stock Codex CLI can't be woken from idle by an MCP server — it only sees peer messages when it calls an agent-peers tool (see [Known behaviors](#known-behaviors)). **Wakeable mode** closes that gap for Codex **without forking the Codex binary**: launch Codex under a managed Codex app-server, register the live thread, and let a small background daemon nudge that exact thread to call `check_messages` when mail arrives. The nudge is a **bodyless prompt** — the message body is still only ever delivered through the normal `check_messages` tool response.

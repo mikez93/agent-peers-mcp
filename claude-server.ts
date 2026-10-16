@@ -29,7 +29,7 @@ import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { defaultPeerName } from "./shared/peer-identity.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
-import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
+import { setTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
 import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
@@ -263,7 +263,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       // buffer is the in-process fast path. Union them by message id so a
       // restart cannot hide a message the previous incarnation persisted
       // but never surfaced.
-      const recent = [...getRecentDelivered()];
+      // Skip ring-buffer entries already confirmed: an earlier check_messages
+      // response showed them and a later call proved it reached the model.
+      // Re-showing them every turn for 15 minutes cost tokens and made
+      // sessions report already-read mail as "unread" again.
+      const recent = getRecentDelivered().filter((m) => !delivery.isConfirmed(m.id));
       // Durable unread is included at ANY age — an unread message is an
       // undelivered obligation, and hiding it behind the ring buffer's
       // 15-minute display window was a silent-loss path for sessions idle
@@ -350,7 +354,15 @@ async function main() {
   // don't set the terminal title. The `agentpeers` alias sets the env var;
   // plain `claude` doesn't. This prevents the peer network from activating
   // (and renaming your tab) in every unrelated Claude session.
-  if (process.env.AGENT_PEERS_ENABLED !== "1") {
+  // Claude desktop sessions (CLAUDE_CODE_ENTRYPOINT=claude-desktop, including
+  // remote-SSH ones) have no launcher alias and no tab to rename, so they join
+  // by default (Mike, 2026-10-16); AGENT_PEERS_ENABLED=0 still opts one out.
+  // Desktop sessions get idle wake from bin/claude-peer-rewake, not a channel.
+  const desktopSession = process.env.CLAUDE_CODE_ENTRYPOINT === "claude-desktop";
+  // A desktop session has no terminal tab; skip the title writes and the
+  // once-a-second /dev/tty keepalive.
+  if (desktopSession) process.env.AGENT_PEERS_DISABLE_TAB_TITLE = "1";
+  if (process.env.AGENT_PEERS_ENABLED !== "1" && !(desktopSession && process.env.AGENT_PEERS_ENABLED !== "0")) {
     mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
     await mcp.connect(new StdioServerTransport());
     log("agent-peers disabled (set AGENT_PEERS_ENABLED=1 to activate); idle");

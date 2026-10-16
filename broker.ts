@@ -25,6 +25,8 @@ export const DEFAULT_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10)
 export const STALE_THRESHOLD_MS = 60_000;
 export const STALE_RECLAIM_THRESHOLD_MS = 60_000;
 export const LEASE_DURATION_MS = 30_000;
+// A poll refreshes last_seen only when it is at least this old (see pollMessagesInner).
+export const POLL_HEARTBEAT_WRITE_MS = 10_000;
 export const GC_INTERVAL_MS = 30_000;
 // How long a DURABLE peer's registry row (identity + mailbox) survives without
 // a heartbeat. Ephemeral peers are still deleted at STALE_THRESHOLD_MS.
@@ -767,11 +769,6 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
 
 // ----- Send -----
 
-function isStale(last_seen_iso: string): boolean {
-  const t = Date.parse(last_seen_iso);
-  return !Number.isFinite(t) || (Date.now() - t) > STALE_THRESHOLD_MS;
-}
-
 function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
   const byId = getPeer(db, to_id_or_name);
   if (byId) return byId;
@@ -883,16 +880,22 @@ function pollMessagesInner(db: Database, id: string, session_token: string): Lea
   const leaseUntil = new Date(now.getTime() + LEASE_DURATION_MS).toISOString();
 
   const tx = db.transaction(() => {
-    // Session-token auth — caller must prove peer ownership.
-    // The UPDATE with both predicates serves as atomic auth + heartbeat:
-    // if the token doesn't match or the peer is gone, 0 rows update, and we
-    // return empty (matches "no messages" semantically, without exposing
-    // anyone's mailbox).
-    const hbInfo = db.query(
-      "UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?"
-    ).run(nowStr, id, session_token);
-    if ((hbInfo.changes ?? 0) === 0) {
+    // Session-token auth — caller must prove peer ownership. If the token
+    // doesn't match or the peer is gone we return empty (matches "no
+    // messages" semantically, without exposing anyone's mailbox).
+    const peerRow = db.query<{ last_seen: string }, [string, string]>(
+      "SELECT last_seen FROM peers WHERE id = ? AND session_token = ?"
+    ).get(id, session_token);
+    if (!peerRow) {
       return [] as LeasedMessage[];
+    }
+    // Heartbeat, throttled: every session polls about once a second, and an
+    // unconditional UPDATE made each empty poll a durable (fsynced) write.
+    // last_seen only has to beat STALE_THRESHOLD_MS (60s), so refreshing it
+    // when it is POLL_HEARTBEAT_WRITE_MS old keeps rows live with far fewer writes.
+    if (Date.parse(peerRow.last_seen) <= now.getTime() - POLL_HEARTBEAT_WRITE_MS) {
+      db.query("UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?")
+        .run(nowStr, id, session_token);
     }
 
     const rows = db.query<
