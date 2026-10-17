@@ -70,6 +70,10 @@ async function writeMetadata(rootDir: string, peerId = "peer-1", value = metadat
 
 class MockClient implements AppServerClient {
   startCalls: Array<{ prompt: string; clientUserMessageId: string; pendingSignature: string }> = [];
+  steerCalls: Array<{ threadId: string; expectedTurnId: string; prompt: string; clientUserMessageId: string }> = [];
+  // The in-progress turn the fake app-server reports, and an optional steer failure.
+  activeTurn: string | null = "turn-active";
+  steerError: Error | null = null;
   constructor(
     private readonly thread: AppServerThread,
     private readonly loaded: string[] = [thread.id],
@@ -92,6 +96,18 @@ class MockClient implements AppServerClient {
     this.startCalls.push(params);
     if (this.failStart) throw new Error("boom");
     return { turnId: "turn-1" };
+  }
+
+  async activeTurnId(): Promise<string | null> {
+    return this.activeTurn;
+  }
+
+  async steerWakeTurn(params: {
+    threadId: string; expectedTurnId: string; clientUserMessageId: string; prompt: string;
+  }): Promise<{ turnId: string | null }> {
+    this.steerCalls.push(params);
+    if (this.steerError) throw this.steerError;
+    return { turnId: params.expectedTurnId };
   }
 
   close(): void {}
@@ -150,11 +166,96 @@ test("runWakePass refuses not-loaded threads", async () => {
   expect(client.startCalls).toHaveLength(0);
 });
 
-test("runWakePass refuses active, approval-wait, and user-input-wait threads", async () => {
+function busyThread(): AppServerThread {
+  return idleThread({ status: { type: "active", activeFlags: [] } });
+}
+
+test("runWakePass steers a working thread's running turn instead of waiting", async () => {
+  const client = new MockClient(busyThread());
+  const results = await runWakePass({
+    rootDir: await makeDirWithMetadata(),
+    registry: { list: async () => [entry()] },
+    appServerClientFactory: () => client,
+  });
+  expect(results[0]?.action).toBe("wake");
+  expect(results[0]?.reason).toBe("steered");
+  expect(results[0]?.turn_id).toBe("turn-active");
+  expect(client.startCalls).toHaveLength(0);
+  expect(client.steerCalls).toHaveLength(1);
+  expect(client.steerCalls[0]?.expectedTurnId).toBe("turn-active");
+  expect(client.steerCalls[0]?.prompt).toContain("Call the agent-peers check_messages tool once now");
+  expect(client.steerCalls[0]?.prompt).toContain("continue the task you were working on");
+  expect(client.steerCalls[0]?.prompt).not.toContain("sender-peer");
+});
+
+test("a client without steer support still leaves a working thread alone", async () => {
+  const client = new MockClient(busyThread());
+  (client as { steerWakeTurn?: unknown }).steerWakeTurn = undefined;
+  const results = await runWakePass({
+    rootDir: await makeDirWithMetadata(),
+    registry: { list: async () => [entry()] },
+    appServerClientFactory: () => client,
+  });
+  expect(results[0]?.reason).toBe("thread_active");
+  expect(client.startCalls).toHaveLength(0);
+});
+
+test("a turn that ends before the steer gets a normal wake turn on the now-idle thread", async () => {
+  const client = new MockClient(busyThread());
+  let reads = 0;
+  client.readThread = async () => ++reads <= 2 ? busyThread() : idleThread();
+  client.steerError = new Error("no active turn to steer");
+  const results = await runWakePass({
+    rootDir: await makeDirWithMetadata(),
+    registry: { list: async () => [entry()] },
+    appServerClientFactory: () => client,
+  });
+  expect(results[0]?.reason).toBe("nudged");
+  expect(client.steerCalls).toHaveLength(1);
+  expect(client.startCalls).toHaveLength(1);
+});
+
+test("a steer that races into a different busy turn releases the claim for the next pass", async () => {
+  const rootDir = await makeDirWithMetadata();
+  const client = new MockClient(busyThread());
+  client.steerError = new Error("expected active turn id `turn-active` but found `turn-2`");
+  const opts = { rootDir, registry: { list: async () => [entry()] }, appServerClientFactory: () => client,
+    now: () => new Date("2026-06-18T00:00:00.000Z") };
+  expect((await runWakePass(opts))[0]?.reason).toBe("steer_raced");
+  expect(client.startCalls).toHaveLength(0);
+  expect(await readdir(join(rootDir, "wake-ledger"))).toEqual([]);
+  // Next pass (same clock, no cooldown spent) steers the new turn.
+  client.steerError = null;
+  expect((await runWakePass(opts))[0]?.reason).toBe("steered");
+});
+
+test("a working thread with no listed in-progress turn is retried, not woken blind", async () => {
+  const rootDir = await makeDirWithMetadata();
+  const client = new MockClient(busyThread());
+  client.activeTurn = null;
+  const opts = { rootDir, registry: { list: async () => [entry()] }, appServerClientFactory: () => client };
+  expect((await runWakePass(opts))[0]?.reason).toBe("steer_raced");
+  expect(client.steerCalls).toHaveLength(0);
+  expect(client.startCalls).toHaveLength(0);
+  expect(await readdir(join(rootDir, "wake-ledger"))).toEqual([]);
+});
+
+test("an unexpected steer error is recorded as a failed wake", async () => {
+  const client = new MockClient(busyThread());
+  client.steerError = new Error("boom");
+  const results = await runWakePass({
+    rootDir: await makeDirWithMetadata(),
+    registry: { list: async () => [entry()] },
+    appServerClientFactory: () => client,
+  });
+  expect(results[0]?.reason).toBe("wake_failed");
+  expect(client.startCalls).toHaveLength(0);
+});
+
+test("runWakePass refuses approval-wait and user-input-wait threads", async () => {
   const rootDir = await makeDir();
   await writeMetadata(rootDir);
   const cases = [
-    [idleThread({ status: { type: "active", activeFlags: [] } }), "thread_active"],
     [idleThread({ status: { type: "active", activeFlags: ["waitingOnApproval"] } }), "waiting_on_approval"],
     [idleThread({ status: { type: "active", activeFlags: ["waitingOnUserInput"] } }), "waiting_on_user_input"],
   ] as const;
@@ -168,6 +269,7 @@ test("runWakePass refuses active, approval-wait, and user-input-wait threads", a
     });
     expect(results[0]?.reason).toBe(reason);
     expect(client.startCalls).toHaveLength(0);
+    expect(client.steerCalls).toHaveLength(0);
   }
 });
 
@@ -229,9 +331,22 @@ async function makeDirWithMetadata(): Promise<string> {
   return rootDir;
 }
 
-test("final read rejects idle-to-busy/identity transitions without spending a wake attempt", async () => {
+test("an idle thread that starts working before the final read is steered", async () => {
+  const client = new MockClient(idleThread());
+  let reads = 0;
+  client.readThread = async () => ++reads === 2 ? busyThread() : idleThread();
+  const results = await runWakePass({
+    rootDir: await makeDirWithMetadata(),
+    registry: { list: async () => [entry()] },
+    appServerClientFactory: () => client,
+  });
+  expect(results[0]?.reason).toBe("steered");
+  expect(client.startCalls).toHaveLength(0);
+  expect(client.steerCalls).toHaveLength(1);
+});
+
+test("final read rejects prompt-wait/identity transitions without spending a wake attempt", async () => {
   const cases: Array<[Partial<AppServerThread>, string]> = [
-    [{ status: { type: "active", activeFlags: [] } }, "thread_active"],
     [{ status: { type: "active", activeFlags: ["waitingOnApproval"] } }, "waiting_on_approval"],
     [{ status: { type: "active", activeFlags: ["waitingOnUserInput"] } }, "waiting_on_user_input"],
     [{ status: { type: "notLoaded" } }, "thread_not_loaded"],
@@ -283,31 +398,33 @@ test("an unsent retry restores the exact previous ledger, including attempts and
   now += 1_001;
   let reads = 0;
   client.readThread = async () => ++reads === 2
-    ? idleThread({ status: { type: "active", activeFlags: [] } }) : idleThread();
-  expect((await runWakePass(opts))[0]?.reason).toBe("thread_active");
+    ? idleThread({ status: { type: "active", activeFlags: ["waitingOnApproval"] } }) : idleThread();
+  expect((await runWakePass(opts))[0]?.reason).toBe("waiting_on_approval");
   expect(await readFile(ledgerPath, "utf8")).toBe(before);
   expect((await runWakePass(opts))[0]?.action).toBe("wake");
   expect(client.startCalls).toHaveLength(2);
   expect((await runWakePass(opts))[0]?.reason).toBe("max_attempts");
 });
 
-test("twelve busy polls never wake, even as unread batches change and retry delays elapse", async () => {
+test("a busy thread is steered once per new unread batch, not on every poll", async () => {
   const rootDir = await makeDirWithMetadata();
-  const client = new MockClient(idleThread({ status: { type: "active", activeFlags: [] } }));
+  const client = new MockClient(busyThread());
   let now = Date.parse("2026-06-18T00:00:00.000Z");
   const opts = { rootDir, registry: { list: async () => [entry()] }, appServerClientFactory: () => client,
     now: () => new Date(now) };
+  expect((await runWakePass(opts))[0]?.reason).toBe("steered");
+  // Polls every 5 s with the same unread set do not re-steer.
   for (let i = 0; i < 12; i++) {
-    now += 3 * 60 * 60_000; // Beyond every configured retry delay.
-    const next = metadata();
-    next.unread[0]!.id += i; // New mail must not bypass the busy check either.
-    await writeMetadata(rootDir, "peer-1", next);
-    expect((await runWakePass(opts))[0]?.reason).toBe("thread_active");
+    now += 5_000;
+    expect((await runWakePass(opts))[0]?.reason).toBe("duplicate_or_cooldown");
   }
+  expect(client.steerCalls).toHaveLength(1);
+  // A new message changes the batch and is steered in at once.
+  const next = metadata();
+  next.unread.push({ ...next.unread[0]!, id: 11 });
+  await writeMetadata(rootDir, "peer-1", next);
+  now += 5_000;
+  expect((await runWakePass(opts))[0]?.reason).toBe("steered");
+  expect(client.steerCalls).toHaveLength(2);
   expect(client.startCalls).toHaveLength(0);
-  // When work really ends, the pending batch gets one initial wake, not twelve.
-  client.readThread = async () => idleThread();
-  expect((await runWakePass(opts))[0]?.action).toBe("wake");
-  expect((await runWakePass(opts))[0]?.reason).toBe("duplicate_or_cooldown");
-  expect(client.startCalls).toHaveLength(1);
 });

@@ -22,7 +22,7 @@ for (const result of results) {
   const target = `${result.peer_name} (${result.peer_id.slice(0, 8)}…) thread=${result.thread_id}`;
   const note = result.note ? ` — ${result.note}` : "";
   if (result.action === "wake") {
-    console.log(`${ts} wake: nudged ${target}${note}`);
+    console.log(`${ts} wake: ${result.reason === "steered" ? "steered" : "nudged"} ${target}${note}`);
   } else {
     console.log(`${ts} wake: skipped ${target} (${result.reason})${note}`);
   }

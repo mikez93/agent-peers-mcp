@@ -21,7 +21,8 @@ thread status from its app-server and acts on it:
 | Thread state | What the daemon does |
 |---|---|
 | `idle` | Eligible to wake. The **wake ledger** fires one nudge, then backs off re-waking the *same* unread set on a `5m → 30m → 2h` schedule and abandons after the cap (the message still surfaces on the peer's next turn). |
-| `active` / `waitingOnApproval` / `waitingOnUserInput` | Peer's user is mid-turn — **not** woken. Polled every pass so delivery happens the instant it goes idle; the repeated log lines are coalesced. |
+| `active` (working) | **Steered.** The wake is appended to the running turn with `turn/steer` (`expectedTurnId` = the in-progress turn from `thread/turns/list`), the same as typing into a busy Codex chat, and logged as `steered`. If that turn ended first, an idle thread gets a normal wake turn; otherwise the claim is released and the next pass retries. The same ledger backoff applies to re-steering an unchanged unread set. |
+| `waitingOnApproval` / `waitingOnUserInput` | Turn is parked on a prompt for the person — **not** woken. Polled every pass so delivery happens the instant it resumes; the repeated log lines are coalesced. |
 | `systemError` | Thread is **wedged** (a failed/crashed turn). It can't be woken until bounced. Re-checked on an escalating `5m → 30m → 2h` backoff instead of every pass, and logged once with a bounce hint. |
 
 ## Reading the log

@@ -358,3 +358,55 @@ test("reloadMcpServers uses the app-server's in-place MCP reload method", async 
   expect(seen.find((request) => request.method === "config/mcpServer/reload")?.params).toBeNull();
   client.close();
 });
+
+test("finds the in-progress turn and steers it with an expected-turn precondition", async () => {
+  const { directory, path } = makeUnixSocketPath();
+  const seen: Array<{ method?: string; params?: unknown }> = [];
+  let latestStatus = "inProgress";
+  const server = Bun.serve({
+    unix: path,
+    fetch(req, srv) {
+      if (srv.upgrade(req)) return undefined;
+      return new Response("not a websocket", { status: 400 });
+    },
+    websocket: {
+      message(ws, raw) {
+        const request = JSON.parse(String(raw)) as { id: number; method?: string; params?: unknown };
+        seen.push(request);
+        const result = request.method === "thread/turns/list"
+          ? { data: [{ id: "turn-live", status: latestStatus, items: [] }], nextCursor: null }
+          : request.method === "turn/steer"
+            ? { turnId: "turn-live" }
+            : {};
+        ws.send(JSON.stringify({ id: request.id, result }));
+      },
+    },
+  });
+  stoppers.push(() => {
+    server.stop(true);
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const client = new CodexAppServerWsClient(unixWebSocketUrl(path));
+  expect(await client.activeTurnId("thread-unix")).toBe("turn-live");
+  expect(await client.steerWakeTurn({
+    threadId: "thread-unix",
+    expectedTurnId: "turn-live",
+    clientUserMessageId: "message-steer",
+    prompt: "Steer prompt",
+  })).toEqual({ turnId: "turn-live" });
+  latestStatus = "completed";
+  expect(await client.activeTurnId("thread-unix")).toBeNull();
+
+  expect(seen.map((request) => request.method)).toEqual([
+    "initialize", "thread/turns/list", "turn/steer", "thread/turns/list",
+  ]);
+  expect(seen[1]?.params).toEqual({ threadId: "thread-unix", limit: 1, sortDirection: "desc", itemsView: "notLoaded" });
+  expect(seen[2]?.params).toEqual({
+    threadId: "thread-unix",
+    expectedTurnId: "turn-live",
+    clientUserMessageId: "message-steer",
+    input: [{ type: "text", text: "Steer prompt", text_elements: [] }],
+  });
+  client.close();
+});

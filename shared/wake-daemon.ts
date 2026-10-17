@@ -69,9 +69,10 @@ const DEFAULT_DEAD_GRACE_MS = 30 * 60_000;
 // Skip reasons that mean the peer's thread is genuinely WEDGED (not just busy):
 // it has hit a system-level error and cannot be woken until a human bounces it.
 // These get an escalating re-check backoff so the daemon stops round-tripping +
-// re-logging them every pass. A merely-`active` peer is NOT wedged — its user is
-// mid-turn — so it keeps getting polled every pass (we want low-latency delivery
-// the moment it goes idle); only its log lines are coalesced.
+// re-logging them every pass. A merely-`active` peer is NOT wedged: a working
+// turn is steered (the wake is appended to it), and a turn parked on an
+// approval or user-input prompt keeps getting polled every pass so the wake
+// lands the moment it resumes; only its log lines are coalesced.
 const OBSERVE_BACKOFF_REASONS = new Set(["thread_system_error"]);
 const OBSERVE_SYSTEMERROR_SCHEDULE_MS = [5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 const OBSERVE_HEARTBEAT_MS = 30 * 60_000;
@@ -89,6 +90,13 @@ export function pendingSignature(peerId: string, metadata: CodexInboxMetadataSta
 export function buildWakePrompt(wakeId: string): string {
   return `[agent-peers wake]
 You have pending agent-peers messages in your local MCP inbox. Immediately call the agent-peers check_messages tool once. Treat that tool response as the only authoritative message content. Do not infer message content from this wake signal. After handling the inbox normally, return to waiting. Wake id: ${wakeId}`;
+}
+
+// Appended to a turn that is already running, the way the team has always
+// worked: a colleague's message lands mid-task instead of waiting for it to end.
+export function buildSteerPrompt(wakeId: string): string {
+  return `[agent-peers message while you work]
+New agent-peers mail arrived while you are working. Call the agent-peers check_messages tool once now. Treat that tool response as the only authoritative message content. Do not infer message content from this signal. Handle it as a colleague would: answer, or if it is not meant for you, say so and point the sender to the right peer. Then continue the task you were working on. Wake id: ${wakeId}`;
 }
 
 export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeResult[]> {
@@ -147,7 +155,7 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
 
       const thread = await client.readThread(entry.thread_id);
       const unsafeReason = validateThread(entry, thread);
-      if (unsafeReason) {
+      if (unsafeReason && !(unsafeReason === "thread_active" && canSteer(client))) {
         results.push(await annotatedSkip(entry, unsafeReason));
         continue;
       }
@@ -169,21 +177,41 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
         await ledger.release(signature, claim.previous);
         throw error;
       }
-      if (finalReason) {
+      if (finalReason && !(finalReason === "thread_active" && canSteer(client))) {
         await ledger.release(signature, claim.previous);
         results.push(await annotatedSkip(entry, finalReason));
         continue;
       }
 
       const wakeId = randomUUID();
+      const clientUserMessageId = `agent-peers-wake-${wakeId}`;
       try {
-        const wake = await client.startWakeTurn({
-          threadId: entry.thread_id,
-          clientUserMessageId: `agent-peers-wake-${wakeId}`,
-          prompt: buildWakePrompt(wakeId),
-          wakeId,
-          pendingSignature: signature,
-        });
+        let delivered: { turnId: string | null; reason: "nudged" | "steered" } | null = null;
+        if (finalReason === "thread_active") {
+          delivered = await steerActiveTurn(client, entry.thread_id, clientUserMessageId, wakeId);
+          if (!delivered) {
+            // The turn ended (or had not yet been listed) between the read and
+            // the steer. If the thread is idle now, start a normal wake turn;
+            // otherwise leave the claim unspent for the next pass.
+            const current = validateThread(entry, await client.readThread(entry.thread_id));
+            if (current !== null) {
+              await ledger.release(signature, claim.previous);
+              results.push(await annotatedSkip(entry, current === "thread_active" ? "steer_raced" : current));
+              continue;
+            }
+          }
+        }
+        if (!delivered) {
+          const wake = await client.startWakeTurn({
+            threadId: entry.thread_id,
+            clientUserMessageId,
+            prompt: buildWakePrompt(wakeId),
+            wakeId,
+            pendingSignature: signature,
+          });
+          delivered = { turnId: wake.turnId, reason: "nudged" };
+        }
+        const wake = delivered;
         await ledger.mark(signature, "nudged");
         // A successful nudge means the peer is healthy and idle again; clear any
         // prior wedged/coalesced observation state so the next anomaly logs fresh.
@@ -194,7 +222,7 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
           cwd: entry.cwd,
           thread_id: entry.thread_id,
           action: "wake",
-          reason: "nudged",
+          reason: wake.reason,
           log: true,
           wake_id: wakeId,
           turn_id: wake.turnId,
@@ -230,6 +258,30 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
   } catch { /* best effort */ }
 
   return results;
+}
+
+function canSteer(client: AppServerClient): boolean {
+  return typeof client.activeTurnId === "function" && typeof client.steerWakeTurn === "function";
+}
+
+// Append the wake to the thread's running turn. Returns null when there is no
+// in-progress turn to steer or the turn changed before the steer landed
+// (`expectedTurnId` mismatch / "no active turn"); any other error propagates.
+async function steerActiveTurn(
+  client: AppServerClient, threadId: string, clientUserMessageId: string, wakeId: string,
+): Promise<{ turnId: string | null; reason: "steered" } | null> {
+  const turnId = await client.activeTurnId!(threadId);
+  if (!turnId) return null;
+  try {
+    const result = await client.steerWakeTurn!({
+      threadId, expectedTurnId: turnId, clientUserMessageId, prompt: buildSteerPrompt(wakeId),
+    });
+    return { turnId: result.turnId ?? turnId, reason: "steered" };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/expected active turn id|no active turn/i.test(message)) return null;
+    throw error;
+  }
 }
 
 function validateThread(entry: WakeRegistryEntry, thread: AppServerThread): string | null {

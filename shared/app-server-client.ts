@@ -44,6 +44,15 @@ export interface AppServerClient {
     wakeId: string;
     pendingSignature: string;
   }): Promise<{ turnId: string | null }>;
+  // Mid-turn delivery for a busy thread. Optional so minimal test doubles can
+  // omit them; a client without them leaves busy threads to the next idle pass.
+  activeTurnId?(threadId: string): Promise<string | null>;
+  steerWakeTurn?(params: {
+    threadId: string;
+    expectedTurnId: string;
+    clientUserMessageId: string;
+    prompt: string;
+  }): Promise<{ turnId: string | null }>;
   close(): void;
 }
 
@@ -222,6 +231,36 @@ export class CodexAppServerWsClient implements AppServerClient {
       input: [{ type: "text", text: params.prompt, text_elements: [] }],
     });
     const turnId = (result as { turn?: { id?: unknown } }).turn?.id;
+    return { turnId: typeof turnId === "string" ? turnId : null };
+  }
+
+  /** The thread's in-progress turn id, or null when its newest turn has ended. */
+  async activeTurnId(threadId: string): Promise<string | null> {
+    await this.connect();
+    const result = await this.request("thread/turns/list", {
+      threadId, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
+    });
+    const latest = (result as { data?: Array<{ id?: unknown; status?: unknown }> }).data?.[0];
+    return latest && latest.status === "inProgress" && typeof latest.id === "string" ? latest.id : null;
+  }
+
+  // `turn/steer` appends input to the running turn, the same as typing into a
+  // busy Codex chat. `expectedTurnId` makes it fail rather than land in a
+  // different turn if that turn ended in the meantime.
+  async steerWakeTurn(params: {
+    threadId: string;
+    expectedTurnId: string;
+    clientUserMessageId: string;
+    prompt: string;
+  }): Promise<{ turnId: string | null }> {
+    await this.connect();
+    const result = await this.request("turn/steer", {
+      threadId: params.threadId,
+      expectedTurnId: params.expectedTurnId,
+      clientUserMessageId: params.clientUserMessageId,
+      input: [{ type: "text", text: params.prompt, text_elements: [] }],
+    });
+    const turnId = (result as { turnId?: unknown }).turnId;
     return { turnId: typeof turnId === "string" ? turnId : null };
   }
 
