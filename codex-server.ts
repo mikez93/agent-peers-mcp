@@ -88,7 +88,17 @@ import { paperclipAgentMarker, paperclipRefusalMessage } from "./shared/papercli
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+// Poll every second while a peer conversation is live, and more slowly when
+// idle (see claude-server.ts; Studio CPU, 2026-10-17). Tool calls still poll
+// inline, so an active Codex turn sees new mail at once either way.
 const POLL_INTERVAL_MS = 1000;
+const POLL_IDLE_MS = parseInt(process.env.AGENT_PEERS_IDLE_POLL_MS ?? "3000", 10);
+const POLL_ACTIVE_WINDOW_MS = 120_000;
+let lastPeerActivity = Date.now();
+function markPeerActivity() { lastPeerActivity = Date.now(); }
+function nextPollDelay() {
+  return Date.now() - lastPeerActivity < POLL_ACTIVE_WINDOW_MS ? POLL_INTERVAL_MS : POLL_IDLE_MS;
+}
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.AGENT_PEERS_HEARTBEAT_MS ?? "15000", 10);
 const RUNTIME_PEER_TYPE: PeerType = process.env.AGENT_PEERS_RUNTIME === "hermes"
   ? "hermes"
@@ -335,7 +345,9 @@ async function waitForFreshPeerMessages(timeoutMs: number, from?: string): Promi
 // background/wait-hook paths, where holding the lock across network I/O would
 // stall concurrent tool calls).
 async function fetchBrokerLeases(): Promise<LeasedMessage[]> {
-  return client.pollMessages({ id: myId!, session_token: mySession! });
+  const msgs = await client.pollMessages({ id: myId!, session_token: mySession! });
+  if (msgs.length > 0) markPeerActivity();
+  return msgs;
 }
 
 // Classify + upsert leased messages into the durable queue. MUST run under
@@ -704,6 +716,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
           from_id: myId!, session_token: mySession!, to_id_or_name: to_id, text: message,
         });
         if (!res.ok) return { text: `Send failed: ${res.error}`, isError: true };
+        markPeerActivity();
         return { text: `Message sent (id=${res.message_id}).${res.notice ? ` ${res.notice}` : ""}` };
       }
 
@@ -1025,7 +1038,7 @@ async function main() {
     pollTickTimer = setTimeout(async () => {
       try { await pollBrokerIntoQueue(); }
       finally { scheduleNextPoll(); }
-    }, POLL_INTERVAL_MS);
+    }, nextPollDelay());
   };
   scheduleNextPoll();
 

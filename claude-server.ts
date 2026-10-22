@@ -46,7 +46,18 @@ import type { PeerId, PeerType } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
-const POLL_INTERVAL_MS = 1000;
+// Poll every second while a peer conversation is live, and more slowly when
+// idle. With ~50 sessions open, a flat 1 s poll cost about a quarter of a CPU
+// core on the Studio (2026-10-17). Idle delivery latency rises to at most
+// AGENT_PEERS_IDLE_POLL_MS.
+const POLL_ACTIVE_MS = 1000;
+const POLL_IDLE_MS = parseInt(process.env.AGENT_PEERS_IDLE_POLL_MS ?? "3000", 10);
+const POLL_ACTIVE_WINDOW_MS = 120_000;
+let lastPeerActivity = Date.now();
+function markPeerActivity() { lastPeerActivity = Date.now(); }
+function nextPollDelay() {
+  return Date.now() - lastPeerActivity < POLL_ACTIVE_WINDOW_MS ? POLL_ACTIVE_MS : POLL_IDLE_MS;
+}
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.AGENT_PEERS_HEARTBEAT_MS ?? "15000", 10);
 const WORKING_SESSION_STARTED_AT = workingSessionStartedAt("claude");
 
@@ -235,6 +246,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       if (!res.ok) {
         return { content: [{ type: "text" as const, text: `Send failed: ${res.error}` }], isError: true };
       }
+      markPeerActivity();
       return { content: [{ type: "text" as const, text: `Message sent (id=${res.message_id}).${res.notice ? ` ${res.notice}` : ""}` }] };
     }
 
@@ -481,6 +493,7 @@ async function main() {
     if (!myId || !mySession) return;
     try {
       const msgs = await client.pollMessages({ id: myId, session_token: mySession });
+      if (msgs.length > 0) markPeerActivity();
       const toAck: string[] = [];
       for (const m of msgs) {
         if (seen.has(m.id)) {
@@ -576,7 +589,7 @@ async function main() {
     pushTickTimer = setTimeout(async () => {
       try { await pollAndPush(); }
       finally { scheduleNextPush(); }
-    }, POLL_INTERVAL_MS);
+    }, nextPollDelay());
   };
   scheduleNextPush();
 
