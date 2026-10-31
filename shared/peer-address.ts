@@ -35,11 +35,15 @@ function slug(value: string): string {
  * generated `persona-repo-harness` name or an explicit `persona-hermes` name.
  * A `repo-harness` fallback name (no persona declared) has none.
  */
+/** Leading name tokens that name a harness or model, never a persona
+ *  (e.g. "claude-sender", "codex-receiver", old "opus-*" sessions). */
+const HARNESS_WORDS = new Set(["claude", "codex", "hermes", "droid", "opus", "sonnet", "haiku", "fable", "gemini", "agent", "peer"]);
+
 export function personaOf(row: { name: string; persona?: string | null; git_root?: string | null; cwd?: string | null }): string | null {
   if (row.persona && row.persona.trim()) return slug(row.persona) || null;
   const name = row.name.toLowerCase();
   const first = name.split("-")[0] ?? "";
-  if (!first || /^[0-9a-f]{8}$/.test(first)) return null;
+  if (!first || /^[0-9a-f]{8}$/.test(first) || HARNESS_WORDS.has(first)) return null;
   const root = row.git_root || row.cwd || "";
   const repo = slug(root.split("/").filter(Boolean).pop() ?? "");
   if (repo && (name === repo || name.startsWith(`${repo}-`))) return null;

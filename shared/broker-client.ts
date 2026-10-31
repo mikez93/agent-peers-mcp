@@ -6,7 +6,7 @@ import type {
   SendMessageRequest, SendMessageResponse, AckMessagesRequest, AckMessagesResponse,
   RenamePeerRequest, RenamePeerResponse,
   HeartbeatRequest, HeartbeatResponse, UnregisterRequest, PollMessagesRequest,
-  LeasedMessage, Peer,
+  LeasedMessage, Peer, ListChatsRequest, ListChatsResponse, ChatInboxEntry,
 } from "./types.ts";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -22,6 +22,10 @@ export interface BrokerClient {
   pollMessages(req: PollMessagesRequest): Promise<LeasedMessage[]>;
   ackMessages(req: AckMessagesRequest): Promise<AckMessagesResponse>;
   renamePeer(req: RenamePeerRequest): Promise<RenamePeerResponse>;
+  /** v3. Null when the broker predates chat discovery (404). */
+  listChats(req: ListChatsRequest): Promise<ListChatsResponse | null>;
+  /** v3. Null when the broker predates the chat inbox (404). */
+  chatInbox(): Promise<ChatInboxEntry[] | null>;
   // Note: there is no adminRenamePeer() in the client anymore. cli.ts reads
   // the target peer's session_token from SQLite directly and calls renamePeer
   // with it — see cli.ts cmdRename.
@@ -97,17 +101,64 @@ function defaultDbPath(): string {
   return process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
 }
 
-export function createClient(baseUrl: string, sharedSecret: string): BrokerClient {
-  async function post<T>(path: string, body: unknown): Promise<T> {
-    const res = await fetch(`${baseUrl}${path}`, {
+/** Default per-request timeout. A broker that never answers (hung, or the
+ *  Mac waking from sleep) must not wedge an MCP tool call forever. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+
+export class BrokerHttpError extends Error {
+  constructor(readonly path: string, readonly status: number, body: string) {
+    super(`broker ${path}: ${status} ${body}`);
+  }
+}
+
+/**
+ * `secret` may be a reader function. A reader is called per request, so a
+ * rotated secret file is picked up without restarting the session; on a 401
+ * the request is retried once with a freshly read secret. A 401 means the
+ * broker refused before doing anything, so the retry cannot double-apply.
+ * Timeouts are never retried here: a timed-out send may already be stored.
+ */
+export function createClient(
+  baseUrl: string,
+  secret: string | (() => string | null),
+  opts: { timeoutMs?: number } = {},
+): BrokerClient {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const readSecret = typeof secret === "function" ? secret : () => secret;
+  let cached = readSecret() ?? "";
+
+  async function send(path: string, body: unknown, key: string): Promise<Response> {
+    return fetch(`${baseUrl}${path}`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        [SECRET_HEADER]: sharedSecret,
-      },
+      headers: { "Content-Type": "application/json", [SECRET_HEADER]: key },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!res.ok) throw new Error(`broker ${path}: ${res.status} ${await res.text()}`);
+  }
+
+  async function postRaw(path: string, body: unknown): Promise<Response> {
+    let res = await send(path, body, cached);
+    if (res.status === 401 && typeof secret === "function") {
+      const fresh = readSecret() ?? "";
+      if (fresh && fresh !== cached) {
+        cached = fresh;
+        res = await send(path, body, cached);
+      }
+    }
+    return res;
+  }
+
+  async function post<T>(path: string, body: unknown): Promise<T> {
+    const res = await postRaw(path, body);
+    if (!res.ok) throw new BrokerHttpError(path, res.status, await res.text());
+    return res.json() as Promise<T>;
+  }
+
+  /** For additive endpoints: an older broker answers 404, meaning absent. */
+  async function postOptional<T>(path: string, body: unknown): Promise<T | null> {
+    const res = await postRaw(path, body);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new BrokerHttpError(path, res.status, await res.text());
     return res.json() as Promise<T>;
   }
 
@@ -130,5 +181,10 @@ export function createClient(baseUrl: string, sharedSecret: string): BrokerClien
     },
     ackMessages(req) { return post<AckMessagesResponse>("/ack-messages", req); },
     renamePeer(req) { return post<RenamePeerResponse>("/rename-peer", req); },
+    listChats(req) { return postOptional<ListChatsResponse>("/list-chats", req); },
+    async chatInbox() {
+      const r = await postOptional<{ entries: ChatInboxEntry[] }>("/chat-inbox", {});
+      return r ? r.entries : null;
+    },
   };
 }

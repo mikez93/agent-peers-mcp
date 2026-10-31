@@ -14,6 +14,7 @@ import type {
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
   LeasedMessage, AckMessagesRequest, AckMessagesResponse,
   RenamePeerRequest, RenamePeerResponse,
+  ListChatsRequest, ListChatsResponse, ChatInboxEntry,
 } from "./shared/types.ts";
 import { appendSuffixWithinLimit, generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 import { findConversation, hasConversationSchema, withConversationFence } from "./shared/hermes-conversation-fence.ts";
@@ -1014,21 +1015,14 @@ export function listDirectoryPeers(db: Database, req: { query?: string } = {}): 
 
 // ----- v3: chat discovery and the Hermes chat inbox -----
 
+export type { ListChatsRequest, ListChatsResponse, ChatInboxEntry } from "./shared/types.ts";
+
 export const BROKER_CAPABILITIES = ["persona-names", "chat-mail", "list-chats", "chat-inbox", "bounded-poll"];
 
-export interface ListChatsRequest {
-  id: string;
-  session_token: string;
-  peer: string;
-  query?: string;
-  limit?: number;
-  offset?: number;
-}
 
 /** Read-only chat lookup: titles and status, never transcript text. It does
  *  not adopt, wake or consume mail. */
-export function listChats(db: Database, req: ListChatsRequest):
-  { ok: boolean; error?: string; candidates?: string[]; peer?: string; chats?: (ChatCandidate & { address: string })[] } {
+export function listChats(db: Database, req: ListChatsRequest): ListChatsResponse {
   const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
   const caller = db.query<{ id: string }, [string, string, string]>(
     "SELECT id FROM peers WHERE id = ? AND session_token = ? AND last_seen >= ?",
@@ -1051,17 +1045,6 @@ export function listChats(db: Database, req: ListChatsRequest):
   };
 }
 
-export interface ChatInboxEntry {
-  peer_id: string;
-  peer_name: string;
-  /** Null is the general mailbox, which the profile's "Agent Peers" chat reads. */
-  to_chat: string | null;
-  title: string | null;
-  unread: number;
-  leased: number;
-  max_id: number;
-  oldest_sent_at: string;
-}
 
 /** Unread Hermes mail grouped by recipient chat, for the wake daemon. Only
  *  chat-capable owners are listed for general mail, so old Hermes processes

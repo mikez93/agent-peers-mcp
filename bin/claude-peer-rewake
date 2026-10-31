@@ -23,8 +23,10 @@ session is armed when its first turn ends). One waiter per session:
   * exits 2 naming only senders and message ids it has not announced before,
     so Claude calls check_messages. It never reads bodies and never acks, so
     check_messages stays the only delivery path.
-It exits 0 at once when the session already has the agent-peers channel or
-runs with -p/--print, and exits 0 when the session process is gone, when no
+It exits 0 at once when the session already has the agent-peers channel,
+runs with -p/--print, or its MCP server wakes it through Claude Code's inbox
+socket (marker file socket-wake/<server pid>, written by claude-server.ts;
+sessions started on older code have no marker and keep this hook), and exits 0 when the session process is gone, when no
 peer row appears within UNREGISTERED_SECONDS, or at its own time limit.
 """
 import fcntl
@@ -38,6 +40,7 @@ import time
 HOME = os.path.expanduser("~")
 INBOX_ROOT = os.environ.get("AGENT_PEERS_STATE_DIR", os.path.join(HOME, ".agent-peers-claude"))
 STATE_DIR = os.path.join(INBOX_ROOT, "rewake")
+SOCKET_WAKE_DIR = os.path.join(INBOX_ROOT, "socket-wake")
 DB_PATH = os.environ.get("AGENT_PEERS_DB", os.path.join(HOME, ".agent-peers.db"))
 POLL_SECONDS = 3
 # Stay under the hook's configured timeout so Claude Code never has to cancel us.
@@ -88,6 +91,24 @@ def has_channel(command):
     return False
 
 
+def socket_wake_active(server_pid):
+    return os.path.exists(os.path.join(SOCKET_WAKE_DIR, str(server_pid)))
+
+
+def drop_stale_socket_markers(table):
+    """Markers whose MCP server has exited (a crash skips its own cleanup)."""
+    try:
+        names = os.listdir(SOCKET_WAKE_DIR)
+    except OSError:
+        return
+    for name in names:
+        if name.isdigit() and int(name) not in table:
+            try:
+                os.unlink(os.path.join(SOCKET_WAKE_DIR, name))
+            except OSError:
+                pass
+
+
 def peer_id_for(server_pid):
     try:
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
@@ -133,7 +154,10 @@ def main():
         pass
     table = processes()
     claude_pid, claude_cmd, server_pid = find_session(table)
+    drop_stale_socket_markers(table)
     if claude_pid is None or has_channel(claude_cmd) or headless(claude_cmd):
+        return 0
+    if socket_wake_active(server_pid):
         return 0
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     week_ago = time.time() - 7 * 86400
@@ -159,6 +183,8 @@ def main():
             os.kill(claude_pid, 0)
         except OSError:
             return 0
+        if socket_wake_active(server_pid):
+            return 0  # the session wakes itself now; never announce twice
         peer_id = peer_id_for(server_pid)
         if not peer_id and time.time() - started > UNREGISTERED_SECONDS:
             return 0  # this session's MCP server never registered (disabled or refused)

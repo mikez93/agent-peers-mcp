@@ -1,6 +1,8 @@
 // shared/types.ts
 // Canonical types used by broker, clients, and CLI.
 
+import type { ChatCandidate } from "./chat-directory.ts";
+
 export type PeerId = string; // UUID v4
 export type PeerType = "claude" | "codex" | "hermes" | "droid";
 export type PeerName = string; // Validated by shared/names.ts; UUID-shaped names are excluded.
@@ -165,4 +167,35 @@ export interface RenamePeerResponse {
   ok: boolean;
   error?: string;
   name?: PeerName;
+}
+
+// ----- v3 chat discovery and the Hermes chat inbox -----
+
+export interface ListChatsRequest {
+  id: string;
+  session_token: string;
+  peer: string;
+  query?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ListChatsResponse {
+  ok: boolean;
+  error?: string;
+  candidates?: string[];
+  peer?: string;
+  chats?: (ChatCandidate & { address: string })[];
+}
+
+export interface ChatInboxEntry {
+  peer_id: string;
+  peer_name: string;
+  /** Null is the general mailbox, which the profile's "Agent Peers" chat reads. */
+  to_chat: string | null;
+  title: string | null;
+  unread: number;
+  leased: number;
+  max_id: number;
+  oldest_sent_at: string;
 }

@@ -34,3 +34,10 @@ test("matchesPersonaQuery matches leading tokens only", () => {
   expect(matchesPersonaQuery("marcopolo-claude", "marco")).toBe(false);
   expect(matchesPersonaQuery("vector-agentic-coding-resources-claude-7", "vector-agentic")).toBe(true);
 });
+
+test("harness and model words are never inferred as personas", () => {
+  expect(personaOf({ name: "claude-sender", cwd: "/projA" })).toBeNull();
+  expect(personaOf({ name: "codex-receiver" })).toBeNull();
+  expect(personaOf({ name: "marco-imekka-director-ops-droid", cwd: "/w/imekka-director-ops" })).toBe("marco");
+  expect(personaOf({ name: "re-amaze-codex", cwd: "/w/re-amaze" })).toBeNull();
+});
