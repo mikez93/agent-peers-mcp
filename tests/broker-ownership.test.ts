@@ -89,9 +89,21 @@ test("client-owner broker yields with exit 0 when the port is taken; launchd-own
   expect(body.owner).toBe("launchd");
   expect(typeof body.epoch).toBe("string");
 
+  // 3. systemd-owner (Linux service) is a service owner too: it evicts a client squatter
+  //    the same way and reports owner=systemd, never "launchd".
   launchd.kill("SIGTERM");
   await launchd.exited;
-}, 45_000);
+  const squatter = spawnBroker([], db1, secret);
+  expect(await waitFor(async () => (await healthPid()) === squatter.pid, 8000)).toBe(true);
+  const systemd = spawnBroker(["--owner=systemd"], db2, secret);
+  expect(await waitFor(async () => (await healthPid()) === systemd.pid, 25_000)).toBe(true);
+  expect(await squatter.exited).toBe(0);
+  const res2 = await fetch(`http://127.0.0.1:${PORT}/health`);
+  expect(((await res2.json()) as { owner?: string }).owner).toBe("systemd");
+
+  systemd.kill("SIGTERM");
+  await systemd.exited;
+}, 75_000);
 
 test("/ready requires the shared secret and reports identity", async () => {
   PORT = 20_000 + Math.floor(Math.random() * 20_000);

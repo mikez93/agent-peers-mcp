@@ -1,0 +1,29 @@
+# Agent Peers broker as a systemd --user unit (Linux fleet boxes: Omarchy, Hetzner).
+# Same contract as the macOS LaunchAgent com.mike.agent-peers-broker: the service
+# manager is the only legitimate owner of port 7900 (--owner=systemd), clients never
+# spawn the broker, and a dead broker is revived with `systemctl --user start`.
+# Install: deploy/linux/install.sh (copies this to ~/.config/systemd/user/).
+[Unit]
+Description=Agent Peers broker (loopback :7900, owner=systemd)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.bun/bin/bun %h/agent-peers-mcp/broker.ts --owner=systemd
+WorkingDirectory=%h/agent-peers-mcp
+Environment=HOME=%h
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=AGENT_PEERS_PORT=7900
+Environment=AGENT_PEERS_DB=%h/.agent-peers.db
+# Federation reads ~/.agent-peers-host, ~/.agent-peers-fleet.json and
+# ~/.agent-peers-federation-secret; without them the broker refuses to start, so
+# install.sh writes them first. Flip to 0 to run this box standalone.
+Environment=AGENT_PEERS_FEDERATION=1
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

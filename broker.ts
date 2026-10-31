@@ -1833,7 +1833,11 @@ export function ensureSharedSecret(path: string): string {
 // register/heartbeat responses.
 export const BROKER_EPOCH = randomUUID();
 
-export type BrokerOwner = "launchd" | "client";
+export type BrokerOwner = "launchd" | "systemd" | "client";
+/** launchd on macOS, systemd --user on Linux: the service manager that owns the port. */
+export function isServiceOwner(owner: BrokerOwner): boolean {
+  return owner === "launchd" || owner === "systemd";
+}
 
 // Sliding-window throttle for the unauthenticated protection endpoint: its
 // answer can only spare processes, so a 429 is always safe for the caller
@@ -2119,11 +2123,19 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
   // if the port is busy again afterwards, someone new owns it.
   const alreadySignaled = new Set<number>();
   const portListenerPid = (): number | null => {
+    const candidate = (raw: string | undefined): number | null => {
+      const pid = parseInt(raw ?? "", 10);
+      return Number.isInteger(pid) && pid > 1 && pid !== process.pid ? pid : null;
+    };
     try {
       const proc = Bun.spawnSync(["lsof", "-ti", `tcp:${port}`, "-sTCP:LISTEN"]);
-      const first = proc.stdout.toString().trim().split("\n")[0] ?? "";
-      const pid = parseInt(first, 10);
-      return Number.isInteger(pid) && pid > 1 && pid !== process.pid ? pid : null;
+      const found = candidate(proc.stdout.toString().trim().split("\n")[0]);
+      if (found !== null) return found;
+    } catch { /* lsof missing (Arch): fall through to ss */ }
+    try {
+      // Linux without lsof: `ss -Hltnp 'sport = :PORT'` prints users:(("bun",pid=123,fd=9)).
+      const proc = Bun.spawnSync(["ss", "-Hltnp", `sport = :${port}`]);
+      return candidate(/pid=(\d+)/.exec(proc.stdout.toString())?.[1]);
     } catch {
       return null;
     }
@@ -2136,12 +2148,12 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
       return;
     } catch (e) {
       if (!isAddrInUse(e)) throw e;
-      if (owner !== "launchd") {
+      if (!isServiceOwner(owner)) {
         console.error(`[broker] port ${port} already served and owner=${owner}; yielding to the incumbent (exit 0)`);
         process.exit(0);
       }
       if (attempt === 4) break;
-      // launchd owner: evict whoever actually holds the listening socket.
+      // service owner: evict whoever actually holds the listening socket.
       const squatterPid = portListenerPid();
       if (squatterPid === null || alreadySignaled.has(squatterPid)) {
         console.error(`[broker] attempt ${attempt}: port ${port} busy, no NEW evictable listener via lsof; retrying in 2s`);
@@ -2149,7 +2161,7 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
         continue;
       }
       alreadySignaled.add(squatterPid);
-      console.error(`[broker] owner=launchd evicting rogue broker pid=${squatterPid} from port ${port}`);
+      console.error(`[broker] owner=${owner} evicting rogue broker pid=${squatterPid} from port ${port}`);
       try { process.kill(squatterPid, "SIGTERM"); } catch { /* already gone */ }
       const deadline = Date.now() + 5000;
       while (Date.now() < deadline) {
@@ -2166,6 +2178,7 @@ async function startBrokerMain(owner: BrokerOwner): Promise<void> {
 export { NAME_REGEX, NAME_MAX_LEN, isValidName };
 
 if (import.meta.main) {
-  const owner: BrokerOwner = process.argv.includes("--owner=launchd") ? "launchd" : "client";
+  const owner: BrokerOwner = process.argv.includes("--owner=launchd") ? "launchd"
+    : process.argv.includes("--owner=systemd") ? "systemd" : "client";
   await startBrokerMain(owner);
 }

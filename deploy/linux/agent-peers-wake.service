@@ -1,0 +1,20 @@
+# Agent Peers wake loop as a systemd --user unit. Mirrors the macOS LaunchAgent
+# com.mike.agent-peers-wake: `codex-peer daemon 5` reruns wake-daemon.ts from the
+# checkout every 5 seconds, so new code is picked up without restarting this unit.
+[Unit]
+Description=Agent Peers wake daemon loop (codex-peer daemon 5)
+After=agent-peers-broker.service
+Wants=agent-peers-broker.service
+
+[Service]
+Type=simple
+ExecStart=%h/agent-peers-mcp/bin/codex-peer daemon 5
+WorkingDirectory=%h/agent-peers-mcp
+Environment=HOME=%h
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

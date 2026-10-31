@@ -83,11 +83,13 @@ export function createReadinessProbe(
         ok?: boolean; protocol?: number; owner?: string; db_id?: string;
       };
       if (body.ok !== true || body.protocol !== 1) return false;
-      // Ownership: launchd always; a client-owned broker only under the
+      // Ownership: launchd or systemd always; a client-owned broker only under the
       // explicit AGENT_PEERS_SPAWN_BROKER=1 dev escape — and then only
       // owner="client" exactly, never an arbitrary/absent owner value.
       const devMode = process.env.AGENT_PEERS_SPAWN_BROKER === "1";
-      const ownerOk = body.owner === "launchd" || (devMode && body.owner === "client");
+      // "systemd" is the Linux service owner (Omarchy, Hetzner): same contract
+      // as launchd, so it is accepted on every platform, never as "launchd".
+      const ownerOk = body.owner === "launchd" || body.owner === "systemd" || (devMode && body.owner === "client");
       if (!ownerOk) return false;
       // DB identity is REQUIRED: an absent db_id is a broker we can't verify
       // (or a responder that merely echoes ok/protocol), not a pass.

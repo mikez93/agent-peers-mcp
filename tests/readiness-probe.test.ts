@@ -45,6 +45,11 @@ test("healthy launchd broker with matching DB passes", async () => {
   expect(await probe(GOOD_SECRET)()).toBe(true);
 });
 
+test("systemd-owned broker (Linux service) passes outside dev mode; the string is not 'launchd'", async () => {
+  readyBody = { ok: true, protocol: 1, owner: "systemd", db_id: expectedDbIdentityHash(DB_PATH) };
+  expect(await probe(GOOD_SECRET)()).toBe(true);
+});
+
 test("wrong secret (someone else's broker) fails", async () => {
   expect(await probe("wrong-".padEnd(40, "x"))()).toBe(false);
 });

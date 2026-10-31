@@ -9,7 +9,7 @@
 // port 7900 with its spawner's env).
 
 import { test, expect } from "bun:test";
-import { ensureBroker } from "../shared/ensure-broker.ts";
+import { ensureBroker, serviceStartCommand } from "../shared/ensure-broker.ts";
 
 const SCRIPT_URL = new URL("./fixtures/echo-env-broker.ts", import.meta.url).href;
 
@@ -92,4 +92,10 @@ test("allowSpawn: spawns with pinned env — session vars never reach the child"
     delete process.env.AGENT_PEERS_TEST_OUT;
     delete process.env.AGENT_PEERS_PORT;
   }
+});
+
+test("service start command: launchctl kickstart on macOS, systemctl --user start on Linux", () => {
+  expect(serviceStartCommand("darwin").slice(0, 2)).toEqual(["launchctl", "kickstart"]);
+  expect(serviceStartCommand("darwin")[2]).toMatch(/^gui\/\d+\/com\.mike\.agent-peers-broker$/);
+  expect(serviceStartCommand("linux")).toEqual(["systemctl", "--user", "start", "agent-peers-broker"]);
 });

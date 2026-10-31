@@ -15,9 +15,13 @@
 // (tests, broker-less dev boxes) and pins the child env so nothing session-
 // specific can leak into a broker that outlives the session.
 
+import { platform } from "node:os";
 import { fileURLToPath } from "node:url";
 
 export const BROKER_LAUNCHD_LABEL = "com.mike.agent-peers-broker";
+// Linux boxes (Omarchy, Hetzner) run the broker as a systemd --user unit with
+// --owner=systemd; same contract as launchd, different service manager.
+export const BROKER_SYSTEMD_UNIT = "agent-peers-broker";
 
 export interface EnsureBrokerOpts {
   /** Total time to wait for the broker to answer, default 15s (launchd cold
@@ -25,24 +29,35 @@ export interface EnsureBrokerOpts {
   timeoutMs?: number;
   /** Poll interval, default 250ms. */
   pollMs?: number;
-  /** Injectable `launchctl kickstart` runner for tests. Must not throw. */
+  /** Injectable service-start runner (`launchctl kickstart` / `systemctl --user start`) for tests. Must not throw. */
   kickstart?: () => Promise<void>;
   /** Override for AGENT_PEERS_SPAWN_BROKER (tests). */
   allowSpawn?: boolean;
 }
 
+export function serviceStartCommand(os: string = platform()): string[] {
+  if (os === "linux") return ["systemctl", "--user", "start", BROKER_SYSTEMD_UNIT];
+  const uid = process.getuid?.() ?? 501;
+  return ["launchctl", "kickstart", `gui/${uid}/${BROKER_LAUNCHD_LABEL}`];
+}
+
 async function defaultKickstart(): Promise<void> {
   try {
-    const uid = process.getuid?.() ?? 501;
-    const p = Bun.spawn(
-      ["launchctl", "kickstart", `gui/${uid}/${BROKER_LAUNCHD_LABEL}`],
-      { stdio: ["ignore", "ignore", "ignore"] },
-    );
+    const p = Bun.spawn(serviceStartCommand(), { stdio: ["ignore", "ignore", "ignore"] });
     await p.exited;
   } catch {
-    // launchctl missing or service not installed (dev box) — the poll loop
-    // below will surface the failure with a clear message.
+    // launchctl/systemctl missing or service not installed (dev box) — the
+    // poll loop below will surface the failure with a clear message.
   }
+}
+
+function serviceHint(os: string = platform()): string {
+  if (os === "linux") {
+    return `Production brokers are owned by systemd --user (${BROKER_SYSTEMD_UNIT}); check ` +
+      `\`systemctl --user status ${BROKER_SYSTEMD_UNIT}\` and \`journalctl --user -u ${BROKER_SYSTEMD_UNIT}\`.`;
+  }
+  return `Production brokers are owned by launchd (${BROKER_LAUNCHD_LABEL}); check ` +
+    `\`launchctl print gui/$(id -u)/${BROKER_LAUNCHD_LABEL}\` and ~/Library/Logs/agent-peers-broker.log.`;
 }
 
 export async function ensureBroker(
@@ -89,9 +104,7 @@ export async function ensureBroker(
   }
   throw new Error(
     `ensureBroker: broker did not come up within ${Math.round(timeoutMs / 1000)}s. ` +
-    `Production brokers are owned by launchd (${BROKER_LAUNCHD_LABEL}); check ` +
-    `\`launchctl print gui/$(id -u)/${BROKER_LAUNCHD_LABEL}\` and ` +
-    `~/Library/Logs/agent-peers-broker.log. On a box without the LaunchAgent, ` +
+    `${serviceHint()} On a box without the service, ` +
     `set AGENT_PEERS_SPAWN_BROKER=1 to allow client self-spawn.`,
   );
 }
