@@ -57,9 +57,17 @@ For example, a fleet map can contain:
 These are placeholder URLs, not installed destinations. Base URLs are origins
 (scheme, host, and port when needed), without `/federation`. The Macs use
 dedicated HTTPS port **8443**; Linux brokers use **443**. Mac port 443 already
-serves unrelated applications, so keep Linux-to-Mac federation access restricted
-to TCP 8443. Do not grant access to Mac port 443 to make federation work; verify
-the effective policy, including any other grants, preserves this boundary.
+serves unrelated applications, so the federation grants to the Macs allow only
+TCP 8443. Existing authorized access is separate. The fleet's effective boundary
+(2026-10-31) is:
+
+- Hetzner cannot reach either Mac on port 443.
+- Omarchy cannot reach the MacBook on port 443.
+- Omarchy retains its pre-existing full access to the Studio, including 443.
+  Do not revoke that access to match the federation-only grant.
+
+Verify the effective policy, including other grants, rather than inferring
+denial from the narrow federation grant alone.
 The configured proxy must forward the service's
 `/federation/directory`, `/federation/relay`, and `/federation/health` paths.
 The broker stays bound to localhost. Relay requests do not follow redirects.
@@ -83,7 +91,8 @@ Remove only the relevant mount with
 `tailscale serve --https=443 --set-path=/federation off` on Linux, not a global reset.
 At cutover, verify the federation health route with the separate credential,
 that local-only paths such as `/register` are not exposed by this mount, and
-that Linux nodes cannot reach the Macs' unrelated port-443 services.
+that Hetzner is denied both Macs' port-443 services and Omarchy is denied the
+MacBook's. Omarchy-to-Studio access must remain unchanged.
 Docs/CLI syntax is not live proxy-path or authorization proof.
 
 Reference: [Tailscale Serve CLI](https://tailscale.com/docs/reference/tailscale-cli/serve),
