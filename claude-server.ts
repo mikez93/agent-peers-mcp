@@ -36,6 +36,7 @@ import {
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
+import { LIST_CHATS_TOOL, runListChats } from "./shared/chat-list.ts";
 import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { DeliveryState } from "./shared/delivery-state.ts";
@@ -207,6 +208,7 @@ const TOOLS = [
       required: ["new_name"],
     },
   },
+  LIST_CHATS_TOOL,
 ];
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -354,6 +356,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       myName = res.name ?? new_name;
       setTabTitle(`peer:${myName}`);
       return { content: [{ type: "text" as const, text: `Renamed to ${myName}` }] };
+    }
+
+    case "list_chats": {
+      const r = await runListChats(client, { id: myId, session_token: mySession }, (args ?? {}) as Record<string, unknown>);
+      return { content: [{ type: "text" as const, text: r.text }], ...(r.isError ? { isError: true } : {}) };
     }
 
     default:

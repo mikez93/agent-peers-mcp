@@ -70,6 +70,8 @@ import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive }
 import { canUseLegacyWakeEnv, decideWakeLaunchRole, isWakeLaunchEnv, shouldRegisterAsPeer } from "./shared/wake-launch-role.ts";
 import { resolveStateDir } from "./shared/state-dir.ts";
 import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
+import { LIST_CHATS_TOOL, runListChats } from "./shared/chat-list.ts";
+import { resolvePeerIdentity } from "./shared/peer-identity.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName, NAME_MAX_LEN } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
@@ -113,6 +115,13 @@ const RUNTIME_DISPLAY_NAME = RUNTIME_PEER_TYPE === "hermes"
     : "Codex";
 const RUNTIME_IS_CODEX = RUNTIME_PEER_TYPE === "codex";
 const RUNTIME_IS_DROID = RUNTIME_PEER_TYPE === "droid";
+// v3 per-chat mail (bd-b2in.5). One agent-peers process serves every chat of a
+// Hermes profile and MCP calls carry no session, so each mail call names its
+// chat. Mail for one chat is never drawn or confirmed by a call from another.
+// Calls without a chat keep today's behavior: they read the general mailbox.
+const HERMES_CHAT_MAIL = RUNTIME_PEER_TYPE === "hermes" && process.env.AGENT_PEERS_HERMES_CHAT_MAIL !== "0";
+const GENERAL_PARTITION = "general";
+function partitionOf(m: { to_chat?: string | null }): string { return m.to_chat ?? GENERAL_PARTITION; }
 // Claude/Codex MCP lifetime is the real working-session lineage. Hermes may
 // launch temporary MCP children, so it deliberately omits this value and lets
 // the broker preserve the durable peer's existing start on reclaim.
@@ -221,7 +230,20 @@ DELIVERY CHANNELS:
   2. A best-effort MCP \`notifications/message\` log push also fires
      on each background poll tick. Treat the [PEER INBOX] block as the
      authoritative input regardless of whether ${RUNTIME_DISPLAY_NAME}
-     surfaces that notification.`,
+     surfaces that notification.${HERMES_CHAT_MAIL ? `
+
+PER-CHAT MAIL (Hermes):
+
+This server is shared by every chat of this profile, so mail is filed per
+chat. Pass your chat to every agent-peers call: \`chat\` on check_messages,
+list_peers, set_summary and the other tools, and \`from_chat\` on
+send_message so the reply comes back to this chat. Your chat is the one
+named in a wake message; otherwise it is the value of $HERMES_SESSION_ID
+(run \`echo $HERMES_SESSION_ID\` once). In the profile's "Agent Peers" chat,
+or when a wake message says general, use chat="general". A call without a
+chat reads the profile's general mailbox. When you finish handling woken
+mail, call check_messages with the same chat once more so the broker records
+that you read it.` : ""}`,
   },
 );
 
@@ -299,6 +321,21 @@ const TOOLS = [
   },
 ];
 
+(TOOLS as unknown as Record<string, unknown>[]).push(LIST_CHATS_TOOL);
+if (HERMES_CHAT_MAIL) {
+  const chatArg = {
+    type: "string" as const,
+    description: "Your Hermes chat, so only its mail is read and confirmed: the chat named in a wake message, else $HERMES_SESSION_ID. Use \"general\" in the profile's Agent Peers chat. Omitted: the general mailbox.",
+  };
+  for (const tool of TOOLS as unknown as { name: string; inputSchema: { properties: Record<string, unknown> } }[]) {
+    if (tool.name === "send_message") {
+      tool.inputSchema.properties.from_chat = { ...chatArg, description: `${chatArg.description} Replies come back to this chat.` };
+    } else {
+      tool.inputSchema.properties.chat = chatArg;
+    }
+  }
+}
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 const MAX_PENDING_ACKS = 500;
@@ -324,11 +361,21 @@ function enqueueAck(token: string) {
   }
 }
 
-async function waitForFreshPeerMessages(timeoutMs: number, from?: string): Promise<boolean> {
+async function waitForFreshPeerMessages(timeoutMs: number, from?: string, chat?: string): Promise<boolean> {
+  // A chat wait polls that chat and ends only on that chat's mail.
+  const chatHint = HERMES_CHAT_MAIL && chat && chat.trim().toLowerCase() !== GENERAL_PARTITION ? chat.trim() : undefined;
+  let chatKey: string | null = HERMES_CHAT_MAIL && !chatHint ? GENERAL_PARTITION : null;
   return waitForFreshPeerMessagesLoop({
     timeoutMs,
     pollIntervalMs: WAIT_FOR_MESSAGES_POLL_MS,
-    poll: pollBrokerIntoQueue,
+    poll: chatHint
+      ? async () => {
+          const r = await client.pollChat({ id: myId!, session_token: mySession!, chat: chatHint });
+          if (r.scope === "chat" && r.chat_key) chatKey = r.chat_key;
+          if (r.messages.length > 0) markPeerActivity();
+          await withPiggybackLock(() => applyLeasedToQueue(r.messages));
+        }
+      : pollBrokerIntoQueue,
     readUnread: async () => inboxStore ? inboxStore.getUnreadMessages() : [],
     // The sender filter governs only what ENDS the wait. Non-matching mail
     // stays queued and still surfaces in this response's [PEER INBOX] block —
@@ -336,6 +383,7 @@ async function waitForFreshPeerMessages(timeoutMs: number, from?: string): Promi
     // 2026-08-08 §1: Marco's wait for Kepler ate an unrelated Vector message).
     isFresh: (m) =>
       !delivery.isBlocked(m.id) &&
+      (!HERMES_CHAT_MAIL || (chatKey !== null && partitionOf(m) === chatKey)) &&
       (!from || m.from_id === from || m.from_name === from),
     onError: (message) => log(`wait_for_peer_messages ${message}`),
   });
@@ -479,7 +527,7 @@ const withPiggybackLock = createAsyncLock();
 
 async function withPiggyback(
   handler: () => Promise<{ text: string; isError?: boolean }>,
-  opts: { beforeReadQueue?: () => Promise<void>; signal?: AbortSignal } = {},
+  opts: { beforeReadQueue?: () => Promise<void>; signal?: AbortSignal; chat?: string } = {},
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
   if (!myId || !mySession) {
     return {
@@ -507,7 +555,7 @@ async function withPiggyback(
     log(`before-read hook failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  const fresh = await withPiggybackLock(async () => acquireInboxBatch(callId, arrivalGen));
+  const { fresh, note } = await withPiggybackLock(async () => acquireInboxBatch(callId, arrivalGen, opts.chat));
 
   // Serving-identity delivery breadcrumb (delivery-fix spec §6.4). This is the
   // ONE place a message is handed to the model, so logging the serving identity
@@ -532,7 +580,7 @@ async function withPiggyback(
   }
 
   const inbox = formatInboxBlock(fresh);
-  const finalText = inbox + toolText;
+  const finalText = inbox + (note ? `${note}\n\n` : "") + toolText;
   if (opts.signal?.aborted) {
     // The request was cancelled: this response will never reach the model.
     // Roll the draws back to re-dealable — nothing was acked, nothing was
@@ -549,7 +597,42 @@ async function withPiggyback(
 
 // The locked critical section: confirm-promote, ack-flush, poll, and the
 // read-filter-mark draw. Exactly one concurrent tool call can be in here.
-async function acquireInboxBatch(callId: string, arrivalGen: number): Promise<LeasedMessage[]> {
+async function acquireInboxBatch(callId: string, arrivalGen: number, chatHint?: string): Promise<{ fresh: LeasedMessage[]; note?: string }> {
+  // ------------------------------------------------------------------------
+  // STEP 0 (Hermes per-chat mail) — work out which mailbox this call reads.
+  // `key` null means no partitioning (Codex, Droid, chat mail switched off).
+  // A chat call polls its chat first, which also refreshes the lease tokens
+  // of mail it presented earlier, so its confirm below acks fresh tokens.
+  let key: string | null = null;
+  let readable = true;
+  let polledChat = false;
+  let note: string | undefined;
+  if (HERMES_CHAT_MAIL) {
+    const hint = chatHint?.trim();
+    if (!hint || hint.toLowerCase() === GENERAL_PARTITION) {
+      key = GENERAL_PARTITION;
+    } else {
+      try {
+        const r = await client.pollChat({ id: myId!, session_token: mySession!, chat: hint });
+        polledChat = true;
+        if (r.messages.length > 0) markPeerActivity();
+        await applyLeasedToQueue(r.messages);
+        if (r.scope === "chat" && r.chat_key) key = r.chat_key;
+        else if (r.scope === "general") key = GENERAL_PARTITION;
+        else {
+          readable = false;
+          note = r.scope === "none"
+            ? `[agent-peers] No chat "${hint}" was found for this agent, so no chat mail was read. Use the chat named in your wake message, $HERMES_SESSION_ID, or "general".`
+            : `[agent-peers] This machine's broker does not support per-chat mail yet, so nothing was read for chat "${hint}".`;
+        }
+      } catch (e) {
+        readable = false;
+        note = `[agent-peers] Could not read mail for chat "${hint}" (${e instanceof Error ? e.message : String(e)}). Nothing was lost; try again.`;
+      }
+    }
+  }
+  const inPartition = (m: LeasedMessage) => readable && (key === null || partitionOf(m) === key);
+
   // ------------------------------------------------------------------------
   // STEP 1a — Confirm-promote FIRST: items drawn into a FULLY BUILT previous
   // response are now (with Codex calling us again as evidence) known to have
@@ -567,7 +650,17 @@ async function acquireInboxBatch(callId: string, arrivalGen: number): Promise<Le
   // Eligibility uses the ARRIVAL snapshot from withPiggyback entry, not
   // lock-entry state: only responses fully built before this request was
   // issued are confirmable by it.
-  const confirmable = delivery.confirmable(arrivalGen);
+  let confirmable = delivery.confirmable(arrivalGen);
+  if (confirmable.length > 0 && inboxStore && key !== null) {
+    // Per-chat mail: a call confirms only presentations of its own mailbox.
+    try {
+      const partitionById = new Map((await inboxStore.getUnreadMessages()).map((m) => [m.id, partitionOf(m)]));
+      confirmable = readable ? confirmable.filter((id) => (partitionById.get(id) ?? GENERAL_PARTITION) === key) : [];
+    } catch (e) {
+      log(`confirm partition read failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
+      confirmable = [];
+    }
+  }
   if (confirmable.length > 0 && inboxStore) {
     try {
       const confirmingSet = new Set(confirmable);
@@ -631,10 +724,12 @@ async function acquireInboxBatch(callId: string, arrivalGen: number): Promise<Le
   // background pollInFlight that is itself queued on the lock we hold. A
   // concurrent background fetch is harmless — its apply serializes behind us
   // and the id-keyed upsert/triage is re-offer-safe by design.
-  try {
-    await applyLeasedToQueue(await fetchBrokerLeases());
-  } catch (e) {
-    log(`inline poll failed: ${e instanceof Error ? e.message : String(e)}`);
+  if (!polledChat && readable) {
+    try {
+      await applyLeasedToQueue(await fetchBrokerLeases());
+    } catch (e) {
+      log(`inline poll failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   // ------------------------------------------------------------------------
@@ -662,6 +757,7 @@ async function acquireInboxBatch(callId: string, arrivalGen: number): Promise<Le
     // Blocked = confirmed, or dealt to a response that is in flight or
     // awaiting confirm — that presentation is the one we're waiting on.
     if (delivery.isBlocked(m.id)) continue;
+    if (!inPartition(m)) continue;
     fresh.push(m);
   }
 
@@ -678,7 +774,7 @@ async function acquireInboxBatch(callId: string, arrivalGen: number): Promise<Le
   // in a way this state still needs to dedupe.
   pruneSeenWatermark(queued);
 
-  return fresh;
+  return { fresh, note };
 }
 
 const SEEN_WATERMARK_SLACK = 10_000;
@@ -694,6 +790,12 @@ function pruneSeenWatermark(queued: LeasedMessage[]): void {
 mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   const { name, arguments: args } = req.params;
   let waitResult: { didWait: boolean; found: boolean; timeoutMs: number; skippedWakeable?: boolean } | null = null;
+  const callArgs = (args ?? {}) as Record<string, unknown>;
+  const chatArg = HERMES_CHAT_MAIL
+    ? (typeof callArgs.chat === "string" && callArgs.chat.trim() ? callArgs.chat.trim()
+      : name === "send_message" && typeof callArgs.from_chat === "string" && callArgs.from_chat.trim() ? callArgs.from_chat.trim()
+      : undefined)
+    : undefined;
 
   return withPiggyback(async () => {
     switch (name) {
@@ -713,8 +815,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
 
       case "send_message": {
         const { to_id, message } = args as { to_id: string; message: string };
+        const fromChat = HERMES_CHAT_MAIL && typeof callArgs.from_chat === "string" && callArgs.from_chat.trim()
+          ? callArgs.from_chat.trim() : undefined;
         const res = await client.sendMessage({
           from_id: myId!, session_token: mySession!, to_id_or_name: to_id, text: message,
+          ...(fromChat ? { from_chat: fromChat } : {}),
         });
         if (!res.ok) return { text: `Send failed: ${res.error}`, isError: true };
         markPeerActivity();
@@ -729,8 +834,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
 
       case "check_messages": {
         // Piggyback already polled + injected; nothing extra to do.
+        if (HERMES_CHAT_MAIL) {
+          return { text: chatArg ? `Checked inbox for chat ${chatArg}.` : "Checked the general mailbox. Pass chat (your $HERMES_SESSION_ID, or the chat in a wake message) to read one chat's mail." };
+        }
         return { text: `Checked inbox.` };
       }
+
+      case "list_chats":
+        return runListChats(client, { id: myId!, session_token: mySession! }, callArgs);
 
       case "wait_for_peer_messages": {
         if (waitResult?.skippedWakeable) {
@@ -779,6 +890,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     }
   }, {
     signal: extra?.signal,
+    chat: chatArg,
     beforeReadQueue: async () => {
       // withPiggyback already captured arrivalGen synchronously. Never
       // move discovery ahead of that barrier, or a concurrent response
@@ -806,6 +918,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       const found = await waitForFreshPeerMessages(
         plan.timeoutMs,
         typeof from === "string" && from.length > 0 ? from : undefined,
+        chatArg,
       );
       waitResult = { didWait: true, found, timeoutMs: plan.timeoutMs };
     },
@@ -954,6 +1067,12 @@ async function main() {
     : null;
   let hermesClaims: HermesNameClaims | null = null;
   let hermesClaimedName: string | null = null;
+  // v3: persona for find-by-name, and per-chat mail for Hermes. An election
+  // loser names its profile's durable mailbox so replies to its chats route
+  // there.
+  let persona: string | null = null;
+  try { persona = resolvePeerIdentity({ cwd: myCwd, harness: RUNTIME_PEER_TYPE, explicitName: requestedName }).persona; } catch { /* identity is best effort */ }
+  let mailboxOwner: string | undefined;
   if (RUNTIME_PEER_TYPE === "hermes" && process.env.PEER_NAME && requestedName) {
     hermesClaims = new HermesNameClaims();
     if (await hermesClaims.tryAcquire(requestedName, process.pid)) {
@@ -961,6 +1080,7 @@ async function main() {
       log(`hermes name-claim won: this surface owns "${requestedName}"`);
     } else {
       log(`hermes name-claim lost: "${requestedName}" is owned by another live surface; registering ephemeral`);
+      mailboxOwner = requestedName;
       requestedName = await defaultPeerName(myCwd, RUNTIME_PEER_TYPE);
       requestDurable = false;
     }
@@ -993,6 +1113,9 @@ async function main() {
     started_at: WORKING_SESSION_STARTED_AT,
     durable: requestDurable,
     ...(droidResumeClaim?.previous_peer_id ? { prev_id: droidResumeClaim.previous_peer_id } : {}),
+    persona,
+    ...(HERMES_CHAT_MAIL ? { capabilities: ["chat-mail"] } : {}),
+    ...(HERMES_CHAT_MAIL && mailboxOwner ? { mailbox_owner: mailboxOwner } : {}),
   });
   myId = reg.id;
   myName = reg.name;
@@ -1084,6 +1207,9 @@ async function main() {
           // Mailbox follows the agent: if our old row is gone, the broker
           // re-points our unacked mail to the new incarnation.
           prev_id: myId,
+          persona,
+          ...(HERMES_CHAT_MAIL ? { capabilities: ["chat-mail"] } : {}),
+          ...(HERMES_CHAT_MAIL && mailboxOwner ? { mailbox_owner: mailboxOwner } : {}),
         });
         const prevStore = myId !== again.id ? inboxStore : null;
         myId = again.id;

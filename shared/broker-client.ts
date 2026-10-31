@@ -22,6 +22,9 @@ export interface BrokerClient {
   pollMessages(req: PollMessagesRequest): Promise<LeasedMessage[]>;
   ackMessages(req: AckMessagesRequest): Promise<AckMessagesResponse>;
   renamePeer(req: RenamePeerRequest): Promise<RenamePeerResponse>;
+  /** v3: poll one Hermes chat's mail (or "general"). An old broker ignores
+   *  the chat and answers with general mail and no scope. */
+  pollChat(req: PollMessagesRequest & { chat: string }): Promise<{ messages: LeasedMessage[]; scope?: "general" | "chat" | "none"; chat_key?: string | null }>;
   /** v3. Null when the broker predates chat discovery (404). */
   listChats(req: ListChatsRequest): Promise<ListChatsResponse | null>;
   /** v3. Null when the broker predates the chat inbox (404). */
@@ -178,6 +181,9 @@ export function createClient(
     async pollMessages(req) {
       const { messages } = await post<{ messages: LeasedMessage[] }>("/poll-messages", req);
       return messages;
+    },
+    pollChat(req) {
+      return post<{ messages: LeasedMessage[]; scope?: "general" | "chat" | "none"; chat_key?: string | null }>("/poll-messages", req);
     },
     ackMessages(req) { return post<AckMessagesResponse>("/ack-messages", req); },
     renamePeer(req) { return post<RenamePeerResponse>("/rename-peer", req); },
