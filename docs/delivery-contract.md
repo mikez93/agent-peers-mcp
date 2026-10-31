@@ -28,6 +28,20 @@ does anything.
 
 ## Per-harness behavior
 
+### Broker-side retention
+
+The local durable stores above have no TTL. The broker's own `messages`
+table does: acked rows are kept 7 days as receipts, and unacked rows are
+deleted after 30 days (`gcOldMessages`). Every live recipient copies its mail
+into its local durable store within seconds of arrival (Claude acks at that
+point; Codex, Droid and Hermes keep the broker row leased until confirm), and
+that copy is removed only on confirm. So the 30-day cutoff loses mail only for
+a recipient that never came online in 30 days — mail to a UUID nobody will
+reclaim. Before it runs out, `cli.ts stranded-messages` lists it. Legacy Hermes
+V2 conversation peers are exempt. A Hermes chat that nobody opens for 30 days
+keeps its mail in the profile owner's local store, but the chat-wake pass
+(which reads the broker) stops offering a wake for it.
+
 ### Claude Code (`claude-server.ts`)
 
 - **Push-ish**: a background poll (1s) pushes into the session's channel and
