@@ -18,6 +18,7 @@ import { canonicalProfileHome, type HermesConversationContext } from "./hermes-c
 import { validateConversationDbFiles } from "./hermes-conversation-db-files.ts";
 import { HermesConversationComposition, type HermesConversationHostBridge } from "./hermes-conversation-composition.ts";
 import { createHermesAttachmentBridge } from "./hermes-runtime-attachment.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
 export async function startHermesConversationRuntime(options: {
   resolveGitRoot?: typeof getGitRoot;
@@ -26,7 +27,7 @@ export async function startHermesConversationRuntime(options: {
   createHostBridge?: (scope: Readonly<{ home: string; backend_id: string }>) => HermesConversationHostBridge;
 } = {}): Promise<void> {
   const env = Object.freeze({ ...process.env });
-  const stateRoot = env.AGENT_PEERS_STATE_DIR ?? env.AGENT_PEERS_HERMES_STATE_DIR ?? join(homedir(), ".agent-peers-hermes");
+  const stateRoot = resolveStateDir({ runtime: "hermes", kind: "coordination", env });
   let db: Database | undefined;
   let adapter: HermesConversationAdapter | undefined;
   let composition: HermesConversationComposition | undefined;

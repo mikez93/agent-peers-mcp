@@ -20,28 +20,15 @@
 // win.
 
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { isProcessAlive } from "./process-liveness.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
 
 function defaultClaimsDir(): string {
-  const root = process.env.AGENT_PEERS_STATE_DIR
-    ?? process.env.AGENT_PEERS_HERMES_STATE_DIR
-    ?? join(homedir(), ".agent-peers-hermes");
-  return join(root, "name-claims");
-}
-
-function isProcessAlive(pid: number | null | undefined): boolean {
-  if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    // EPERM means "alive but not ours" — still alive.
-    return e instanceof Error && "code" in e && (e as { code?: string }).code === "EPERM";
-  }
+  return join(resolveStateDir({ runtime: "hermes", kind: "coordination" }), "name-claims");
 }
 
 /** PID-reuse guard (2026-08-10 review medium): after a reboot, an unrelated

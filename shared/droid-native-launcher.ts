@@ -1,5 +1,4 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { realpath } from "node:fs/promises";
 import { DroidLaunchClaimStore } from "./droid-launch-claims.ts";
@@ -7,12 +6,13 @@ import { defaultPeerName } from "./peer-identity.ts";
 import { buildDroidMcpServer, ClaimBoundDroidWakeMetadataSource, DroidWakeController, DroidLauncherUsageError, type DroidLauncherOptions } from "./droid-launcher.ts";
 import { DroidNativeRelay, type DroidFrame } from "./droid-native-relay.ts";
 import { acquireDroidSession } from "./droid-session-owner.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
 // Keep Factory's UI, permission prompts, history renderer and key handling.
 // Only the daemon is detached: its process group contains our owned engines
 // and MCP children, and can be shut down without touching another session.
 export async function runNativeDroidLauncher(opts: DroidLauncherOptions, signal: AbortSignal): Promise<number> {
-  const root = process.env.AGENT_PEERS_DROID_STATE_DIR ?? join(homedir(), ".agent-peers-droid");
+  const root = resolveStateDir({ runtime: "droid", kind: "coordination" });
   const claims = new DroidLaunchClaimStore({ rootDir: root });
   const saved = opts.sessionId ? await claims.readSession(opts.sessionId) : null;
   // Factory canonicalizes cwd (notably /tmp -> /private/tmp on macOS).

@@ -2,9 +2,10 @@
 // Bodyless wake engine for app-server-backed Codex sessions.
 
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { readFile, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { atomicWriteJson, ensurePrivateDir } from "./file-state.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
 import { CodexAppServerWsClient, type AppServerClient, type AppServerThread } from "./app-server-client.ts";
 import { WakeRegistry, type WakeRegistryEntry } from "./wake-registry.ts";
@@ -54,10 +55,6 @@ interface PeerInboxMetadata {
   metadata: CodexInboxMetadataState;
 }
 
-const DIR_MODE = 0o700;
-const FILE_MODE = 0o600;
-const IS_POSIX = platform() !== "win32";
-
 // Re-waking the SAME unread set rarely helps — the model has already been
 // shown it once. So back off hard and cap. New messages change the signature
 // and bypass this entirely. Wide gaps keep the worst-case token cost of a
@@ -76,10 +73,6 @@ const DEFAULT_DEAD_GRACE_MS = 30 * 60_000;
 const OBSERVE_BACKOFF_REASONS = new Set(["thread_system_error"]);
 const OBSERVE_SYSTEMERROR_SCHEDULE_MS = [5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 const OBSERVE_HEARTBEAT_MS = 30 * 60_000;
-
-function defaultRootDir(): string {
-  return join(homedir(), ".agent-peers-codex");
-}
 
 export function pendingSignature(peerId: string, metadata: CodexInboxMetadataState): string {
   const ids = metadata.unread.map((message) => message.id).sort((a, b) => a - b).join(",");
@@ -100,7 +93,8 @@ New agent-peers mail arrived while you are working. Call the agent-peers check_m
 }
 
 export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeResult[]> {
-  const rootDir = opts.rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? defaultRootDir();
+  const rootDir = resolveStateDir({ runtime: "codex", kind: "coordination", rootDir: opts.rootDir });
+  const inboxRoot = resolveStateDir({ runtime: "codex", rootDir: opts.rootDir });
   const registry = opts.registry ?? new WakeRegistry({ rootDir });
   if ("init" in registry && typeof registry.init === "function") await registry.init();
   const ledger = new WakeLedger({
@@ -110,7 +104,11 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
     now: opts.now,
   });
   const observe = new WakeObservationLog({ rootDir, now: opts.now });
-  const metadataByPeer = new Map((await readAllInboxMetadata(rootDir)).map((item) => [item.peerId, item.metadata]));
+  // Old MCP children may still write beneath the coordination root. Prefer the
+  // configured inbox when present, but keep those existing peers wakeable too.
+  const oldMetadata = inboxRoot === rootDir ? [] : await readAllInboxMetadata(rootDir);
+  const metadataByPeer = new Map([...oldMetadata, ...await readAllInboxMetadata(inboxRoot)]
+    .map((item) => [item.peerId, item.metadata]));
   const entries = await registry.list();
   const results: WakeResult[] = [];
 
@@ -436,10 +434,7 @@ class WakeLedger {
   }
 
   private async ensureDir(): Promise<void> {
-    await mkdir(this.dir, { recursive: true, mode: DIR_MODE });
-    if (IS_POSIX) {
-      try { await chmod(this.dir, DIR_MODE); } catch { /* best effort */ }
-    }
+    await ensurePrivateDir(this.dir);
   }
 
   private async read(path: string): Promise<WakeLedgerRecord | null> {
@@ -454,13 +449,7 @@ class WakeLedger {
   }
 
   private async write(path: string, value: WakeLedgerRecord): Promise<void> {
-    await this.ensureDir();
-    const tempPath = `${path}.${process.pid}.tmp`;
-    await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
-    if (IS_POSIX) {
-      try { await chmod(tempPath, FILE_MODE); } catch { /* best effort */ }
-    }
-    await rename(tempPath, path);
+    await atomicWriteJson(path, value);
   }
 
   private pathFor(signature: string): string {
@@ -614,10 +603,7 @@ class WakeObservationLog {
   }
 
   private async ensureDir(): Promise<void> {
-    await mkdir(this.dir, { recursive: true, mode: DIR_MODE });
-    if (IS_POSIX) {
-      try { await chmod(this.dir, DIR_MODE); } catch { /* best effort */ }
-    }
+    await ensurePrivateDir(this.dir);
   }
 
   private async read(path: string): Promise<WakeObservationRecord | null> {
@@ -632,14 +618,7 @@ class WakeObservationLog {
   }
 
   private async write(peerId: string, value: WakeObservationRecord): Promise<void> {
-    await this.ensureDir();
-    const path = this.pathFor(peerId);
-    const tempPath = `${path}.${process.pid}.tmp`;
-    await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
-    if (IS_POSIX) {
-      try { await chmod(tempPath, FILE_MODE); } catch { /* best effort */ }
-    }
-    await rename(tempPath, path);
+    await atomicWriteJson(this.pathFor(peerId), value);
   }
 
   private pathFor(peerId: string): string {

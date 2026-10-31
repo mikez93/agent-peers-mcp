@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { decideWakeLaunchRole, isWakeLaunchEnv, shouldRegisterAsPeer } from "../shared/wake-launch-role.ts";
+import { canUseLegacyWakeEnv, decideWakeLaunchRole, isWakeLaunchEnv, shouldRegisterAsPeer } from "../shared/wake-launch-role.ts";
 import { WakeLaunchClaimStore } from "../shared/wake-launch-claims.ts";
 
 const dirs: string[] = [];
@@ -44,6 +44,39 @@ test("isWakeLaunchEnv only trips on an exact opt-in", () => {
   expect(isWakeLaunchEnv({ AGENT_PEERS_WAKE_LAUNCH: "0" })).toBe(false);
   expect(isWakeLaunchEnv({ AGENT_PEERS_WAKE_LAUNCH: "true" })).toBe(false);
   expect(isWakeLaunchEnv({})).toBe(false);
+});
+
+test("legacy wake hints cannot override a managed launch's elected claim", () => {
+  expect(canUseLegacyWakeEnv({ AGENT_PEERS_WAKE_ENABLED: "1" })).toBe(true);
+  expect(canUseLegacyWakeEnv({ AGENT_PEERS_WAKE_ENABLED: "1", AGENT_PEERS_WAKE_LAUNCH: "1" })).toBe(false);
+  expect(canUseLegacyWakeEnv({})).toBe(false);
+});
+
+test("concurrent stale-claim recovery cannot remove the fresh winner", async () => {
+  const store = tempStore();
+  const claim = await store.create({ cwd: "/repo", tty: null });
+  await store.tryAcquireRoot(claim.claim_id, 4_194_304);
+  const holders = Array.from({ length: 8 }, () => Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" }));
+  try {
+    const results = await Promise.all(holders.map((child) => store.tryAcquireRoot(claim.claim_id, child.pid)));
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const winner = holders[results.indexOf(true)]!;
+    expect(await store.tryAcquireRoot(claim.claim_id, winner.pid)).toBe(true);
+    expect(await store.tryAcquireRoot(claim.claim_id, process.pid)).toBe(false);
+  } finally {
+    for (const child of holders) child.kill();
+    await Promise.all(holders.map((child) => child.exited));
+  }
+});
+
+test("incomplete owner records fail closed instead of stealing an in-flight claim", async () => {
+  const store = tempStore();
+  const claim = await store.create({ cwd: "/repo", tty: null });
+  const path = join(dirs[dirs.length - 1]!, "wake-launch-claims", `${claim.claim_id}.root.lock`);
+  for (const record of ["", "{}", '{"owner_pid":0}', '{"owner_pid":null}']) {
+    writeFileSync(path, record);
+    expect(await store.tryAcquireRoot(claim.claim_id, process.pid)).toBe(false);
+  }
 });
 
 test("exactly one concurrent child wins tryAcquireRoot", async () => {

@@ -13,6 +13,7 @@ import {
 import { BoundedLog, createWakeableAppServerLog } from "./bounded-log.ts";
 import { WakeLaunchClaimStore } from "./wake-launch-claims.ts";
 import { getTty } from "./peer-context.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
 export interface WakeableLauncherOptions {
   cwd: string;
@@ -260,7 +261,17 @@ export function buildMcpEnvConfigArgs(opts: {
   return Object.entries(values).flatMap(([key, value]) => [
     "-c",
     `mcp_servers.agent-peers.env.${key}=${tomlString(value)}`,
-  ]);
+  ]).concat(buildMcpStateConfigArgs());
+}
+
+export function buildMcpStateConfigArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  if (env.AGENT_PEERS_STATE_DIR === undefined && env.AGENT_PEERS_CODEX_STATE_DIR === undefined) return [];
+  // Codex filters its MCP child's environment. Forward both existing layouts,
+  // rather than assuming the child inherits the launcher's shell overrides.
+  return [
+    "-c", `mcp_servers.agent-peers.env.AGENT_PEERS_STATE_DIR=${tomlString(resolveStateDir({ runtime: "codex", env }))}`,
+    "-c", `mcp_servers.agent-peers.env.AGENT_PEERS_CODEX_STATE_DIR=${tomlString(resolveStateDir({ runtime: "codex", kind: "coordination", env }))}`,
+  ];
 }
 
 export function buildMcpPeerNameConfigArgs(peerName?: string): string[] {
@@ -290,6 +301,7 @@ export function buildMcpPeerNameConfigArgs(peerName?: string): string[] {
 export function buildResumeMcpConfigArgs(peerName?: string): string[] {
   return [
     ...buildMcpPeerNameConfigArgs(peerName),
+    ...buildMcpStateConfigArgs(),
     "-c", `mcp_servers.agent-peers.env.AGENT_PEERS_WAKE_LAUNCH=${tomlString("1")}`,
     "-c", "mcp_servers.agent-peers.required=true",
   ];
