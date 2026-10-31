@@ -1,5 +1,9 @@
 # T2 exact-wake coordinator fixtures
 
+> Retired on 2026-10-31 (bd-b2in.9). These fixtures describe the archived V2
+> runtime, not the stock Hermes driver. Source is retained at
+> `archive/hermes-v2-2026-10-31`; see [retirement notes](legacy-hermes-v2.md).
+
 Tracking: `bd-1con`. This is source-stage work, not a live wake release.
 The runtime selects composition through a host-issued private attachment or a
 programmatically injected test bridge. Without either it retains T1 behavior

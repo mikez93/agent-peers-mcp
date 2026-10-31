@@ -17,8 +17,7 @@ import type {
   ListChatsRequest, ListChatsResponse, ChatInboxEntry, PeerType,
 } from "./shared/types.ts";
 import { appendSuffixWithinLimit, generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
-import { findConversation, hasConversationSchema, withConversationFence } from "./shared/hermes-conversation-fence.ts";
-import { dormantMailboxNotice, type ConversationOwner } from "./shared/hermes-conversation-bindings.ts";
+import { findConversation, hasConversationSchema, withConversationFence, dormantMailboxNotice, type ConversationOwner } from "./shared/hermes-conversation-fence.ts";
 import { personaOf, withPersonaPrefix } from "./shared/peer-address.ts";
 import {
   CHAT_MAIL_CAPABILITY, chatRouteId, findPeers, hasCapability, mailboxOwnerRow, recordChatRoute, resolveAddress,

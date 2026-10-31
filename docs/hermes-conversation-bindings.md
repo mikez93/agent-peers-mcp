@@ -1,5 +1,9 @@
 # Hermes per-conversation T1 integration
 
+> Retired on 2026-10-31 (bd-b2in.9). The implementation described below is
+> historical, retained at `archive/hermes-v2-2026-10-31`.
+> See [retirement and data retention](legacy-hermes-v2.md) for current behavior.
+
 Tracking: `bd-1con`. Design approved by Marco on 2026-09-08:
 `agentic-coding-resources/.specs/2026-09-08-hermes-conversation-peers-design.md`.
 
