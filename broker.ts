@@ -14,7 +14,7 @@ import type {
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
   LeasedMessage, AckMessagesRequest, AckMessagesResponse,
   RenamePeerRequest, RenamePeerResponse,
-  ListChatsRequest, ListChatsResponse, ChatInboxEntry,
+  ListChatsRequest, ListChatsResponse, ChatInboxEntry, PeerType,
 } from "./shared/types.ts";
 import { appendSuffixWithinLimit, generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 import { findConversation, hasConversationSchema, withConversationFence } from "./shared/hermes-conversation-fence.ts";
@@ -23,7 +23,7 @@ import { personaOf, withPersonaPrefix } from "./shared/peer-address.ts";
 import {
   CHAT_MAIL_CAPABILITY, chatRouteId, findPeers, hasCapability, mailboxOwnerRow, recordChatRoute, resolveAddress,
   resolvePeerName, resolvePollScope, resolveSenderChat, rowByName,
-  type AddressRow, type AddressingDeps,
+  type AddressRow, type AddressingDeps, type RemoteSendRequest,
 } from "./shared/broker-addressing.ts";
 import type { ChatCandidate } from "./shared/chat-directory.ts";
 
@@ -1001,6 +1001,57 @@ export function deliverRelayed(db: Database, m: RelayedMessage): SendMessageResp
     if (outcome.ok && resolution.notice) return { ...outcome, notice: resolution.notice };
     return outcome;
   })();
+}
+
+/** The sender of a message leaving this machine, as the federation layer
+ *  stores it. Same shape as FederationSender in shared/federation.ts. */
+export interface OutboundSender {
+  /** Reply UUID: the peer itself, or the stable chat route for a chat sender. */
+  id: string;
+  /** Local mailbox owner UUID (the profile's durable peer for a Hermes chat
+   *  or election loser), where delivery notices are kept. */
+  peer_id: string;
+  name: string;
+  peer_type: PeerType;
+  cwd: string;
+  summary: string;
+  /** Stable chat key (never the raw title), or null. */
+  chat: string | null;
+}
+
+/** Federation hook. Runs inside the send transaction, after the sender was
+ *  authenticated. Records the sender's chat route so a remote reply to the
+ *  chat UUID resolves here. */
+export function snapshotSender(db: Database, req: RemoteSendRequest): OutboundSender {
+  const row = rowByName(db, req.fromName);
+  const peer = getPeer(db, req.fromId);
+  if (!row || !peer || row.id !== req.fromId) throw new Error("federation: sender is not registered");
+  const chat = resolveSenderChat(db, row, req.fromChat ?? undefined, addressingDeps);
+  if (chat) recordChatRoute(db, chat.owner.name, chat.chatKey, chat.title);
+  const owner = mailboxOwnerRow(db, row);
+  return {
+    id: chat ? chatRouteId(chat.owner.name, chat.chatKey) : row.id,
+    peer_id: owner.id,
+    name: chat ? chat.owner.name : row.name,
+    peer_type: row.peer_type as PeerType,
+    cwd: peer.cwd,
+    summary: withPersonaSummary(peer).summary,
+    chat: chat?.chatKey ?? null,
+  };
+}
+
+/** Federation hook: a delivery notice from the broker itself. Inserted even
+ *  when the recipient is stale or its row was collected, so a later
+ *  re-registration with prev_id still hands it over. Idempotent on
+ *  message_uid. Synchronous; the caller supplies the transaction. */
+export function deliverNotice(db: Database, n: {
+  to_id: string; to_chat: string | null; from_id: string; text: string; sent_at: string; message_uid: string;
+}): { message_id: number } {
+  db.query(
+    `INSERT INTO messages (from_id, to_id, text, sent_at, message_uid, to_chat)
+     VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(message_uid) DO NOTHING`,
+  ).run(n.from_id, n.to_id, n.text, n.sent_at, n.message_uid, n.to_chat);
+  return { message_id: db.query<{ id: number }, [string]>("SELECT id FROM messages WHERE message_uid = ?").get(n.message_uid)!.id };
 }
 
 /** Local directory for other machines: live plus retained durable agents,

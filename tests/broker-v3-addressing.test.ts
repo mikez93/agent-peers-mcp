@@ -7,7 +7,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import {
   initDb, registerPeer, listPeers, sendMessage, pollMessages, ackMessages, setPeerSummary,
   configureAddressing, listChats, chatInbox, MAX_POLL_BATCH, MAX_ACK_TOKENS,
-  deliverRelayed, listDirectoryPeers,
+  deliverRelayed, listDirectoryPeers, snapshotSender, deliverNotice, type OutboundSender,
 } from "../broker.ts";
 import type { ChatDirectory, ChatCandidate } from "../shared/chat-directory.ts";
 import { chatRouteId } from "../shared/broker-addressing.ts";
@@ -280,4 +280,44 @@ test("directory lists live and retained durable agents with persona statuses", (
 test("unknown names carry a machine-readable code for the federation fallback", () => {
   const me = reg({ name: "m-claude" });
   expect(send(me, "valentina").code).toBe("unknown_peer");
+});
+
+test("outbound sender snapshot: chat key, chat route reply UUID, profile mailbox", () => {
+  const val = hermesOwner();
+  setPeerSummary(db, val.id, val.session_token, "triaging promo email");
+  const loser = reg({ name: "valentina-hermes-otter", peer_type: "hermes", cwd: "/h/valentina", capabilities: ["chat-mail"], mailbox_owner: "valentina-hermes", durable: false });
+  const snaps: OutboundSender[] = [];
+  configureAddressing({ chats: fakeChats, remote: (r) => { snaps.push(snapshotSender(db, r)); return { ok: true, notice: "queued" }; } });
+
+  expect(send(loser, "kepler@studio", "from a chat", { from_chat: "Email Shit" }).ok).toBe(true);
+  const s1 = snaps[0]!;
+  expect(s1.chat).toBe("20261029_121224_2b437e");
+  expect(s1.id).toBe(chatRouteId("valentina-hermes", "20261029_121224_2b437e"));
+  expect(s1.peer_id).toBe(val.id);
+  expect(s1.name).toBe("valentina-hermes");
+  expect(s1.peer_type).toBe("hermes");
+
+  // A remote reply to the chat UUID lands in that chat.
+  const back = deliverRelayed(db, { to_address: s1.id, text: "reply to chat", from_id: "remote-1", from_chat: null, message_uid: "uid-r1", sent_at: "2026-10-31T00:00:00Z" });
+  expect(back.ok).toBe(true);
+  expect(pollMessages(db, val.id, val.session_token, undefined, "email shit").map((m) => m.text)).toEqual(["reply to chat"]);
+
+  // A plain sender: its own UUID, no chat, persona status.
+  expect(send(val, "kepler@studio", "plain").ok).toBe(true);
+  const s2 = snaps[1]!;
+  expect(s2).toMatchObject({ id: val.id, peer_id: val.id, chat: null, name: "valentina-hermes" });
+  // The same status the directory shows.
+  expect(s2.summary).toBe(listDirectoryPeers(db, { query: "valentina-hermes" }).find((p) => p.id === val.id)!.summary);
+  expect(s2.summary).toContain("triaging promo email");
+});
+
+test("delivery notices survive a collected recipient row and are idempotent", () => {
+  const gone = reg({ name: "m-claude", durable: false });
+  db.run("DELETE FROM peers WHERE id = ?", [gone.id]);
+  const n = { to_id: gone.id, to_chat: null, from_id: chatRouteId("agent-peers", "system@studio"), text: "Delivery failed", sent_at: "2026-10-31T00:00:00Z", message_uid: "bounce-1" };
+  const first = deliverNotice(db, n);
+  expect(deliverNotice(db, n).message_id).toBe(first.message_id);
+  // Re-registration with prev_id hands the notice over.
+  const again = reg({ name: "m-claude", durable: false, prev_id: gone.id });
+  expect(pollMessages(db, again.id, again.session_token).map((m) => m.text)).toEqual(["Delivery failed"]);
 });
