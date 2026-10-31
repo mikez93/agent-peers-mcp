@@ -47,13 +47,20 @@ For example, a fleet map can contain:
 
 ```json
 {
-  "macbook": "https://macbook.example-tailnet.ts.net",
-  "studio": "https://studio.example-tailnet.ts.net"
+  "macbook": "https://macbook.example-tailnet.ts.net:8443",
+  "studio": "https://studio.example-tailnet.ts.net:8443",
+  "omarchy": "https://omarchy.example-tailnet.ts.net",
+  "hetzner": "https://hetzner.example-tailnet.ts.net"
 }
 ```
 
-These are placeholder URLs, not installed destinations. Base URLs do not include
-`/federation`. The configured proxy must forward the service's
+These are placeholder URLs, not installed destinations. Base URLs are origins
+(scheme, host, and port when needed), without `/federation`. The Macs use
+dedicated HTTPS port **8443**; Linux brokers use **443**. Mac port 443 already
+serves unrelated applications, so keep Linux-to-Mac federation access restricted
+to TCP 8443. Do not grant access to Mac port 443 to make federation work; verify
+the effective policy, including any other grants, preserves this boundary.
+The configured proxy must forward the service's
 `/federation/directory`, `/federation/relay`, and `/federation/health` paths.
 The broker stays bound to localhost. Relay requests do not follow redirects.
 Plain HTTP is accepted only for loopback fixtures.
@@ -61,16 +68,23 @@ Plain HTTP is accepted only for loopback fixtures.
 Expose only the federation mount, not the broker's root or whole TCP port:
 
 ```sh
+# MacBook and Studio: dedicated federation listener
+tailscale serve --bg --https=8443 --set-path=/federation http://127.0.0.1:7900/federation
+
+# Linux brokers: federation listener on 443
 tailscale serve --bg --https=443 --set-path=/federation http://127.0.0.1:7900/federation
 ```
 
 This is a deployment recipe, not an automatically executed setup step. Check
 existing Serve mappings first and preserve unrelated services; do not use
-`serve reset` or Funnel. The matching removal is
-`tailscale serve --https=443 --set-path=/federation off`, not a global reset.
+`serve reset` or Funnel. Match the fleet URL, Serve listener, and grant port.
+Remove only the relevant mount with
+`tailscale serve --https=8443 --set-path=/federation off` on a Mac, or
+`tailscale serve --https=443 --set-path=/federation off` on Linux, not a global reset.
 At cutover, verify the federation health route with the separate credential,
-and verify that local-only paths such as `/register` are not exposed by this
-mount. Docs/CLI syntax is not live proxy-path or authorization proof.
+that local-only paths such as `/register` are not exposed by this mount, and
+that Linux nodes cannot reach the Macs' unrelated port-443 services.
+Docs/CLI syntax is not live proxy-path or authorization proof.
 
 Reference: [Tailscale Serve CLI](https://tailscale.com/docs/reference/tailscale-cli/serve),
 checked with the installed `tailscale serve --help` on 2026-10-31.
