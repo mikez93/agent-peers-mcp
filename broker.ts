@@ -26,6 +26,7 @@ import {
   type AddressRow, type AddressingDeps, type RemoteSendRequest,
 } from "./shared/broker-addressing.ts";
 import type { ChatCandidate } from "./shared/chat-directory.ts";
+import { FederationService, UNREACHABLE_HOSTS_HEADER, loadFederationConfig, type FederationConfig } from "./shared/federation.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
@@ -1857,6 +1858,58 @@ function dbIdentityHash(dbPath: string): string {
   return Bun.hash(resolve(dbPath)).toString(16).slice(0, 12);
 }
 
+/** Federation is off unless AGENT_PEERS_FEDERATION=1 and its config files are
+ *  valid. A missing or broken config logs and leaves local service untouched.
+ *  With federation off, relayed mail already stored keeps its sender names. */
+function startFederation(db: Database): { service: FederationService; config: FederationConfig } | null {
+  let config: FederationConfig | null = null;
+  try {
+    config = loadFederationConfig();
+  } catch (e) {
+    console.error(`[broker] federation config unusable, federation stays off: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!config) {
+    const stored = storedFederationSenders(db);
+    if (stored && !addressingDeps.senderForMessage) configureAddressing({ ...addressingDeps, senderForMessage: stored });
+    return null;
+  }
+  let service: FederationService;
+  try {
+    service = new FederationService({
+      db, config,
+      listLocalPeers: (r) => listDirectoryPeers(db, r),
+      sendLocal: (r) => sendMessage(db, r),
+      snapshotSender: (r) => snapshotSender(db, r),
+      deliverLocal: (m) => deliverRelayed(db, m),
+      deliverNotice: (n) => deliverNotice(db, n),
+    });
+  } catch (e) {
+    console.error(`[broker] federation failed to start, federation stays off: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+  configureAddressing({
+    ...addressingDeps,
+    isLocalHost: service.isLocalHost,
+    remote: service.enqueue,
+    remoteRoute: service.remoteRoute,
+    senderForMessage: service.senderForMessage,
+  });
+  service.start();
+  console.error(`[broker] federation on as ${config.host}; peers: ${Object.keys(config.hosts).join(", ")}`);
+  return { service, config };
+}
+
+function storedFederationSenders(db: Database): AddressingDeps["senderForMessage"] {
+  const table = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'federation_senders'").get();
+  if (!table) return undefined;
+  const q = db.query<{ snapshot: string }, [number]>("SELECT snapshot FROM federation_senders WHERE message_id = ?");
+  return (id) => {
+    const row = q.get(id);
+    if (!row) return null;
+    try { return JSON.parse(row.snapshot); } catch { return null; }
+  };
+}
+
 export function startBroker(
   port: number,
   dbPath: string,
@@ -1865,6 +1918,7 @@ export function startBroker(
 ) {
   const db = initDb(dbPath);
   const sharedSecret = ensureSharedSecret(secretPath);
+  const federation = startFederation(db);
 
   // Suspend-aware GC. When the machine sleeps, every client's heartbeat timer
   // freezes along with ours; on wake, wall-clock has jumped and every row
@@ -1929,8 +1983,15 @@ export function startBroker(
             db_id: dbIdentityHash(dbPath),
             // v3: features are advertised, never signalled by bumping
             // `protocol`, which old clients compare for equality.
-            capabilities: BROKER_CAPABILITIES,
+            capabilities: federation ? [...BROKER_CAPABILITIES, "federation"] : BROKER_CAPABILITIES,
           });
+        }
+        // Federation routes carry their own secret and host check, and use
+        // GET for health and directory, so they run before the POST rule and
+        // the local secret gate. Nothing else is reachable with that secret.
+        if (federation && url.pathname.startsWith("/federation/")) {
+          const handled = await federation.service.handle(req);
+          if (handled) return handled;
         }
         if (req.method !== "POST") return json({ error: "method not allowed" }, { status: 405 });
 
@@ -1968,8 +2029,22 @@ export function startBroker(
           case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); return json({ ok: true, known: heartbeatPeer(db, b.id, b.session_token), epoch: BROKER_EPOCH }); }
           case "/unregister":    { const b = await readJson<{ id: string; session_token: string }>(req); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
           case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
-          case "/list-peers":    return json(listPeers(db, await readJson(req)));
-          case "/send-message":  return json(sendMessage(db, await readJson(req)));
+          case "/list-peers": {
+            const b = await readJson<ListPeersRequest>(req);
+            const local = listPeers(db, b);
+            // Machine scope also lists the other machines, live (about 1.5 s
+            // per unreachable host). Still a bare array for old clients; the
+            // unreachable hosts travel in a header.
+            if (!federation || b.scope !== "machine") return json(local);
+            const dir = await federation.service.directory();
+            const remote = dir.peers.filter((p) => p.host !== federation.config.host && (!b.peer_type || p.peer_type === b.peer_type));
+            return json([...local, ...remote], dir.unreachable_hosts.length
+              ? { headers: { [UNREACHABLE_HOSTS_HEADER]: dir.unreachable_hosts.join(",") } } : undefined);
+          }
+          // An unknown bare name may live on another machine. The service
+          // tries the local send first and asks the other brokers only on
+          // unknown_peer, outside any transaction.
+          case "/send-message":  { const b = await readJson<SendMessageRequest>(req); return json(federation ? await federation.service.send(b) : sendMessage(db, b)); }
           case "/poll-messages": {
             const b = await readJson<{ id: string; session_token: string; chat?: string }>(req);
             if (typeof b.chat !== "string") return json({ messages: pollMessages(db, b.id, b.session_token) });
@@ -1995,9 +2070,10 @@ export function startBroker(
     },
   });
 
-  const cleanup = () => {
+  const cleanup = async () => {
     clearInterval(gcTimer);
     server.stop(true);
+    try { await federation?.service.stop(); } catch { /* exiting anyway */ }
     db.close();
     process.exit(0);
   };
@@ -2011,7 +2087,7 @@ export function startBroker(
   process.on("SIGHUP", () => {});
 
   console.error(`[broker] listening on http://127.0.0.1:${port}, db=${dbPath}, pid=${process.pid}, owner=${owner}, epoch=${BROKER_EPOCH}`);
-  return { server, db, gcTimer };
+  return { server, db, gcTimer, federation: federation?.service ?? null };
 }
 
 function isAddrInUse(e: unknown): boolean {
