@@ -8,6 +8,7 @@ import {
   truncateSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { resolveStateDir } from "./state-dir.ts";
 
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 const DEFAULT_KEEP = 3;
@@ -53,7 +54,7 @@ export function createWakeableAppServerLog(opts: {
   env?: NodeJS.ProcessEnv;
 }): BoundedLog {
   const env = opts.env ?? process.env;
-  const stateDir = env.AGENT_PEERS_CODEX_STATE_DIR || join(env.HOME || process.cwd(), ".agent-peers-codex");
+  const stateDir = resolveStateDir({ runtime: "codex", kind: "coordination", env });
   const rawName = opts.peerName || `${basename(opts.cwd)}-codex`;
   const safeName = rawName.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "wakeable-codex";
   return new BoundedLog(

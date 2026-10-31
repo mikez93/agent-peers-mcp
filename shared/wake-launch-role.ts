@@ -67,3 +67,9 @@ export function shouldRegisterAsPeer(role: WakeLaunchRole): boolean {
 export function isWakeLaunchEnv(env: NodeJS.ProcessEnv): boolean {
   return env.AGENT_PEERS_WAKE_LAUNCH === "1";
 }
+
+// Legacy standalone launchers still supply env hints. A managed launch must
+// instead use the exact claim it won: inherited env is shared by its siblings.
+export function canUseLegacyWakeEnv(env: NodeJS.ProcessEnv): boolean {
+  return env.AGENT_PEERS_WAKE_ENABLED === "1" && !isWakeLaunchEnv(env);
+}

@@ -2,13 +2,13 @@
 // Sidecar handshake between the wakeable launcher and the Codex MCP child.
 
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { open, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { atomicWriteJson, ensurePrivateDir } from "./file-state.ts";
+import { isProcessAlive } from "./process-liveness.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
-const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
-const IS_POSIX = platform() !== "win32";
 
 export type WakeLaunchClaimStatus = "starting" | "ready" | "consumed" | "failed";
 
@@ -35,26 +35,6 @@ export interface CompleteWakeLaunchClaim extends WakeLaunchClaim {
   thread_id: string;
 }
 
-function defaultRootDir(): string {
-  return join(homedir(), ".agent-peers-codex");
-}
-
-async function ensurePrivateDir(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: DIR_MODE });
-  if (IS_POSIX) {
-    try { await chmod(path, DIR_MODE); } catch { /* best effort */ }
-  }
-}
-
-async function atomicWriteJson(path: string, value: unknown): Promise<void> {
-  const tempPath = `${path}.tmp`;
-  await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
-  if (IS_POSIX) {
-    try { await chmod(tempPath, FILE_MODE); } catch { /* best effort */ }
-  }
-  await rename(tempPath, path);
-}
-
 function isCompleteClaim(claim: WakeLaunchClaim): claim is CompleteWakeLaunchClaim {
   return (claim.status === "ready" || claim.status === "consumed")
     && typeof claim.app_server_url === "string"
@@ -69,16 +49,6 @@ function isRecent(claim: WakeLaunchClaim, maxAgeMs: number): boolean {
   return Date.now() - Date.parse(claim.created_at) <= maxAgeMs;
 }
 
-function isProcessAlive(pid: number | null): boolean {
-  if (!pid || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function isLiveClaim(claim: WakeLaunchClaim): boolean {
   return isCompleteClaim(claim)
     && isProcessAlive(claim.app_server_pid)
@@ -89,7 +59,7 @@ export class WakeLaunchClaimStore {
   private readonly dir: string;
 
   constructor(opts: { rootDir?: string } = {}) {
-    this.dir = join(opts.rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? defaultRootDir(), "wake-launch-claims");
+    this.dir = join(resolveStateDir({ runtime: "codex", kind: "coordination", rootDir: opts.rootDir }), "wake-launch-claims");
   }
 
   async create(opts: {
@@ -209,28 +179,38 @@ export class WakeLaunchClaimStore {
   // `prune()` clear it with the claim, and a lock whose owner process is dead
   // is reclaimable so a crashed root does not strand the launch forever.
   async tryAcquireRoot(claimId: string, ownerPid: number): Promise<boolean> {
+    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return false;
     await ensurePrivateDir(this.dir);
     const lockPath = this.lockPathFor(claimId);
-    try {
-      await writeFile(lockPath, JSON.stringify({ owner_pid: ownerPid, acquired_at: new Date().toISOString() }), {
-        encoding: "utf8",
-        mode: FILE_MODE,
-        flag: "wx",
-      });
-      return true;
-    } catch {
-      // Someone holds it. Reclaim only if that someone is gone.
+    // Bound recovery; recursion could run forever against competing reclaimers.
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const raw = await readFile(lockPath, "utf8");
-        const held = JSON.parse(raw) as { owner_pid?: number };
+        await writeFile(lockPath, JSON.stringify({ owner_pid: ownerPid, acquired_at: new Date().toISOString() }), {
+          encoding: "utf8", mode: FILE_MODE, flag: "wx",
+        });
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+      }
+      // Serialize stale-owner observation + unlink. Otherwise a second reclaimer
+      // can unlink the fresh winner after the first has already replaced the lock.
+      const guardPath = `${lockPath}.reclaim`;
+      const guard = await open(guardPath, "wx", FILE_MODE).catch(() => null);
+      if (!guard) return false;
+      try {
+        const held = JSON.parse(await readFile(lockPath, "utf8")) as { owner_pid?: number };
         if (held?.owner_pid === ownerPid) return true;
-        if (isProcessAlive(held?.owner_pid ?? null)) return false;
+        if (!Number.isSafeInteger(held?.owner_pid) || !held.owner_pid || held.owner_pid < 0) return false;
+        if (isProcessAlive(held.owner_pid)) return false;
         await unlink(lockPath);
-        return await this.tryAcquireRoot(claimId, ownerPid);
-      } catch {
-        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      } finally {
+        await guard.close();
+        await unlink(guardPath);
       }
     }
+    return false;
   }
 
   async releaseRoot(claimId: string): Promise<void> {

@@ -1,10 +1,13 @@
 // shared/wake-registry.ts
 // Durable registry for Codex sessions launched in wakeable app-server mode.
 
-import { createHash, randomUUID } from "node:crypto";
-import { access, chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { createHash } from "node:crypto";
+import { access, mkdir, open, readFile, stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { platform } from "node:os";
+import { atomicWriteJson } from "./file-state.ts";
+import { isProcessAlive } from "./process-liveness.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
 import type { PeerId, PeerName } from "./types.ts";
 
@@ -43,28 +46,6 @@ const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
 const IS_POSIX = platform() !== "win32";
 
-function defaultRootDir(): string {
-  return join(homedir(), ".agent-peers-codex");
-}
-
-async function atomicWriteJson<T>(path: string, value: T): Promise<void> {
-  const dir = dirname(path);
-  await mkdir(dir, { recursive: true, mode: DIR_MODE });
-  if (IS_POSIX) {
-    try { await chmod(dir, DIR_MODE); } catch { /* best effort */ }
-  }
-
-  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
-    await rename(tempPath, path);
-  } finally {
-    await unlink(tempPath).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
-  }
-}
-
 // Only ESRCH proves a dead owner. Unknown/partial records and reused live PIDs
 // fail closed; lock age alone never licenses stealing a writer's lock.
 async function reclaimDeadLock(lockPath: string): Promise<void> {
@@ -88,11 +69,7 @@ async function reclaimDeadLock(lockPath: string): Promise<void> {
     }
     const pid = owner?.owner_pid;
     if (!Number.isInteger(pid) || !pid || pid <= 0) return;
-    try {
-      process.kill(pid, 0);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") await unlink(lockPath);
-    }
+    if (!isProcessAlive(pid)) await unlink(lockPath);
   } finally {
     await guard.close();
     await unlink(guardPath);
@@ -135,16 +112,6 @@ function cloneEntry(entry: WakeRegistryEntry): WakeRegistryEntry {
   };
 }
 
-function isProcessAlive(pid: number | null): boolean {
-  if (!pid || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function socketPathExists(path: string | null): Promise<boolean> {
   if (!path) return true;
   try {
@@ -165,7 +132,7 @@ export class WakeRegistry {
     rootDir?: string;
     persistState?: (path: string, value: WakeRegistryState) => Promise<void>;
   } = {}) {
-    const rootDir = opts.rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? defaultRootDir();
+    const rootDir = resolveStateDir({ runtime: "codex", kind: "coordination", rootDir: opts.rootDir });
     this.filePath = join(rootDir, "wake-registry.json");
     this.persistState = opts.persistState ?? atomicWriteJson;
   }

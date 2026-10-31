@@ -13,9 +13,11 @@
 //     than 0o600 (fail closed — don't silently serve a leak)
 // Only POSIX platforms get the perm enforcement; on Windows we skip it.
 
-import { mkdir, readFile, rename, writeFile, chmod, lstat } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { mkdir, readFile, chmod, lstat } from "node:fs/promises";
+import { platform } from "node:os";
 import { dirname, join } from "node:path";
+import { atomicWriteJson } from "./file-state.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
 import type { LeasedMessage, PeerId } from "./types.ts";
 
@@ -48,40 +50,6 @@ function cloneMessages(messages: LeasedMessage[]): LeasedMessage[] {
   return messages.map((message) => ({ ...message }));
 }
 
-function defaultRootDir(): string {
-  const runtime = process.env.AGENT_PEERS_RUNTIME === "hermes"
-    ? "hermes"
-    : process.env.AGENT_PEERS_RUNTIME === "droid"
-      ? "droid"
-      : "codex";
-  return join(homedir(), `.agent-peers-${runtime}`);
-}
-
-async function atomicWriteJson<T>(path: string, value: T): Promise<void> {
-  const dir = dirname(path);
-  // Create the dir with 0o700 and re-chmod defensively — mkdir's mode can be
-  // masked by umask on some Node/Bun versions, so we always follow up with
-  // an explicit chmod to close the window.
-  await mkdir(dir, { recursive: true, mode: DIR_MODE });
-  if (IS_POSIX) {
-    try { await chmod(dir, DIR_MODE); } catch { /* best effort */ }
-  }
-
-  const tempPath = `${path}.tmp`;
-  // writeFile with `mode` only takes effect on file creation; if the temp
-  // file already exists from a crashed prior write, the mode is ignored —
-  // we chmod explicitly right after to guarantee the invariant.
-  await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
-  if (IS_POSIX) {
-    try { await chmod(tempPath, FILE_MODE); } catch { /* best effort */ }
-  }
-
-  // rename is atomic on the same filesystem and preserves the 0o600 mode
-  // we just set. If the destination already existed with wider perms, the
-  // rename replaces it wholesale.
-  await rename(tempPath, path);
-}
-
 export class CodexInboxStore {
   private readonly filePath: string;
   private readonly metadataFilePath: string;
@@ -99,12 +67,7 @@ export class CodexInboxStore {
     persistMetadata?: (path: string, value: CodexInboxMetadataState) => Promise<void>;
     onMetadataError?: (error: unknown) => void;
   }) {
-    const rootDir = opts.rootDir
-      ?? process.env.AGENT_PEERS_STATE_DIR
-      ?? (process.env.AGENT_PEERS_RUNTIME === "droid" ? process.env.AGENT_PEERS_DROID_STATE_DIR : undefined)
-      ?? (process.env.AGENT_PEERS_RUNTIME === "hermes" ? process.env.AGENT_PEERS_HERMES_STATE_DIR : undefined)
-      ?? process.env.AGENT_PEERS_CODEX_STATE_DIR
-      ?? defaultRootDir();
+    const rootDir = resolveStateDir({ rootDir: opts.rootDir });
     const safePeerId = encodeURIComponent(opts.peerId);
     this.filePath = join(rootDir, `${safePeerId}.json`);
     this.metadataFilePath = join(rootDir, `${safePeerId}.metadata.json`);

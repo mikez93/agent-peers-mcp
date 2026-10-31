@@ -67,7 +67,8 @@ import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { defaultPeerName } from "./shared/peer-identity.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
-import { decideWakeLaunchRole, isWakeLaunchEnv, shouldRegisterAsPeer } from "./shared/wake-launch-role.ts";
+import { canUseLegacyWakeEnv, decideWakeLaunchRole, isWakeLaunchEnv, shouldRegisterAsPeer } from "./shared/wake-launch-role.ts";
+import { resolveStateDir } from "./shared/state-dir.ts";
 import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName, NAME_MAX_LEN } from "./shared/names.ts";
@@ -1160,8 +1161,8 @@ async function bindDroidLaunchClaim(opts: {
   }
 
   try {
-    const rootDir = process.env.AGENT_PEERS_STATE_DIR
-      ?? process.env.AGENT_PEERS_DROID_STATE_DIR;
+    const rootDir = resolveStateDir({ runtime: "droid", kind: "coordination",
+      rootDir: process.env.AGENT_PEERS_STATE_DIR });
     const claims = new DroidLaunchClaimStore({ rootDir });
     await claims.bindClaim(claimId, {
       peerId: opts.peerId,
@@ -1236,7 +1237,7 @@ async function resolveWakeRegistrationHints(opts: {
   cwd: string;
   tty: string | null;
 }): Promise<(CompleteWakeLaunchClaim & { claim_id: string }) | null> {
-  if (process.env.AGENT_PEERS_WAKE_ENABLED === "1") {
+  if (RUNTIME_IS_CODEX && canUseLegacyWakeEnv(process.env)) {
     const threadId = process.env.AGENT_PEERS_WAKE_THREAD_ID;
     const appServerUrl = process.env.AGENT_PEERS_WAKE_APP_SERVER_URL;
     const appServerPid = Number.parseInt(process.env.AGENT_PEERS_WAKE_APP_SERVER_PID ?? "", 10);

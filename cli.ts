@@ -11,6 +11,8 @@ import { CodexAppServerWsClient, formatThreadStatus } from "./shared/app-server-
 import { DroidLaunchClaimStore, selectDroidClaim, type BoundDroidLaunchClaim } from "./shared/droid-launch-claims.ts";
 import type { Peer } from "./shared/types.ts";
 import { peerStartedAt, sortPeersNewestFirst } from "./shared/peer-list.ts";
+import { resolveStateDir, type StateRuntime } from "./shared/state-dir.ts";
+import { isProcessAlive as processIsAlive } from "./shared/process-liveness.ts";
 
 // True app-server thread status for a wakeable peer — the GROUND TRUTH the
 // operator can trust over the TUI's "working" spinner, which lingers after
@@ -80,9 +82,8 @@ async function readPeerAuth(target: string): Promise<PeerAuthRow | null> {
 
 async function readUnreadCountsByPeer(rootDir?: string): Promise<Map<string, number>> {
   const { readdir, readFile } = await import("node:fs/promises");
-  const { homedir } = await import("node:os");
   const { join } = await import("node:path");
-  const inboxRoot = rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? join(homedir(), ".agent-peers-codex");
+  const inboxRoot = resolveStateDir({ runtime: "codex", rootDir });
   const counts = new Map<string, number>();
   let files: string[];
   try {
@@ -422,16 +423,6 @@ async function cmdWakeStatus() {
   }
 }
 
-function processIsAlive(pid: number | null | undefined): boolean {
-  if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error instanceof Error && "code" in error && (error as { code?: string }).code === "EPERM";
-  }
-}
-
 function printDroidWakePeer(
   peer: Peer | undefined,
   claim: BoundDroidLaunchClaim | undefined,
@@ -627,12 +618,7 @@ async function cmdSuggestName(base: string) {
 // broker rows the strict orphan view misses, and archive dead inbox files
 // without ever deleting bodies.
 
-const INBOX_ROOTS: { runtime: string; env?: string; dirname: string }[] = [
-  { runtime: "codex", env: "AGENT_PEERS_CODEX_STATE_DIR", dirname: ".agent-peers-codex" },
-  { runtime: "hermes", env: "AGENT_PEERS_HERMES_STATE_DIR", dirname: ".agent-peers-hermes" },
-  { runtime: "droid", env: "AGENT_PEERS_DROID_STATE_DIR", dirname: ".agent-peers-droid" },
-  { runtime: "claude", dirname: ".agent-peers-claude" },
-];
+const INBOX_RUNTIMES: StateRuntime[] = ["codex", "hermes", "droid", "claude"];
 
 interface InboxFileInfo {
   runtime: string;
@@ -644,18 +630,15 @@ interface InboxFileInfo {
 
 async function readAllInboxFiles(): Promise<InboxFileInfo[]> {
   const { readdir, readFile, stat } = await import("node:fs/promises");
-  const { homedir } = await import("node:os");
   const { join } = await import("node:path");
   const out: InboxFileInfo[] = [];
   const seenDirs = new Set<string>();
-  for (const root of INBOX_ROOTS) {
+  for (const runtime of INBOX_RUNTIMES) {
     // Same precedence as the WRITERS (codex-inbox.ts / hermes-server.ts):
     // generic AGENT_PEERS_STATE_DIR beats the runtime-specific var. If the
     // CLI resolved these the other way around, it would inspect a different
     // directory than the servers write and report clean while mail strands.
-    const dir = process.env.AGENT_PEERS_STATE_DIR
-      || (root.env && process.env[root.env])
-      || join(homedir(), root.dirname);
+    const dir = resolveStateDir({ runtime });
     if (seenDirs.has(dir)) continue; // shared STATE_DIR: scan once
     seenDirs.add(dir);
     let files: string[];
@@ -668,7 +651,7 @@ async function readAllInboxFiles(): Promise<InboxFileInfo[]> {
         const parsed = JSON.parse(await readFile(path, "utf8")) as { unread?: InboxFileInfo["unread"] };
         const st = await stat(path);
         out.push({
-          runtime: root.runtime,
+          runtime,
           path,
           peerId: decodeURIComponent(file.slice(0, -".json".length)),
           unread: Array.isArray(parsed.unread) ? parsed.unread : [],

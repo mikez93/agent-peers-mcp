@@ -2,11 +2,12 @@
 // agent-peers MCP child that Droid starts for the exact ACP session.
 
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
-import { homedir, platform } from "node:os";
-import { dirname, join } from "node:path";
+import { lstat, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { platform } from "node:os";
+import { join } from "node:path";
+import { atomicWriteJson, ensurePrivateDir } from "./file-state.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
-const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const IS_POSIX = platform() !== "win32";
 const CLAIM_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -57,23 +58,6 @@ export interface DroidSessionState {
   updated_at: string;
 }
 
-function defaultRootDir(): string {
-  return process.env.AGENT_PEERS_DROID_STATE_DIR ?? join(homedir(), ".agent-peers-droid");
-}
-
-async function ensurePrivateDir(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: DIR_MODE });
-  if (IS_POSIX) await chmod(path, DIR_MODE);
-}
-
-async function atomicWriteJson(path: string, value: unknown): Promise<void> {
-  await ensurePrivateDir(dirname(path));
-  const tempPath = `${path}.${randomUUID()}.tmp`;
-  await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE, flag: "wx" });
-  if (IS_POSIX) await chmod(tempPath, FILE_MODE);
-  await rename(tempPath, path);
-}
-
 async function readPrivateJson(path: string): Promise<unknown | null> {
   try {
     if (IS_POSIX) {
@@ -96,7 +80,7 @@ export class DroidLaunchClaimStore {
   private readonly sessionsDir: string;
 
   constructor(opts: { rootDir?: string } = {}) {
-    const root = opts.rootDir ?? defaultRootDir();
+    const root = resolveStateDir({ runtime: "droid", kind: "coordination", rootDir: opts.rootDir });
     this.rootDir = root;
     this.claimsDir = join(root, "claims");
     this.sessionsDir = join(root, "sessions");

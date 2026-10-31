@@ -1,12 +1,13 @@
 // Managed ACP launcher and bodyless wake controller for Factory Droid peers.
 
 import { lstat, readFile } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { platform } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultPeerName } from "./peer-identity.ts";
 import { isValidName, NAME_MAX_LEN } from "./names.ts";
 import { acquireDroidSession } from "./droid-session-owner.ts";
+import { resolveStateDir } from "./state-dir.ts";
 
 import {
   DroidAcpClient,
@@ -334,7 +335,7 @@ export async function runDroidLauncher(
   deps: DroidLauncherDependencies = {},
   signal?: AbortSignal,
 ): Promise<number> {
-  const stateRoot = deps.stateRoot ?? process.env.AGENT_PEERS_DROID_STATE_DIR ?? join(homedir(), ".agent-peers-droid");
+  const stateRoot = resolveStateDir({ runtime: "droid", kind: "coordination", rootDir: deps.stateRoot });
   const claims = deps.claimStore ?? new DroidLaunchClaimStore({ rootDir: stateRoot });
   const saved = opts.sessionId ? await claims.readSession(opts.sessionId) : null;
   const effectiveOpts: DroidLauncherOptions = {
