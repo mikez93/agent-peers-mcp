@@ -398,7 +398,10 @@ export function defaultWakeText(peerName: string, chatKey: string | null, title:
   const warning = interruptedTail
     ? " Note: the last message in this chat is a user message whose turn was interrupted before it was answered; confirm with Mike before acting on it."
     : "";
-  return `Agent Peers: ${peerName} has unread peer mail addressed to ${where}. Call check_messages${chatArg}, handle what it returns, and reply with send_message from this chat.${warning}`;
+  // Verified 2026-10-31: on a -q turn the clarify tool is answered headless ("no user available,
+  // use your own judgment") and approvals are off on every fleet profile, so a question for Mike
+  // never parks the turn. The agent must therefore hand it back instead of deciding.
+  return `Agent Peers: ${peerName} has unread peer mail addressed to ${where}. Call check_messages${chatArg}, handle what it returns, and reply with send_message from this chat. If handling it needs a decision only Mike can make, do not decide it yourself: tell the peer Mike must be asked, and leave the question in this chat for him.${warning}`;
 }
 
 function ledgerName(chatKey: string | null): string {

@@ -210,6 +210,7 @@ test("wake text names the chat key for check_messages and warns about an interru
   expect(defaultWakeText("valentina-hermes", "k1", "Instagram ads", false)).toContain('check_messages with chat="k1"');
   expect(defaultWakeText("valentina-hermes", null, null, false)).toContain("general Agent Peers mailbox");
   expect(defaultWakeText("valentina-hermes", "k1", null, true)).toContain("interrupted before it was answered");
+  expect(defaultWakeText("valentina-hermes", "k1", null, false)).toContain("decision only Mike can make");
 });
 
 // ---------------------------------------------------------------------------
