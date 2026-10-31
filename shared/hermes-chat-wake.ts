@@ -99,6 +99,10 @@ function isoFromEpoch(seconds: number | null | undefined): string | null {
 
 /** The Hermes profile a peer row stands for: `valentina-hermes` reads valentina's state.db. */
 export function hermesProfileForPeer(peer: ChatPeer): string | null {
+  // Durable Hermes names are "<profile>-hermes" (PEER_NAME in each profile's
+  // MCP config), which is exact; the persona is only a fallback.
+  const named = /^([a-z0-9][a-z0-9_-]*)-hermes$/i.exec(peer.name);
+  if (named) return named[1]!.toLowerCase();
   return personaOf(peer);
 }
 

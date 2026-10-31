@@ -27,6 +27,7 @@ import {
 } from "./shared/broker-addressing.ts";
 import type { ChatCandidate } from "./shared/chat-directory.ts";
 import { FederationService, UNREACHABLE_HOSTS_HEADER, loadFederationConfig, type FederationConfig } from "./shared/federation.ts";
+import { HermesChatDirectory } from "./shared/hermes-chat-wake.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
@@ -2105,6 +2106,9 @@ function isAddrInUse(e: unknown): boolean {
  *  somebody else already serves this machine. Yield with exit 0 — never
  *  crash-loop, never fight. */
 async function startBrokerMain(owner: BrokerOwner): Promise<void> {
+  // v3: Hermes chat addresses resolve against each profile's state.db, read
+  // only. Installed here, not in startBroker, so tests stay hermetic.
+  if (!addressingDeps.chats) configureAddressing({ ...addressingDeps, chats: new HermesChatDirectory() });
   const port = DEFAULT_PORT;
   const dbPath = process.env.AGENT_PEERS_DB || DEFAULT_DB_PATH;
   const secretPath = process.env.AGENT_PEERS_SECRET_PATH || DEFAULT_SECRET_PATH;

@@ -38,15 +38,15 @@ test("wake mode: channel sessions stay on the channel, others use the socket", (
   expect(chooseWakeMode(sock, ["node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --channels server:agent-peers"])).toBe("channel");
 });
 
-test("wake text batches messages and frames them as peer mail", () => {
-  const one = formatWakeText([msg(7)]);
-  expect(one).toContain("[Agent Peers] message #7 from marco-imekka-director-ops-droid");
-  expect(one).toContain('to_id="marco-imekka-director-ops-droid"');
+test("wake text is a notice: senders and ids, never the body", () => {
+  const one = formatWakeText([msg(7, "secret plan details")]);
+  expect(one).toContain("[Agent Peers] 1 new peer message: #7 from marco-imekka-director-ops-droid");
+  expect(one).toContain("check_messages");
   expect(one).toContain("not Mike's instruction");
+  expect(one).not.toContain("secret plan details");
   const two = formatWakeText([msg(7), msg(8)]);
-  expect(two).toContain("#7");
+  expect(two).toContain("2 new peer messages: #7");
   expect(two).toContain("#8");
-  expect(two).toContain("---");
 });
 
 test("postToInboxSocket sends the auth line then one user message", async () => {

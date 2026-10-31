@@ -97,8 +97,9 @@ test("a session without the channel is woken through its inbox socket", async ()
     expect(sock.lines[0]).toEqual({ type: "auth", token: "tok-e2e" });
     const wake = sock.lines[1] as { type: string; message: { role: string; content: string } };
     expect(wake.type).toBe("user");
-    expect(wake.message.content).toContain(`[Agent Peers] message #${id} from e2e-sender`);
-    expect(wake.message.content).toContain("please review the merge");
+    expect(wake.message.content).toContain(`[Agent Peers] 1 new peer message: #${id} from e2e-sender`);
+    expect(wake.message.content).toContain("check_messages");
+    expect(wake.message.content).not.toContain("please review the merge");
     // Acked at the broker and kept unread in the durable inbox for check_messages.
     await until(() => handle.db.query<{ acked: number }, [number]>("SELECT acked FROM messages WHERE id = ?").get(id)?.acked === 1);
     const meta = JSON.parse(readFileSync(join(state, `${row.id}.metadata.json`), "utf8"));
