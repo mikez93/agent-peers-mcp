@@ -600,7 +600,9 @@ async function cmdSuggestName(base: string) {
   let taken = new Set<string>();
   try {
     if (await client.isAlive()) {
-      const peers = await client.listPeers({ scope: "machine", cwd: process.cwd(), git_root: null });
+      // Local names only: remote rows never collide, and a sleeping host
+      // would otherwise delay every Codex launch.
+      const peers = await client.listPeers({ scope: "machine", cwd: process.cwd(), git_root: null, local_only: true });
       taken = new Set(peers.map((p) => p.name));
     }
   } catch {

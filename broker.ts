@@ -2039,7 +2039,7 @@ export function startBroker(
             // Machine scope also lists the other machines, live (about 1.5 s
             // per unreachable host). Still a bare array for old clients; the
             // unreachable hosts travel in a header.
-            if (!federation || b.scope !== "machine") return json(local);
+            if (!federation || b.scope !== "machine" || b.local_only) return json(local);
             const dir = await federation.service.directory();
             const remote = dir.peers.filter((p) => p.host !== federation.config.host && (!b.peer_type || p.peer_type === b.peer_type));
             return json([...local, ...remote], dir.unreachable_hosts.length

@@ -169,6 +169,8 @@ test("machine scope lists the other machine's peers, still as a bare array", asy
   expect(peers.map((p) => p.name)).toContain("kepler-claude@beta");
   const repo = await api("alpha").listPeers({ scope: "repo", cwd: "/w/alpha", git_root: null, exclude_id: vector.id });
   expect(repo.map((p) => p.name)).not.toContain("kepler-claude@beta");
+  const localOnly = await api("alpha").listPeers({ scope: "machine", cwd: "/w/alpha", git_root: null, exclude_id: vector.id, local_only: true });
+  expect(localOnly.map((p) => p.name)).not.toContain("kepler-claude@beta");
 });
 
 test("an outage queues mail, reports the host, and delivers once on recovery", async () => {
@@ -179,6 +181,10 @@ test("an outage queues mail, reports the host, and delivers once on recovery", a
     body: JSON.stringify({ scope: "machine", cwd: "/w/alpha", git_root: null }),
   });
   expect(res.headers.get("x-agent-peers-unreachable-hosts")).toBe("beta");
+  // Launch-time name suggestion never waits on a down host.
+  const t = Date.now();
+  await api("alpha").listPeers({ scope: "machine", cwd: "/w/alpha", git_root: null, local_only: true });
+  expect(Date.now() - t).toBeLessThan(500);
   const sent = await api("alpha").sendMessage({ from_id: vector.id, session_token: vector.session_token, to_id_or_name: "kepler-claude@beta", text: "sent during outage" });
   expect(sent.ok).toBe(true);
   // Local mail keeps working during the outage.

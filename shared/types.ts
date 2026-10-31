@@ -102,6 +102,9 @@ export interface ListPeersRequest {
   git_root: string | null;
   exclude_id?: PeerId;
   peer_type?: PeerType;
+  /** Skip the other machines even at machine scope (no network wait).
+   *  Older brokers ignore it and list local peers only anyway. */
+  local_only?: boolean;
 }
 
 export interface SendMessageRequest {
