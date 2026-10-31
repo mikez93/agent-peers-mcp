@@ -16,17 +16,14 @@
 // that CAN distinguish their surfaces.
 
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveStateDir } from "./shared/state-dir.ts";
 
 process.env.AGENT_PEERS_RUNTIME = "hermes";
 
-const disabledFlag = join(
-  process.env.AGENT_PEERS_STATE_DIR
-    ?? process.env.AGENT_PEERS_HERMES_STATE_DIR
-    ?? join(homedir(), ".agent-peers-hermes"),
-  "disabled",
-);
+// Same root as before: AGENT_PEERS_STATE_DIR, then AGENT_PEERS_HERMES_STATE_DIR,
+// then ~/.agent-peers-hermes (the coordination layout keeps old locks in place).
+const disabledFlag = join(resolveStateDir({ runtime: "hermes", kind: "coordination" }), "disabled");
 if (existsSync(disabledFlag)) {
   console.error(`[agent-peers/hermes] disabled by flag file ${disabledFlag}; running inert`);
   process.env.AGENT_PEERS_ENABLED = "0";

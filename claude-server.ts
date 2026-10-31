@@ -28,6 +28,7 @@ import { ensureBroker } from "./shared/ensure-broker.ts";
 import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { resolvePeerIdentity } from "./shared/peer-identity.ts";
+import { resolveStateDir } from "./shared/state-dir.ts";
 import { createAsyncLock } from "./shared/async-lock.ts";
 import {
   ancestorCommands, chooseWakeMode, SocketWaker, writeSocketWakeMarker, removeSocketWakeMarker,
@@ -39,8 +40,6 @@ import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.t
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { DeliveryState } from "./shared/delivery-state.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { isValidName, NAME_MAX_LEN } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import { formatPeerList, PEER_LIST_TOOL_DESCRIPTION } from "./shared/peer-list.ts";
@@ -90,7 +89,7 @@ let myGitRoot: string | null = null;
 // truly silent loss path on the Claude side. Messages are now persisted here
 // BEFORE the channel push, and acked only after the write lands.
 let inboxStore: CodexInboxStore | null = null;
-const CLAUDE_INBOX_ROOT = process.env.AGENT_PEERS_STATE_DIR ?? join(homedir(), ".agent-peers-claude");
+const CLAUDE_INBOX_ROOT = resolveStateDir({ runtime: "claude" });
 const SEEN_WATERMARK_SLACK = 10_000; // same bound as codex-server's watermark
 // Delivery lifecycle for durable entries surfaced via check_messages:
 // draw → promote (response fully built) → confirm+remove on the NEXT call.
