@@ -20,6 +20,8 @@ export interface Peer {
    * registered_at. */
   started_at?: string; // canonical UTC ISO timestamp
   last_seen: string; // ISO timestamp
+  /** Persona slug (AGENTS.md name) when known. Optional, additive (v3). */
+  persona?: string | null;
 }
 
 export interface LeasedMessage {
@@ -33,6 +35,10 @@ export interface LeasedMessage {
   text: string;
   sent_at: string;
   lease_token: string;
+  /** v3 chat mail. The recipient chat (Hermes session ID), when addressed. */
+  to_chat?: string | null;
+  /** v3 chat mail. The sending chat, when the sender was a Hermes chat. */
+  from_chat?: string | null;
 }
 
 // ----- Broker API request/response -----
@@ -60,6 +66,14 @@ export interface RegisterRequest {
    *  unacked mail to the new row — the mailbox survives the incarnation
    *  without reusing the session token (which stays the auth boundary). */
   prev_id?: string;
+  /** v3: persona slug from the AGENTS.md declaration, for find-by-name. */
+  persona?: string | null;
+  /** v3: features this client implements, e.g. "chat-mail". Old clients omit
+   *  it, and the broker then never stores mail they cannot read. */
+  capabilities?: string[];
+  /** v3: for a Hermes election loser, the durable mailbox name of its
+   *  profile (e.g. "valentina-hermes"), so replies to its chats route there. */
+  mailbox_owner?: PeerName;
 }
 
 export interface RegisterResponse {
@@ -93,6 +107,8 @@ export interface SendMessageRequest {
   session_token: string;
   to_id_or_name: string;
   text: string;
+  /** v3: the sending Hermes chat (title or session ID), so replies return to it. */
+  from_chat?: string;
 }
 
 export interface SendMessageResponse {
@@ -101,9 +117,18 @@ export interface SendMessageResponse {
   message_id?: number;
   /** Queued is not delivered or woken, especially for a saved conversation. */
   notice?: string;
+  /** v3: when an address was ambiguous or a chat title missed, the exact
+   *  addresses the sender can resend to. */
+  candidates?: string[];
 }
 
-export interface PollMessagesRequest { id: PeerId; session_token: string; }
+export interface PollMessagesRequest {
+  id: PeerId;
+  session_token: string;
+  /** v3: read one chat's mail (Hermes). "general" reads the general mailbox.
+   *  Omitted: the general mailbox only (old clients never see chat mail). */
+  chat?: string;
+}
 
 export interface PollMessagesResponse {
   messages: LeasedMessage[];

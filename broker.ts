@@ -18,6 +18,13 @@ import type {
 import { appendSuffixWithinLimit, generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 import { findConversation, hasConversationSchema, withConversationFence } from "./shared/hermes-conversation-fence.ts";
 import { dormantMailboxNotice, type ConversationOwner } from "./shared/hermes-conversation-bindings.ts";
+import { personaOf, withPersonaPrefix } from "./shared/peer-address.ts";
+import {
+  CHAT_MAIL_CAPABILITY, chatRouteId, hasCapability, mailboxOwnerRow, recordChatRoute, resolveAddress,
+  resolvePeerName, resolvePollScope, resolveSenderChat, rowByName,
+  type AddressRow, type AddressingDeps,
+} from "./shared/broker-addressing.ts";
+import type { ChatCandidate } from "./shared/chat-directory.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
@@ -196,6 +203,9 @@ export function initDb(path: string): Database {
   // constraint requires a table rebuild; this final migration preserves every
   // column in the current schema instead of resetting newer peer metadata.
   migrate_peers_add_droid_peer_type(db);
+  // v3 (2026-10-31). MUST stay last: additive columns and a new table only,
+  // so an older broker can still open this DB if we ever roll back.
+  migrate_v3_addressing(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -484,6 +494,39 @@ function migrate_peers_add_droid_peer_type(db: Database): void {
   }
 }
 
+function migrate_v3_addressing(db: Database): void {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!columnExists(db, "peers", "persona")) db.exec("ALTER TABLE peers ADD COLUMN persona TEXT");
+    if (!columnExists(db, "peers", "capabilities")) db.exec("ALTER TABLE peers ADD COLUMN capabilities TEXT");
+    if (!columnExists(db, "peers", "mailbox_owner")) db.exec("ALTER TABLE peers ADD COLUMN mailbox_owner TEXT");
+    if (!columnExists(db, "messages", "to_chat")) db.exec("ALTER TABLE messages ADD COLUMN to_chat TEXT");
+    if (!columnExists(db, "messages", "from_chat")) db.exec("ALTER TABLE messages ADD COLUMN from_chat TEXT");
+    db.exec(`CREATE TABLE IF NOT EXISTS chat_routes (
+      id         TEXT PRIMARY KEY,
+      peer_name  TEXT NOT NULL,
+      chat_key   TEXT NOT NULL,
+      title      TEXT,
+      created_at TEXT NOT NULL,
+      last_used  TEXT NOT NULL
+    )`);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_messages_to_chat ON messages(to_id, to_chat, acked)");
+    db.exec("COMMIT");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
+  }
+}
+
+// ----- v3 addressing configuration -----
+// The broker process sets these once at startup; tests set them directly.
+let addressingDeps: AddressingDeps = {};
+export function configureAddressing(deps: AddressingDeps): void { addressingDeps = deps; }
+
+/** Hard caps so one caller can never make the broker do unbounded work. */
+export const MAX_POLL_BATCH = 100;
+export const MAX_ACK_TOKENS = 1000;
+
 // ----- Peer CRUD -----
 
 function* nameCandidates(requested: string | undefined): Generator<string> {
@@ -504,7 +547,22 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   // The whole register — reclaim-or-insert plus prev_id mailbox re-pointing —
   // runs as ONE transaction so a crash can never leave a new row without its
   // migrated mail (or vice versa).
-  return db.transaction(() => registerPeerInner(db, req))();
+  return db.transaction(() => {
+    const res = registerPeerInner(db, req);
+    applyV3RegisterFields(db, res.id, req);
+    return res;
+  })();
+}
+
+/** Persona, capabilities and mailbox owner are refreshed on every register,
+ *  so a reclaimed row never keeps a previous incarnation's capabilities. */
+function applyV3RegisterFields(db: Database, id: string, req: RegisterRequest): void {
+  const persona = typeof req.persona === "string" && req.persona.trim() ? req.persona.trim().slice(0, 64) : null;
+  const caps = Array.isArray(req.capabilities)
+    ? req.capabilities.filter((c) => typeof c === "string" && /^[a-z0-9-]{1,32}$/.test(c)).slice(0, 16).join(",") || null
+    : null;
+  const owner = typeof req.mailbox_owner === "string" && isValidName(req.mailbox_owner) ? req.mailbox_owner : null;
+  db.query("UPDATE peers SET persona = ?, capabilities = ?, mailbox_owner = ? WHERE id = ?").run(persona, caps, owner, id);
 }
 
 function registerPeerInner(db: Database, req: RegisterRequest): RegisterResponse {
@@ -692,7 +750,7 @@ function setPeerSummaryInner(db: Database, id: string, session_token: string, su
 // session_token, and it does its own narrow query.
 const PEER_COLS =
   "id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, " +
-  "COALESCE(started_at, registered_at) AS started_at, last_seen";
+  "COALESCE(started_at, registered_at) AS started_at, last_seen, persona";
 
 export function getPeer(db: Database, id: string): Peer | null {
   const row = db.query<Peer, [string]>(`SELECT ${PEER_COLS} FROM peers WHERE id = ?`).get(id);
@@ -760,20 +818,21 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
   const sql = `SELECT id, name, peer_type, pid, cwd, git_root, tty, summary,
                       registered_at,
                       COALESCE(started_at, registered_at) AS started_at,
-                      last_seen
+                      last_seen, persona
                FROM peers ${where}
                ORDER BY COALESCE(started_at, registered_at) DESC,
                         registered_at DESC, name ASC, id ASC`;
-  return db.query<Peer, typeof params>(sql).all(...params);
+  // v3: every status starts with the agent's persona name ("Marco: ..."),
+  // computed on read so stored summaries stay exactly what the agent wrote
+  // and old clients display it with no code change.
+  return db.query<Peer, typeof params>(sql).all(...params).map(withPersonaSummary);
+}
+
+export function withPersonaSummary<T extends { name: string; summary: string; cwd?: string | null; git_root?: string | null; persona?: string | null }>(row: T): T {
+  return { ...row, summary: withPersonaPrefix(row.summary ?? "", personaOf(row)) };
 }
 
 // ----- Send -----
-
-function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
-  const byId = getPeer(db, to_id_or_name);
-  if (byId) return byId;
-  return getPeerByName(db, to_id_or_name);
-}
 
 export function sendMessage(db: Database, req: SendMessageRequest, owner?: ConversationOwner): SendMessageResponse {
   return withConversationFence(db, req.from_id, req.session_token, owner, () => sendMessageInner(db, req));
@@ -816,8 +875,11 @@ function sendMessageInner(db: Database, req: SendMessageRequest): SendMessageRes
       return { ok: true, message_id: inserted.id, notice: dormantMailboxNotice(state) };
     }
 
-    // 2. Target resolution + deliverability + insert in ONE statement, so
-    //    nothing can unregister between the check and the write.
+    // 2. Resolve the address inside this transaction (v3: exact UUID or name
+    //    first, then case-insensitive and persona matches, chat routes and
+    //    remote machines), then insert against the resolved UUID. The
+    //    deliverability rule stays in the same INSERT so nothing can
+    //    unregister between the check and the write.
     //
     //    A target is deliverable if it is LIVE, or if it is DURABLE. The
     //    original rule was live-only, to avoid writing a message no one would
@@ -827,14 +889,34 @@ function sendMessageInner(db: Database, req: SendMessageRequest): SendMessageRes
     //    "your colleague is idle" into "your colleague does not exist". The
     //    message waits in its mailbox and the reclaim path hands it over on
     //    the peer's next registration.
+    const resolution = resolveAddress(db, req.to_id_or_name, staleCutoff, addressingDeps);
+    if (resolution.kind === "none") return { ok: false, error: `unknown peer: ${req.to_id_or_name}` };
+    if (resolution.kind === "error") {
+      return { ok: false, error: resolution.error, ...(resolution.candidates?.length ? { candidates: resolution.candidates } : {}) };
+    }
+    if (resolution.kind === "remote") {
+      if (!addressingDeps.remote) {
+        return { ok: false, error: `unknown machine "${resolution.host}": cross-machine delivery is not enabled on this broker` };
+      }
+      return addressingDeps.remote({
+        db, fromId: req.from_id, fromName: sender.name, host: resolution.host, name: resolution.name,
+        chat: resolution.chat, text: req.text, fromChat: req.from_chat ?? null, sentAt: nowStr,
+      });
+    }
+    const target = resolution.row;
+    const senderRow = rowByName(db, sender.name);
+    const senderChat = senderRow ? resolveSenderChat(db, senderRow, req.from_chat, addressingDeps) : null;
+    if (senderChat) recordChatRoute(db, senderChat.owner.name, senderChat.chatKey, senderChat.title);
+    if (resolution.chatKey) recordChatRoute(db, target.name, resolution.chatKey, resolution.chatTitle);
+
     const inserted = db.query<
       { id: number; to_id: string },
-      [string, string, string, string, string, string, string, string]
+      [string, string, string, string, string | null, string | null, string, string, string]
     >(
-      `INSERT INTO messages (from_id, to_id, text, sent_at, message_uid)
-       SELECT ?, p.id, ?, ?, ?
+      `INSERT INTO messages (from_id, to_id, text, sent_at, message_uid, to_chat, from_chat)
+       SELECT ?, p.id, ?, ?, ?, ?, ?
        FROM peers p
-       WHERE (p.id = ? OR p.name = ?)
+       WHERE p.id = ?
          AND (p.last_seen >= ? OR p.durable = 1)
          AND (
            p.last_seen >= ?
@@ -843,14 +925,12 @@ function sendMessageInner(db: Database, req: SendMessageRequest): SendMessageRes
          )
        RETURNING id, to_id`
     ).get(
-      req.from_id, req.text, nowStr, randomUUID(), req.to_id_or_name, req.to_id_or_name,
-      staleCutoff, staleCutoff,
+      req.from_id, req.text, nowStr, randomUUID(), resolution.chatKey, senderChat?.chatKey ?? null,
+      target.id, staleCutoff, staleCutoff,
     );
 
     if (!inserted) {
-      // Distinguish the three failure modes for a usable error.
-      const target = resolveTarget(db, req.to_id_or_name);
-      if (!target) return { ok: false, error: `unknown peer: ${req.to_id_or_name}` };
+      // Distinguish the failure modes for a usable error.
       const backlog = db.query<{ n: number }, [string]>(
         "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND acked = 0"
       ).get(target.id);
@@ -863,18 +943,99 @@ function sendMessageInner(db: Database, req: SendMessageRequest): SendMessageRes
       }
       return { ok: false, error: `target peer stale: ${target.name}` };
     }
-    return { ok: true, message_id: inserted.id };
+    const exactName = req.to_id_or_name === target.id || req.to_id_or_name === target.name;
+    const notices = [
+      resolution.notice,
+      !exactName ? `delivered to ${target.name}${resolution.chatKey ? `, chat "${resolution.chatTitle ?? resolution.chatKey}"` : ""}` : null,
+      req.from_chat && !senderChat ? `could not identify your chat "${req.from_chat}", so replies go to your general mailbox` : null,
+    ].filter(Boolean);
+    return { ok: true, message_id: inserted.id, ...(notices.length ? { notice: notices.join("; ") } : {}) };
   });
 
   return tx();
 }
 
+// ----- v3: chat discovery and the Hermes chat inbox -----
+
+export const BROKER_CAPABILITIES = ["persona-names", "chat-mail", "list-chats", "chat-inbox", "bounded-poll"];
+
+export interface ListChatsRequest {
+  id: string;
+  session_token: string;
+  peer: string;
+  query?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** Read-only chat lookup: titles and status, never transcript text. It does
+ *  not adopt, wake or consume mail. */
+export function listChats(db: Database, req: ListChatsRequest):
+  { ok: boolean; error?: string; candidates?: string[]; peer?: string; chats?: (ChatCandidate & { address: string })[] } {
+  const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  const caller = db.query<{ id: string }, [string, string, string]>(
+    "SELECT id FROM peers WHERE id = ? AND session_token = ? AND last_seen >= ?",
+  ).get(req.id, req.session_token, staleCutoff);
+  if (!caller) return { ok: false, error: "unauthorized or stale caller" };
+  const named = resolvePeerName(db, String(req.peer ?? "").split("/")[0]!.trim(), staleCutoff);
+  if (!named) return { ok: false, error: `unknown peer: ${req.peer}` };
+  if ("error" in named) return { ok: false, error: named.error, candidates: named.candidates };
+  if (named.row.peer_type !== "hermes") return { ok: false, error: `${named.row.name} is a ${named.row.peer_type} peer; only Hermes agents have chats` };
+  const owner = mailboxOwnerRow(db, named.row);
+  if (!addressingDeps.chats) return { ok: false, error: "chat lookup is not available on this machine" };
+  const limit = Math.max(1, Math.min(50, Math.floor(Number(req.limit) || 20)));
+  const offset = Math.max(0, Math.floor(Number(req.offset) || 0));
+  const query = typeof req.query === "string" && req.query.trim() ? req.query.trim().slice(0, 200) : undefined;
+  const chats = addressingDeps.chats.list(owner, { query, limit, offset });
+  return {
+    ok: true,
+    peer: owner.name,
+    chats: chats.map((c) => ({ ...c, address: `${owner.name}/${c.chat_key}` })),
+  };
+}
+
+export interface ChatInboxEntry {
+  peer_id: string;
+  peer_name: string;
+  /** Null is the general mailbox, which the profile's "Agent Peers" chat reads. */
+  to_chat: string | null;
+  title: string | null;
+  unread: number;
+  leased: number;
+  max_id: number;
+  oldest_sent_at: string;
+}
+
+/** Unread Hermes mail grouped by recipient chat, for the wake daemon. Only
+ *  chat-capable owners are listed for general mail, so old Hermes processes
+ *  keep today's behavior until they restart on new code. */
+export function chatInbox(db: Database): ChatInboxEntry[] {
+  const now = nowIso();
+  const rows = db.query<Omit<ChatInboxEntry, "title">, [string]>(
+    `SELECT p.id AS peer_id, p.name AS peer_name, m.to_chat AS to_chat,
+            COUNT(*) AS unread,
+            SUM(CASE WHEN m.lease_token IS NOT NULL AND m.lease_expires_at >= ? THEN 1 ELSE 0 END) AS leased,
+            MAX(m.id) AS max_id, MIN(m.sent_at) AS oldest_sent_at
+       FROM messages m JOIN peers p ON p.id = m.to_id
+      WHERE m.acked = 0 AND p.peer_type = 'hermes'
+        AND (m.to_chat IS NOT NULL OR (',' || COALESCE(p.capabilities, '') || ',') LIKE '%,${CHAT_MAIL_CAPABILITY},%')
+      GROUP BY m.to_id, m.to_chat
+      ORDER BY MIN(m.id)`,
+  ).all(now);
+  return rows.map((r) => ({
+    ...r,
+    title: r.to_chat
+      ? db.query<{ title: string | null }, [string]>("SELECT title FROM chat_routes WHERE id = ?").get(chatRouteId(r.peer_name, r.to_chat))?.title ?? null
+      : null,
+  }));
+}
+
 // ----- Poll (lease) -----
 
-export function pollMessages(db: Database, id: string, session_token: string, owner?: ConversationOwner): LeasedMessage[] {
-  return withConversationFence(db, id, session_token, owner, () => pollMessagesInner(db, id, session_token));
+export function pollMessages(db: Database, id: string, session_token: string, owner?: ConversationOwner, chat?: string): LeasedMessage[] {
+  return withConversationFence(db, id, session_token, owner, () => pollMessagesInner(db, id, session_token, chat));
 }
-function pollMessagesInner(db: Database, id: string, session_token: string): LeasedMessage[] {
+function pollMessagesInner(db: Database, id: string, session_token: string, chat?: string): LeasedMessage[] {
   const now = new Date();
   const nowStr = now.toISOString();
   const leaseUntil = new Date(now.getTime() + LEASE_DURATION_MS).toISOString();
@@ -898,16 +1059,30 @@ function pollMessagesInner(db: Database, id: string, session_token: string): Lea
         .run(nowStr, id, session_token);
     }
 
-    const rows = db.query<
-      { id: number; from_id: string; to_id: string; text: string; sent_at: string },
-      [string, string]
-    >(
-      `SELECT id, from_id, to_id, text, sent_at
-       FROM messages
-       WHERE to_id = ? AND acked = 0
-         AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < ?)
-       ORDER BY id ASC`
-    ).all(id, nowStr);
+    // v3 mail scope. A poll without a chat (every old client, and every
+    // non-Hermes client) draws only general mail, so chat-addressed mail can
+    // never be consumed by the wrong conversation. A Hermes chat names
+    // itself and draws only its own mail, which lives in the profile's
+    // durable owner mailbox.
+    const requester = rowByName(db, db.query<{ name: string }, [string]>("SELECT name FROM peers WHERE id = ?").get(id)!.name)!;
+    const scope = resolvePollScope(db, requester, chat, addressingDeps);
+    if (scope.mode === "none") return [] as LeasedMessage[];
+    type Row = { id: number; from_id: string; to_id: string; text: string; sent_at: string; to_chat: string | null; from_chat: string | null };
+    const rows = scope.mode === "general"
+      ? db.query<Row, [string, string]>(
+          `SELECT id, from_id, to_id, text, sent_at, to_chat, from_chat
+           FROM messages
+           WHERE to_id = ? AND to_chat IS NULL AND acked = 0
+             AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < ?)
+           ORDER BY id ASC LIMIT ${MAX_POLL_BATCH}`
+        ).all(scope.mailboxId, nowStr)
+      : db.query<Row, [string, string, string]>(
+          `SELECT id, from_id, to_id, text, sent_at, to_chat, from_chat
+           FROM messages
+           WHERE to_id = ? AND to_chat = ? AND acked = 0
+             AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < ?)
+           ORDER BY id ASC LIMIT ${MAX_POLL_BATCH}`
+        ).all(scope.mailboxId, scope.chatKey, nowStr);
 
     const result: LeasedMessage[] = [];
     for (const row of rows) {
@@ -915,17 +1090,33 @@ function pollMessagesInner(db: Database, id: string, session_token: string): Lea
       db.query("UPDATE messages SET lease_token = ?, lease_expires_at = ? WHERE id = ?")
         .run(lease, leaseUntil, row.id);
       const sender = getPeer(db, row.from_id);
+      const shown = sender ? withPersonaSummary(sender) : null;
+      let fromId = row.from_id;
+      let fromName = sender?.name ?? "(gone)";
+      let fromSummary = shown?.summary ?? "";
+      if (row.from_chat && sender) {
+        // Replies must return to the sending chat, including from old
+        // clients that reply to from_id or from_name.
+        const senderRow = rowByName(db, sender.name);
+        const ownerName = senderRow ? mailboxOwnerRow(db, senderRow).name : sender.name;
+        fromId = chatRouteId(ownerName, row.from_chat);
+        const title = db.query<{ title: string | null }, [string]>("SELECT title FROM chat_routes WHERE id = ?").get(fromId)?.title;
+        fromName = `${ownerName}/${row.from_chat}`;
+        fromSummary = `chat "${title ?? row.from_chat}" — ${fromSummary}`;
+      }
       result.push({
         id: row.id,
-        from_id: row.from_id,
-        from_name: sender?.name ?? "(gone)",
+        from_id: fromId,
+        from_name: fromName,
         from_peer_type: sender?.peer_type ?? "claude",
         from_cwd: sender?.cwd ?? "",
-        from_summary: sender?.summary ?? "",
+        from_summary: fromSummary,
         to_id: row.to_id,
         text: row.text,
         sent_at: row.sent_at,
         lease_token: lease,
+        ...(row.to_chat ? { to_chat: row.to_chat } : {}),
+        ...(row.from_chat ? { from_chat: row.from_chat } : {}),
       });
     }
     return result;
@@ -941,6 +1132,7 @@ export function ackMessages(db: Database, req: AckMessagesRequest, owner?: Conve
 }
 function ackMessagesInner(db: Database, req: AckMessagesRequest): AckMessagesResponse {
   if (req.lease_tokens.length === 0) return { ok: true, acked: 0, stale: 0, results: [] };
+  if (req.lease_tokens.length > MAX_ACK_TOKENS) throw new Error(`too many lease tokens in one ack (${req.lease_tokens.length} > ${MAX_ACK_TOKENS})`);
   const now = nowIso();
   // Atomic auth via subquery: the UPDATE only affects messages whose to_id
   // belongs to a peer row with the matching session_token. No separate
@@ -948,7 +1140,14 @@ function ackMessagesInner(db: Database, req: AckMessagesRequest): AckMessagesRes
   const placeholders = req.lease_tokens.map(() => "?").join(",");
   const sql = `UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL
                WHERE lease_token IN (${placeholders})
-                 AND to_id = (SELECT id FROM peers WHERE id = ? AND session_token = ?)
+                 AND to_id IN (
+                   SELECT id FROM peers WHERE id = ? AND session_token = ?
+                   UNION
+                   -- v3: a Hermes member may confirm its own chat's mail,
+                   -- which lives in the profile owner's mailbox.
+                   SELECT o.id FROM peers r JOIN peers o ON o.name = r.mailbox_owner AND o.peer_type = r.peer_type
+                    WHERE r.id = ? AND r.session_token = ?
+                 )
                  AND acked = 0
                  AND lease_expires_at IS NOT NULL
                  AND lease_expires_at >= ?`;
@@ -962,7 +1161,7 @@ function ackMessagesInner(db: Database, req: AckMessagesRequest): AckMessagesRes
         `SELECT lease_token FROM messages WHERE lease_token IN (${placeholders})`
       ).all(...req.lease_tokens).map((r) => r.lease_token),
     );
-    const info = db.query(sql).run(...req.lease_tokens, req.id, req.session_token, now);
+    const info = db.query(sql).run(...req.lease_tokens, req.id, req.session_token, req.id, req.session_token, now);
     return { existing, changes: info.changes ?? 0 };
   });
   const { existing, changes: acked } = ackTx();
@@ -983,10 +1182,13 @@ function ackMessagesInner(db: Database, req: AckMessagesRequest): AckMessagesRes
       // Existed pre-UPDATE, no longer holds the token → this call acked it.
       if (!row) return { token, status: "acked" as const };
       if (row.acked === 1) return { token, status: "acked" as const };
-      const owner = db.query<{ id: string }, [string, string]>(
-        "SELECT id FROM peers WHERE id = ? AND session_token = ?"
+      const owner = db.query<{ id: string; mailbox_owner: string | null; peer_type: string }, [string, string]>(
+        "SELECT id, mailbox_owner, peer_type FROM peers WHERE id = ? AND session_token = ?"
       ).get(req.id, req.session_token);
-      if (!owner || row.to_id !== owner.id) return { token, status: "wrong_session" as const };
+      const ownerMailbox = owner?.mailbox_owner
+        ? db.query<{ id: string }, [string, string]>("SELECT id FROM peers WHERE name = ? AND peer_type = ?").get(owner.mailbox_owner, owner.peer_type)?.id
+        : undefined;
+      if (!owner || (row.to_id !== owner.id && row.to_id !== ownerMailbox)) return { token, status: "wrong_session" as const };
       if (row.lease_expires_at !== null && row.lease_expires_at < now) {
         return { token, status: "expired" as const };
       }
@@ -1599,6 +1801,9 @@ export function startBroker(
             owner,
             protocol: 1,
             db_id: dbIdentityHash(dbPath),
+            // v3: features are advertised, never signalled by bumping
+            // `protocol`, which old clients compare for equality.
+            capabilities: BROKER_CAPABILITIES,
           });
         }
         if (req.method !== "POST") return json({ error: "method not allowed" }, { status: 405 });
@@ -1639,7 +1844,9 @@ export function startBroker(
           case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
           case "/list-peers":    return json(listPeers(db, await readJson(req)));
           case "/send-message":  return json(sendMessage(db, await readJson(req)));
-          case "/poll-messages": { const b = await readJson<{ id: string; session_token: string }>(req); return json({ messages: pollMessages(db, b.id, b.session_token) }); }
+          case "/poll-messages": { const b = await readJson<{ id: string; session_token: string; chat?: string }>(req); return json({ messages: pollMessages(db, b.id, b.session_token, undefined, typeof b.chat === "string" ? b.chat : undefined) }); }
+          case "/list-chats":    return json(listChats(db, await readJson(req)));
+          case "/chat-inbox":    return json({ entries: chatInbox(db) });
           case "/ack-messages":  return json(ackMessages(db, await readJson(req)));
           case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
           // No /admin/rename-peer over HTTP — arbitrary local processes could
