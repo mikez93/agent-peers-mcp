@@ -38,10 +38,8 @@ if (existsSync(disabledFlag)) {
 }
 
 if (process.env.AGENT_PEERS_HERMES_V2 === "1") {
-  const { startHermesConversationRuntime } = await import("./shared/hermes-conversation-runtime.ts");
-  await startHermesConversationRuntime();
-} else {
-  await import("./codex-server.ts");
+  console.error("[agent-peers/hermes] AGENT_PEERS_HERMES_V2 is retired; using the stock chat-mail adapter");
 }
+await import("./codex-server.ts");
 
 export {};

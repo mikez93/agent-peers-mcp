@@ -1,5 +1,36 @@
 import type { Database } from "bun:sqlite";
-import type { ConversationBinding, ConversationOwner } from "./hermes-conversation-bindings.ts";
+
+// V2 runtime retired in bd-b2in.9; this passive compatibility boundary remains.
+// Existing mailbox rows and already-loaded old callers still need reservations,
+// ownership checks and retention. No new binding/schema is created here.
+export type ConversationState = "active" | "reaped" | "closed" | "suspended" | "orphaned" | "disposed";
+
+interface ConversationBinding {
+  peer_id: string;
+  name: string;
+  state: ConversationState;
+  generation: number;
+  backend_id: string;
+  adapter_id: string;
+  owner_lease_until: number;
+}
+
+export interface ConversationOwner {
+  peer_id: string;
+  backend_id: string;
+  adapter_id: string;
+  generation: number;
+}
+
+export function dormantMailboxNotice(state: ConversationState): string | undefined {
+  const notices: Partial<Record<ConversationState, string>> = {
+    closed: "queued to dormant mailbox; recipient closed, will not be woken",
+    reaped: "queued to dormant mailbox; automatic reap, exact-session resume required; no autonomous wake",
+    suspended: "queued to dormant mailbox; backend unavailable; no autonomous wake",
+    orphaned: "queued to orphaned mailbox; chat deleted, operator action required",
+  };
+  return notices[state];
+}
 
 export function hasConversationSchema(db: Database): boolean {
   return !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hermes_conversations'").get();
