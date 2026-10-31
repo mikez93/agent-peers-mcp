@@ -8,6 +8,7 @@ import {
   initDb, registerPeer, listPeers, sendMessage, pollMessages, ackMessages, setPeerSummary, renamePeer,
   configureAddressing, listChats, chatInbox, MAX_POLL_BATCH, MAX_ACK_TOKENS,
   deliverRelayed, listDirectoryPeers, snapshotSender, deliverNotice, type OutboundSender, pollMessagesScoped,
+  gcOldMessages,
 } from "../broker.ts";
 import type { ChatDirectory, ChatCandidate } from "../shared/chat-directory.ts";
 import { chatRouteId } from "../shared/broker-addressing.ts";
@@ -347,4 +348,23 @@ test("a chat poll reports the resolved chat key, a general poll reports general"
   expect(pollMessagesScoped(db, val.id, val.session_token, undefined, "Email Shit")).toMatchObject({ scope: "chat", chat_key: "20261029_121224_2b437e" });
   expect(pollMessagesScoped(db, val.id, val.session_token, undefined, "general")).toMatchObject({ scope: "general", chat_key: null });
   expect(pollMessagesScoped(db, val.id, val.session_token, undefined, "no such chat")).toMatchObject({ scope: "none", chat_key: null, messages: [] });
+});
+
+test("unread chat mail survives the 30-day cleanup while its owner polls only general", () => {
+  // Marco's NO-GO repro: a live chat-mail owner's background loop reads only the
+  // general mailbox, so mail to a chat nobody opens exists only at the broker.
+  const val = hermesOwner();
+  const marco = reg({ name: "marco-imekka-director-ops-droid", peer_type: "droid", git_root: "/w/imekka-director-ops" });
+  expect(send(marco, "valentina/email shit", "closed chat mail").ok).toBe(true);
+  expect(pollMessages(db, val.id, val.session_token)).toEqual([]);
+  expect(send(marco, "valentina-hermes", "old general").ok).toBe(true);
+  const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+  db.query("UPDATE messages SET sent_at = ? WHERE text IN ('closed chat mail', 'old general')").run(old);
+
+  // General mail keeps its old expiry (live recipients hold a local copy);
+  // chat mail is kept until the chat reads it.
+  expect(gcOldMessages(db)).toBe(1);
+  expect(chatInbox(db).find((e) => e.to_chat === "20261029_121224_2b437e")?.unread).toBe(1);
+  const later = pollMessages(db, val.id, val.session_token, undefined, "email shit");
+  expect(later.map((m) => m.text)).toEqual(["closed chat mail"]);
 });

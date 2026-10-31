@@ -1416,8 +1416,12 @@ export function gcOldMessages(db: Database): number {
   const conversationExemption = hasConversationSchema(db)
     ? " AND NOT EXISTS (SELECT 1 FROM hermes_conversations hc WHERE hc.peer_id = messages.to_id)"
     : "";
+  // Unread chat mail never expires here. A Hermes owner's background loop reads
+  // only its general mailbox, so mail to a chat nobody has opened exists only
+  // in this table until that chat reads it.
+  const chatExemption = columnExists(db, "messages", "to_chat") ? " AND to_chat IS NULL" : "";
   const info = db.query(
-    `DELETE FROM messages WHERE (acked = 1 AND sent_at < ?) OR (acked = 0 AND sent_at < ?${conversationExemption})`
+    `DELETE FROM messages WHERE (acked = 1 AND sent_at < ?) OR (acked = 0 AND sent_at < ?${conversationExemption}${chatExemption})`
   ).run(ackedCutoff, unackedCutoff);
   return info.changes ?? 0;
 }
