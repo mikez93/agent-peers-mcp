@@ -512,6 +512,7 @@ function migrate_v3_addressing(db: Database): void {
       last_used  TEXT NOT NULL
     )`);
     db.exec("CREATE INDEX IF NOT EXISTS idx_messages_to_chat ON messages(to_id, to_chat, acked)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_chat_routes_owner ON chat_routes(peer_name, chat_key)");
     db.exec("COMMIT");
   } catch (e) {
     try { db.exec("ROLLBACK"); } catch { /* best effort */ }
@@ -1027,10 +1028,10 @@ export function snapshotSender(db: Database, req: RemoteSendRequest): OutboundSe
   const peer = getPeer(db, req.fromId);
   if (!row || !peer || row.id !== req.fromId) throw new Error("federation: sender is not registered");
   const chat = resolveSenderChat(db, row, req.fromChat ?? undefined, addressingDeps);
-  if (chat) recordChatRoute(db, chat.owner.name, chat.chatKey, chat.title);
+  const routeId = chat ? recordChatRoute(db, chat.owner.name, chat.chatKey, chat.title) : null;
   const owner = mailboxOwnerRow(db, row);
   return {
-    id: chat ? chatRouteId(chat.owner.name, chat.chatKey) : row.id,
+    id: routeId ?? row.id,
     peer_id: owner.id,
     name: chat ? chat.owner.name : row.name,
     peer_type: row.peer_type as PeerType,
@@ -1116,7 +1117,7 @@ export function chatInbox(db: Database): ChatInboxEntry[] {
   return rows.map((r) => ({
     ...r,
     title: r.to_chat
-      ? db.query<{ title: string | null }, [string]>("SELECT title FROM chat_routes WHERE id = ?").get(chatRouteId(r.peer_name, r.to_chat))?.title ?? null
+      ? db.query<{ title: string | null }, [string, string]>("SELECT title FROM chat_routes WHERE peer_name = ? AND chat_key = ? ORDER BY created_at LIMIT 1").get(r.peer_name, r.to_chat)?.title ?? null
       : null,
   }));
 }
@@ -1124,9 +1125,21 @@ export function chatInbox(db: Database): ChatInboxEntry[] {
 // ----- Poll (lease) -----
 
 export function pollMessages(db: Database, id: string, session_token: string, owner?: ConversationOwner, chat?: string): LeasedMessage[] {
-  return withConversationFence(db, id, session_token, owner, () => pollMessagesInner(db, id, session_token, chat));
+  return pollMessagesScoped(db, id, session_token, owner, chat).messages;
 }
-function pollMessagesInner(db: Database, id: string, session_token: string, chat?: string): LeasedMessage[] {
+/** v3: a poll also reports which mailbox it read. For a chat poll, chat_key
+ *  is the resolved stable key, so a client can file the mail per chat even
+ *  when it named the chat by title or by a later session in its lineage. */
+export interface PollScopeReport { scope: "general" | "chat" | "none"; chat_key: string | null }
+export function pollMessagesScoped(db: Database, id: string, session_token: string, owner?: ConversationOwner, chat?: string):
+  { messages: LeasedMessage[] } & PollScopeReport {
+  return withConversationFence(db, id, session_token, owner, () => {
+    const report: PollScopeReport = { scope: "none", chat_key: null };
+    const messages = pollMessagesInner(db, id, session_token, chat, report);
+    return { messages, ...report };
+  });
+}
+function pollMessagesInner(db: Database, id: string, session_token: string, chat: string | undefined, report: PollScopeReport): LeasedMessage[] {
   const now = new Date();
   const nowStr = now.toISOString();
   const leaseUntil = new Date(now.getTime() + LEASE_DURATION_MS).toISOString();
@@ -1157,6 +1170,8 @@ function pollMessagesInner(db: Database, id: string, session_token: string, chat
     // durable owner mailbox.
     const requester = rowByName(db, db.query<{ name: string }, [string]>("SELECT name FROM peers WHERE id = ?").get(id)!.name)!;
     const scope = resolvePollScope(db, requester, chat, addressingDeps);
+    report.scope = scope.mode;
+    report.chat_key = scope.mode === "chat" ? scope.chatKey : null;
     if (scope.mode === "none") return [] as LeasedMessage[];
     type Row = { id: number; from_id: string; to_id: string; text: string; sent_at: string; to_chat: string | null; from_chat: string | null };
     const rows = scope.mode === "general"
@@ -1191,8 +1206,11 @@ function pollMessagesInner(db: Database, id: string, session_token: string, chat
         // clients that reply to from_id or from_name.
         const senderRow = rowByName(db, sender.name);
         const ownerName = senderRow ? mailboxOwnerRow(db, senderRow).name : sender.name;
-        fromId = chatRouteId(ownerName, row.from_chat);
-        const title = db.query<{ title: string | null }, [string]>("SELECT title FROM chat_routes WHERE id = ?").get(fromId)?.title;
+        const route = db.query<{ id: string; title: string | null }, [string, string]>(
+          "SELECT id, title FROM chat_routes WHERE peer_name = ? AND chat_key = ? ORDER BY created_at LIMIT 1",
+        ).get(ownerName, row.from_chat);
+        fromId = route?.id ?? recordChatRoute(db, ownerName, row.from_chat, null);
+        const title = route?.title;
         fromName = `${ownerName}/${row.from_chat}`;
         fromSummary = `chat "${title ?? row.from_chat}" — ${fromSummary}`;
       }
@@ -1318,11 +1336,22 @@ function renamePeerInner(db: Database, req: RenamePeerRequest): RenamePeerRespon
   // we return "unauthorized rename" in both cases (no auth-vs-enumeration
   // leak).
   try {
-    const info = db.query(
-      "UPDATE peers SET name = ?, last_seen = ? WHERE id = ? AND session_token = ?"
-    ).run(req.new_name, nowIso(), req.id, req.session_token);
-    if ((info.changes ?? 0) === 0) return { ok: false, error: "unauthorized rename" };
-    return { ok: true, name: req.new_name };
+    return db.transaction((): RenamePeerResponse => {
+      const before = db.query<{ name: string }, [string, string]>(
+        "SELECT name FROM peers WHERE id = ? AND session_token = ?",
+      ).get(req.id, req.session_token);
+      const info = db.query(
+        "UPDATE peers SET name = ?, last_seen = ? WHERE id = ? AND session_token = ?"
+      ).run(req.new_name, nowIso(), req.id, req.session_token);
+      if (!before || (info.changes ?? 0) === 0) return { ok: false, error: "unauthorized rename" };
+      if (before.name !== req.new_name) {
+        // v3: chat routes and member links follow the agent. Route UUIDs are
+        // kept, so replies to chats addressed before the rename still land.
+        db.query("UPDATE chat_routes SET peer_name = ? WHERE peer_name = ?").run(req.new_name, before.name);
+        db.query("UPDATE peers SET mailbox_owner = ? WHERE mailbox_owner = ?").run(req.new_name, before.name);
+      }
+      return { ok: true, name: req.new_name };
+    })();
   } catch (e) {
     if (isUniqueViolation(e)) return { ok: false, error: "name taken" };
     throw e;
@@ -1941,7 +1970,11 @@ export function startBroker(
           case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
           case "/list-peers":    return json(listPeers(db, await readJson(req)));
           case "/send-message":  return json(sendMessage(db, await readJson(req)));
-          case "/poll-messages": { const b = await readJson<{ id: string; session_token: string; chat?: string }>(req); return json({ messages: pollMessages(db, b.id, b.session_token, undefined, typeof b.chat === "string" ? b.chat : undefined) }); }
+          case "/poll-messages": {
+            const b = await readJson<{ id: string; session_token: string; chat?: string }>(req);
+            if (typeof b.chat !== "string") return json({ messages: pollMessages(db, b.id, b.session_token) });
+            return json(pollMessagesScoped(db, b.id, b.session_token, undefined, b.chat));
+          }
           case "/list-chats":    return json(listChats(db, await readJson(req)));
           case "/chat-inbox":    return json({ entries: chatInbox(db) });
           case "/ack-messages":  return json(ackMessages(db, await readJson(req)));

@@ -5,9 +5,9 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import type { Database } from "bun:sqlite";
 import { existsSync, unlinkSync } from "node:fs";
 import {
-  initDb, registerPeer, listPeers, sendMessage, pollMessages, ackMessages, setPeerSummary,
+  initDb, registerPeer, listPeers, sendMessage, pollMessages, ackMessages, setPeerSummary, renamePeer,
   configureAddressing, listChats, chatInbox, MAX_POLL_BATCH, MAX_ACK_TOKENS,
-  deliverRelayed, listDirectoryPeers, snapshotSender, deliverNotice, type OutboundSender,
+  deliverRelayed, listDirectoryPeers, snapshotSender, deliverNotice, type OutboundSender, pollMessagesScoped,
 } from "../broker.ts";
 import type { ChatDirectory, ChatCandidate } from "../shared/chat-directory.ts";
 import { chatRouteId } from "../shared/broker-addressing.ts";
@@ -320,4 +320,31 @@ test("delivery notices survive a collected recipient row and are idempotent", ()
   // Re-registration with prev_id hands the notice over.
   const again = reg({ name: "m-claude", durable: false, prev_id: gone.id });
   expect(pollMessages(db, again.id, again.session_token).map((m) => m.text)).toEqual(["Delivery failed"]);
+});
+
+test("chat route UUIDs survive a rename of the owning agent", () => {
+  const val = hermesOwner();
+  const me = reg({ name: "m-claude" });
+  // Valentina's chat writes to me; the poll shows me the chat route UUID.
+  expect(send(val, "m-claude", "from email chat", { from_chat: "email shit" }).ok).toBe(true);
+  const [m] = pollMessages(db, me.id, me.session_token);
+  const routeId = m!.from_id;
+  expect(routeId).toBe(chatRouteId("valentina-hermes", "20261029_121224_2b437e"));
+  CHATS["valentina-hermes-2"] = CHATS["valentina-hermes"]!;
+  expect(renamePeer(db, { id: val.id, session_token: val.session_token, new_name: "valentina-hermes-2" }).ok).toBe(true);
+  // A reply to the old UUID, local or relayed, still reaches the same chat.
+  expect(send(me, routeId, "local reply").ok).toBe(true);
+  expect(deliverRelayed(db, { to_address: routeId, text: "relayed reply", from_id: "r1", from_chat: null, message_uid: "uid-rn", sent_at: "2026-10-31T00:00:00Z" }).ok).toBe(true);
+  expect(pollMessages(db, val.id, val.session_token, undefined, "20261029_121224_2b437e").map((x) => x.text)).toEqual(["local reply", "relayed reply"]);
+  // New mail from the same chat keeps the original UUID.
+  expect(send(val, "m-claude", "again", { from_chat: "email shit" }).ok).toBe(true);
+  expect(pollMessages(db, me.id, me.session_token)[0]!.from_id).toBe(routeId);
+  delete CHATS["valentina-hermes-2"];
+});
+
+test("a chat poll reports the resolved chat key, a general poll reports general", () => {
+  const val = hermesOwner();
+  expect(pollMessagesScoped(db, val.id, val.session_token, undefined, "Email Shit")).toMatchObject({ scope: "chat", chat_key: "20261029_121224_2b437e" });
+  expect(pollMessagesScoped(db, val.id, val.session_token, undefined, "general")).toMatchObject({ scope: "general", chat_key: null });
+  expect(pollMessagesScoped(db, val.id, val.session_token, undefined, "no such chat")).toMatchObject({ scope: "none", chat_key: null, messages: [] });
 });

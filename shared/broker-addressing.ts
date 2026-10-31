@@ -92,8 +92,17 @@ export function chatRouteId(peerName: string, chatKey: string): string {
 }
 
 export function recordChatRoute(db: Database, peerName: string, chatKey: string, title: string | null): string {
-  const id = chatRouteId(peerName, chatKey);
   const now = new Date().toISOString();
+  // One UUID per chat for good: after a rename the route row carries the new
+  // name but keeps the UUID it was created with, so reuse it.
+  const existing = db.query<{ id: string }, [string, string]>(
+    "SELECT id FROM chat_routes WHERE peer_name = ? AND chat_key = ? ORDER BY created_at LIMIT 1",
+  ).get(peerName, chatKey);
+  if (existing) {
+    db.query("UPDATE chat_routes SET title = COALESCE(?, title), last_used = ? WHERE id = ?").run(title, now, existing.id);
+    return existing.id;
+  }
+  const id = chatRouteId(peerName, chatKey);
   db.query(
     `INSERT INTO chat_routes (id, peer_name, chat_key, title, created_at, last_used)
      VALUES (?, ?, ?, ?, ?, ?)
