@@ -14,6 +14,9 @@
 // Without it, gateway+serve arbitrate via the name-claim election in
 // codex-server.ts — passive is the configuration-level override for hosts
 // that CAN distinguish their surfaces.
+// AGENT_PEERS_HERMES_ROLE=member (v3) keeps every tool but never takes the
+// durable name: the surface registers as a member of the profile mailbox, so
+// its chats send and receive per-chat mail while the gateway owns the name.
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";

@@ -1038,7 +1038,8 @@ async function main() {
   const sharedSecret = await waitForSharedSecret(
     process.env.AGENT_PEERS_SECRET_PATH ?? undefined,
   );
-  client = createClient(BROKER_URL, sharedSecret);
+  // Re-read on a 401, so a regenerated secret never locks this session out.
+  client = createClient(BROKER_URL, () => readSharedSecret(process.env.AGENT_PEERS_SECRET_PATH ?? undefined) ?? sharedSecret);
 
   // Hermes profiles set AGENT_PEERS_CWD in their MCP config; without it a
   // Hermes surface inherits whatever cwd its host process happened to have
@@ -1073,7 +1074,16 @@ async function main() {
   let persona: string | null = null;
   try { persona = resolvePeerIdentity({ cwd: myCwd, harness: RUNTIME_PEER_TYPE, explicitName: requestedName }).persona; } catch { /* identity is best effort */ }
   let mailboxOwner: string | undefined;
-  if (RUNTIME_PEER_TYPE === "hermes" && process.env.PEER_NAME && requestedName) {
+  if (RUNTIME_PEER_TYPE === "hermes" && process.env.PEER_NAME && requestedName && process.env.AGENT_PEERS_HERMES_ROLE === "member") {
+    // v3 member surface (Desktop and WebUI backends): full tools, but it never
+    // takes the profile's durable name, which stays with the always-on
+    // gateway. Its chats' mail lives in the profile mailbox. Older code
+    // treats "member" like any surface, so setting it early is harmless.
+    log(`hermes member surface: leaving "${requestedName}" to the gateway; registering as a member`);
+    mailboxOwner = requestedName;
+    requestedName = await defaultPeerName(myCwd, RUNTIME_PEER_TYPE);
+    requestDurable = false;
+  } else if (RUNTIME_PEER_TYPE === "hermes" && process.env.PEER_NAME && requestedName) {
     hermesClaims = new HermesNameClaims();
     if (await hermesClaims.tryAcquire(requestedName, process.pid)) {
       hermesClaimedName = requestedName;

@@ -28,6 +28,9 @@ test("wake mode: channel sessions stay on the channel, others use the socket", (
   expect(chooseWakeMode(sock, "claude")).toBe("socket");
   expect(chooseWakeMode({}, "claude")).toBe("none");
   expect(chooseWakeMode({ ...sock, AGENT_PEERS_SOCKET_WAKE: "0" }, "claude")).toBe("none");
+  // Desktop app sessions keep the rewake hook unless socket wake is opted in.
+  expect(chooseWakeMode({ ...sock, CLAUDE_CODE_ENTRYPOINT: "claude-desktop" }, "claude")).toBe("none");
+  expect(chooseWakeMode({ ...sock, CLAUDE_CODE_ENTRYPOINT: "claude-desktop", AGENT_PEERS_SOCKET_WAKE: "1" }, "claude")).toBe("socket");
   // A wrapper shell between Claude and the server still finds the channel flag.
   expect(chooseWakeMode(sock, ["/bin/sh -c bun claude-server.ts", "claude --channels server:agent-peers"])).toBe("channel");
   expect(chooseWakeMode(sock, ["/bin/sh -c bun claude-server.ts", "claude"])).toBe("socket");

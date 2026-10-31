@@ -135,3 +135,41 @@ test("list_chats returns exact addresses", async () => {
   expect(r).toContain(`valentina-hermes/${EMAIL}`);
   expect(r).toContain('"Instagram ads"');
 });
+
+test("a member surface keeps its tools, leaves the durable name to the owner and reads its chat's mail", async () => {
+  const memberTransport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(import.meta.dir, "..", "hermes-server.ts")],
+    cwd: root,
+    stderr: "pipe",
+    env: {
+      PATH: process.env.PATH ?? "",
+      AGENT_PEERS_ENABLED: "1",
+      AGENT_PEERS_PORT: String(broker.server.port),
+      AGENT_PEERS_DB: join(root, "peers.db"),
+      AGENT_PEERS_SECRET_PATH: join(root, "secret"),
+      AGENT_PEERS_STATE_DIR: join(root, "state-member"),
+      AGENT_PEERS_AUTO_SUMMARY: "0",
+      AGENT_PEERS_DISABLE_TAB_TITLE: "1",
+      PEER_NAME: "valentina-hermes",
+      AGENT_PEERS_HERMES_ROLE: "member",
+    },
+  });
+  const member = new Client({ name: "hermes-member-test", version: "1.0.0" });
+  await member.connect(memberTransport, { timeout: 8000 });
+  try {
+    const row = broker.db.query<{ name: string; durable: number; mailbox_owner: string | null; capabilities: string | null }, [number]>(
+      "SELECT name, durable, mailbox_owner, capabilities FROM peers WHERE pid = ?").get(memberTransport.pid!);
+    expect(row!.name).not.toBe("valentina-hermes");
+    expect(row!.durable).toBe(0);
+    expect(row!.mailbox_owner).toBe("valentina-hermes");
+    expect(row!.capabilities).toContain("chat-mail");
+    expect((await member.listTools()).tools.map((t) => t.name)).toContain("send_message");
+    expect(sendMessage(broker.db, { from_id: marco.id, session_token: marco.session_token, to_id_or_name: "valentina-hermes/Instagram ads", text: "B2 via member" }).ok).toBe(true);
+    const r = await member.callTool({ name: "check_messages", arguments: { chat: ADS } });
+    expect((r.content as { text: string }[]).map((c) => c.text).join("")).toContain("B2 via member");
+  } finally {
+    if (memberTransport.pid) { try { process.kill(memberTransport.pid, "SIGTERM"); } catch { /* gone */ } }
+    await member.close();
+  }
+}, 30000);

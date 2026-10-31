@@ -89,8 +89,11 @@ export function chooseWakeMode(env: NodeJS.ProcessEnv, ancestors: string | strin
   const channel = session !== null && hasAgentPeersChannel(session);
   if (env.AGENT_PEERS_SOCKET_WAKE === "0") return channel ? "channel" : "none";
   if (channel) return "channel";
-  if (env.CLAUDE_CODE_MESSAGING_SOCKET) return "socket";
-  return "none";
+  if (!env.CLAUDE_CODE_MESSAGING_SOCKET) return "none";
+  // The desktop app keeps the proven rewake hook until socket wake is proven
+  // there (plan WS3 item 2). AGENT_PEERS_SOCKET_WAKE=1 opts in for that proof.
+  if (env.CLAUDE_CODE_ENTRYPOINT === "claude-desktop" && env.AGENT_PEERS_SOCKET_WAKE !== "1") return "none";
+  return "socket";
 }
 
 /** The text one wake carries: a notice, never the bodies. check_messages
