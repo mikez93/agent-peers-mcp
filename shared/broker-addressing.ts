@@ -34,7 +34,7 @@ export interface AddressRow {
 export type AddressResolution =
   | { kind: "peer"; row: AddressRow; chatKey: string | null; chatTitle: string | null; notice?: string }
   | { kind: "remote"; host: string; name: string; chat: string | null }
-  | { kind: "error"; error: string; candidates?: string[] }
+  | { kind: "error"; code: "ambiguous" | "chat_miss" | "invalid"; error: string; candidates?: string[] }
   | { kind: "none" };
 
 export interface RemoteSendRequest {
@@ -63,6 +63,12 @@ export interface AddressingDeps {
   /** Federation hook: queue a message for another machine. Runs inside the
    *  send transaction, so it must be synchronous (write an outbox row). */
   remote?: (req: RemoteSendRequest) => RemoteSendResult;
+  /** Federation hook: a persisted remote UUID (peer or chat route) → its host. */
+  remoteRoute?: (id: string) => { host: string; name: string; chat: string | null } | null;
+  /** Federation hook: the sender of a relayed message, which has no local row. */
+  senderForMessage?: (messageId: number) => {
+    from_id: string; from_name: string; from_peer_type: string; from_cwd: string; from_summary: string;
+  } | null;
 }
 
 const ROW_COLS = "id, name, peer_type, cwd, git_root, persona, capabilities, mailbox_owner, durable, last_seen";
@@ -125,6 +131,17 @@ function deliverableRows(db: Database, staleCutoff: string): AddressRow[] {
   ).all(staleCutoff);
 }
 
+/** Every peer a name query could mean, most exact first (directory lookups). */
+export function findPeers(db: Database, query: string, staleCutoff: string): AddressRow[] {
+  const exact = rowByName(db, query);
+  if (exact) return [exact];
+  const q = query.toLowerCase();
+  const live = deliverableRows(db, staleCutoff);
+  const nocase = live.filter((r) => r.name.toLowerCase() === q);
+  if (nocase.length) return nocase;
+  return live.filter((r) => matchesPersonaQuery(r.name, q) || personaOf(r) === q);
+}
+
 /** Resolve the name part to exactly one peer, or explain why not. */
 export function resolvePeerName(db: Database, query: string, staleCutoff: string):
   { row: AddressRow } | { error: string; candidates?: string[] } | null {
@@ -170,13 +187,16 @@ export function resolveAddress(db: Database, raw: string, staleCutoff: string, d
   const route = getChatRoute(db, text);
   if (route) {
     const owner = rowByName(db, route.peer_name);
-    if (!owner) return { kind: "error", error: `the agent behind chat ${text} (${route.peer_name}) is not registered` };
+    if (!owner) return { kind: "error", code: "invalid", error: `the agent behind chat ${text} (${route.peer_name}) is not registered` };
     if (!hasCapability(owner, CHAT_MAIL_CAPABILITY)) {
       return { kind: "peer", row: owner, chatKey: null, chatTitle: null,
         notice: `${owner.name} has not switched to per-chat mail yet; delivered to its general mailbox` };
     }
     return { kind: "peer", row: owner, chatKey: route.chat_key, chatTitle: route.title };
   }
+
+  const remoteRoute = deps.remoteRoute?.(text);
+  if (remoteRoute) return { kind: "remote", host: remoteRoute.host, name: remoteRoute.name, chat: remoteRoute.chat };
 
   const parsed = parseAddress(text);
   if (!parsed.name) return { kind: "none" };
@@ -186,24 +206,24 @@ export function resolveAddress(db: Database, raw: string, staleCutoff: string, d
 
   const named = resolvePeerName(db, parsed.name, staleCutoff);
   if (!named) return { kind: "none" };
-  if ("error" in named) return { kind: "error", error: named.error, candidates: named.candidates };
+  if ("error" in named) return { kind: "error", code: "ambiguous", error: named.error, candidates: named.candidates };
   const row = named.row;
 
   if (!parsed.chat) return { kind: "peer", row, chatKey: null, chatTitle: null };
 
   if (row.peer_type !== "hermes") {
-    return { kind: "error", error: `chat addresses work only for Hermes agents; ${row.name} is a ${row.peer_type} peer. Send to ${row.name} without "/${parsed.chat}".` };
+    return { kind: "error", code: "invalid", error: `chat addresses work only for Hermes agents; ${row.name} is a ${row.peer_type} peer. Send to ${row.name} without "/${parsed.chat}".` };
   }
   const owner = mailboxOwnerRow(db, row);
   if (parsed.chat.toLowerCase() === GENERAL_MAILBOX) return { kind: "peer", row: owner, chatKey: null, chatTitle: null };
   if (!deps.chats) {
-    return { kind: "error", error: `chat lookup is not available on this machine; send to ${owner.name} or use its chat ID` };
+    return { kind: "error", code: "invalid", error: `chat lookup is not available on this machine; send to ${owner.name} or use its chat ID` };
   }
   const res = deps.chats.resolve(owner, parsed.chat);
   if (!res.ok) {
     const candidates = res.candidates.map((c) => chatAddress(owner.name, c, res.candidates));
     const hint = candidates.length ? ` Closest: ${candidates.map((c) => `"${c}"`).join(", ")}.` : "";
-    return { kind: "error", error: `${res.error}${hint} Nothing was sent or woken; resend to an exact chat address.`, candidates };
+    return { kind: "error", code: "chat_miss", error: `${res.error}${hint} Nothing was sent or woken; resend to an exact chat address.`, candidates };
   }
   if (!hasCapability(owner, CHAT_MAIL_CAPABILITY)) {
     return { kind: "peer", row: owner, chatKey: null, chatTitle: null,

@@ -20,7 +20,7 @@ import { findConversation, hasConversationSchema, withConversationFence } from "
 import { dormantMailboxNotice, type ConversationOwner } from "./shared/hermes-conversation-bindings.ts";
 import { personaOf, withPersonaPrefix } from "./shared/peer-address.ts";
 import {
-  CHAT_MAIL_CAPABILITY, chatRouteId, hasCapability, mailboxOwnerRow, recordChatRoute, resolveAddress,
+  CHAT_MAIL_CAPABILITY, chatRouteId, findPeers, hasCapability, mailboxOwnerRow, recordChatRoute, resolveAddress,
   resolvePeerName, resolvePollScope, resolveSenderChat, rowByName,
   type AddressRow, type AddressingDeps,
 } from "./shared/broker-addressing.ts";
@@ -854,8 +854,8 @@ function sendMessageInner(db: Database, req: SendMessageRequest): SendMessageRes
       const row = db.query<{ last_seen: string; name: string }, [string, string]>(
         "SELECT last_seen, name FROM peers WHERE id = ? AND session_token = ?"
       ).get(req.from_id, req.session_token);
-      if (!row) return { ok: false, error: `unauthorized sender: ${req.from_id}` };
-      return { ok: false, error: `sender stale: ${row.name}` };
+      if (!row) return { ok: false, code: "unauthorized", error: `unauthorized sender: ${req.from_id}` };
+      return { ok: false, code: "unauthorized", error: `sender stale: ${row.name}` };
     }
 
     const conversation = findConversation(db, req.to_id_or_name);
@@ -890,13 +890,13 @@ function sendMessageInner(db: Database, req: SendMessageRequest): SendMessageRes
     //    message waits in its mailbox and the reclaim path hands it over on
     //    the peer's next registration.
     const resolution = resolveAddress(db, req.to_id_or_name, staleCutoff, addressingDeps);
-    if (resolution.kind === "none") return { ok: false, error: `unknown peer: ${req.to_id_or_name}` };
+    if (resolution.kind === "none") return { ok: false, code: "unknown_peer", error: `unknown peer: ${req.to_id_or_name}` };
     if (resolution.kind === "error") {
-      return { ok: false, error: resolution.error, ...(resolution.candidates?.length ? { candidates: resolution.candidates } : {}) };
+      return { ok: false, code: resolution.code, error: resolution.error, ...(resolution.candidates?.length ? { candidates: resolution.candidates } : {}) };
     }
     if (resolution.kind === "remote") {
       if (!addressingDeps.remote) {
-        return { ok: false, error: `unknown machine "${resolution.host}": cross-machine delivery is not enabled on this broker` };
+        return { ok: false, code: "unknown_peer", error: `unknown machine "${resolution.host}": cross-machine delivery is not enabled on this broker` };
       }
       return addressingDeps.remote({
         db, fromId: req.from_id, fromName: sender.name, host: resolution.host, name: resolution.name,
@@ -909,50 +909,107 @@ function sendMessageInner(db: Database, req: SendMessageRequest): SendMessageRes
     if (senderChat) recordChatRoute(db, senderChat.owner.name, senderChat.chatKey, senderChat.title);
     if (resolution.chatKey) recordChatRoute(db, target.name, resolution.chatKey, resolution.chatTitle);
 
-    const inserted = db.query<
-      { id: number; to_id: string },
-      [string, string, string, string, string | null, string | null, string, string, string]
-    >(
-      `INSERT INTO messages (from_id, to_id, text, sent_at, message_uid, to_chat, from_chat)
-       SELECT ?, p.id, ?, ?, ?, ?, ?
-       FROM peers p
-       WHERE p.id = ?
-         AND (p.last_seen >= ? OR p.durable = 1)
-         AND (
-           p.last_seen >= ?
-           OR (SELECT COUNT(*) FROM messages m
-                WHERE m.to_id = p.id AND m.acked = 0) < ${MAX_QUEUED_PER_DURABLE_PEER}
-         )
-       RETURNING id, to_id`
-    ).get(
-      req.from_id, req.text, nowStr, randomUUID(), resolution.chatKey, senderChat?.chatKey ?? null,
-      target.id, staleCutoff, staleCutoff,
-    );
-
-    if (!inserted) {
-      // Distinguish the failure modes for a usable error.
-      const backlog = db.query<{ n: number }, [string]>(
-        "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND acked = 0"
-      ).get(target.id);
-      if ((backlog?.n ?? 0) >= MAX_QUEUED_PER_DURABLE_PEER) {
-        return {
-          ok: false,
-          error: `target peer mailbox full: ${target.name} ` +
-                 `(${backlog?.n} undelivered; it has not polled since ${target.last_seen})`,
-        };
-      }
-      return { ok: false, error: `target peer stale: ${target.name}` };
-    }
+    const outcome = insertResolvedMessage(db, {
+      fromId: req.from_id, target, text: req.text, sentAt: nowStr, messageUid: randomUUID(),
+      toChat: resolution.chatKey, fromChat: senderChat?.chatKey ?? null, staleCutoff,
+    });
+    if (!outcome.ok) return outcome;
     const exactName = req.to_id_or_name === target.id || req.to_id_or_name === target.name;
     const notices = [
       resolution.notice,
       !exactName ? `delivered to ${target.name}${resolution.chatKey ? `, chat "${resolution.chatTitle ?? resolution.chatKey}"` : ""}` : null,
       req.from_chat && !senderChat ? `could not identify your chat "${req.from_chat}", so replies go to your general mailbox` : null,
     ].filter(Boolean);
-    return { ok: true, message_id: inserted.id, ...(notices.length ? { notice: notices.join("; ") } : {}) };
+    return { ok: true, message_id: outcome.message_id, ...(notices.length ? { notice: notices.join("; ") } : {}) };
   });
 
   return tx();
+}
+
+// ----- v3: shared insertion, relayed delivery, directory -----
+
+/** Insert one message for an already-resolved local target. Deliverability
+ *  (live, or durable with room) is checked in the same INSERT, so nothing can
+ *  unregister between the check and the write. */
+function insertResolvedMessage(db: Database, m: {
+  fromId: string; target: AddressRow; text: string; sentAt: string; messageUid: string;
+  toChat: string | null; fromChat: string | null; staleCutoff: string;
+}): SendMessageResponse {
+  const inserted = db.query<
+    { id: number },
+    [string, string, string, string, string | null, string | null, string, string, string]
+  >(
+    `INSERT INTO messages (from_id, to_id, text, sent_at, message_uid, to_chat, from_chat)
+     SELECT ?, p.id, ?, ?, ?, ?, ?
+     FROM peers p
+     WHERE p.id = ?
+       AND (p.last_seen >= ? OR p.durable = 1)
+       AND (
+         p.last_seen >= ?
+         OR (SELECT COUNT(*) FROM messages m
+              WHERE m.to_id = p.id AND m.acked = 0) < ${MAX_QUEUED_PER_DURABLE_PEER}
+       )
+     RETURNING id`
+  ).get(
+    m.fromId, m.text, m.sentAt, m.messageUid, m.toChat, m.fromChat,
+    m.target.id, m.staleCutoff, m.staleCutoff,
+  );
+  if (inserted) return { ok: true, message_id: inserted.id };
+  const backlog = db.query<{ n: number }, [string]>(
+    "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND acked = 0"
+  ).get(m.target.id);
+  if ((backlog?.n ?? 0) >= MAX_QUEUED_PER_DURABLE_PEER) {
+    return {
+      ok: false, code: "mailbox_full",
+      error: `target peer mailbox full: ${m.target.name} ` +
+             `(${backlog?.n} undelivered; it has not polled since ${m.target.last_seen})`,
+    };
+  }
+  return { ok: false, code: "stale_peer", error: `target peer stale: ${m.target.name}` };
+}
+
+export interface RelayedMessage {
+  to_address: string;
+  text: string;
+  /** The sender's UUID on its own machine (or its chat-route UUID). */
+  from_id: string;
+  from_chat: string | null;
+  message_uid: string;
+  sent_at: string;
+}
+
+/** Deliver a message relayed from another machine. Resolution is LOCAL ONLY
+ *  (any host part is treated as this machine), so a relay can never bounce
+ *  between brokers. The federation layer dedupes on message_uid first. */
+export function deliverRelayed(db: Database, m: RelayedMessage): SendMessageResponse {
+  const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  return db.transaction((): SendMessageResponse => {
+    const localDeps: AddressingDeps = { chats: addressingDeps.chats, isLocalHost: () => true };
+    const resolution = resolveAddress(db, m.to_address, staleCutoff, localDeps);
+    if (resolution.kind === "none" || resolution.kind === "remote") {
+      return { ok: false, code: "unknown_peer", error: `unknown peer: ${m.to_address}` };
+    }
+    if (resolution.kind === "error") {
+      return { ok: false, code: resolution.code, error: resolution.error, ...(resolution.candidates?.length ? { candidates: resolution.candidates } : {}) };
+    }
+    if (resolution.chatKey) recordChatRoute(db, resolution.row.name, resolution.chatKey, resolution.chatTitle);
+    const outcome = insertResolvedMessage(db, {
+      fromId: m.from_id, target: resolution.row, text: m.text, sentAt: m.sent_at || nowIso(),
+      messageUid: m.message_uid, toChat: resolution.chatKey, fromChat: m.from_chat, staleCutoff,
+    });
+    if (outcome.ok && resolution.notice) return { ...outcome, notice: resolution.notice };
+    return outcome;
+  })();
+}
+
+/** Local directory for other machines: live plus retained durable agents,
+ *  persona statuses, never tokens, never a fan-out of its own. */
+export function listDirectoryPeers(db: Database, req: { query?: string } = {}): Peer[] {
+  const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  const ids = req.query && req.query.trim()
+    ? findPeers(db, req.query.trim(), staleCutoff).map((r) => r.id)
+    : db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE last_seen >= ? OR durable = 1").all(staleCutoff).map((r) => r.id);
+  return ids.map((id) => getPeer(db, id)).filter((p): p is Peer => p !== null).map(withPersonaSummary);
 }
 
 // ----- v3: chat discovery and the Hermes chat inbox -----
@@ -1089,7 +1146,8 @@ function pollMessagesInner(db: Database, id: string, session_token: string, chat
       const lease = randomUUID();
       db.query("UPDATE messages SET lease_token = ?, lease_expires_at = ? WHERE id = ?")
         .run(lease, leaseUntil, row.id);
-      const sender = getPeer(db, row.from_id);
+      const relayed = addressingDeps.senderForMessage?.(row.id) ?? null;
+      const sender = relayed ? null : getPeer(db, row.from_id);
       const shown = sender ? withPersonaSummary(sender) : null;
       let fromId = row.from_id;
       let fromName = sender?.name ?? "(gone)";
@@ -1104,12 +1162,17 @@ function pollMessagesInner(db: Database, id: string, session_token: string, chat
         fromName = `${ownerName}/${row.from_chat}`;
         fromSummary = `chat "${title ?? row.from_chat}" — ${fromSummary}`;
       }
+      if (relayed) {
+        fromId = relayed.from_id;
+        fromName = relayed.from_name;
+        fromSummary = relayed.from_summary;
+      }
       result.push({
         id: row.id,
         from_id: fromId,
         from_name: fromName,
-        from_peer_type: sender?.peer_type ?? "claude",
-        from_cwd: sender?.cwd ?? "",
+        from_peer_type: (relayed?.from_peer_type ?? sender?.peer_type ?? "claude") as LeasedMessage["from_peer_type"],
+        from_cwd: relayed?.from_cwd ?? sender?.cwd ?? "",
         from_summary: fromSummary,
         to_id: row.to_id,
         text: row.text,

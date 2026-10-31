@@ -7,6 +7,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import {
   initDb, registerPeer, listPeers, sendMessage, pollMessages, ackMessages, setPeerSummary,
   configureAddressing, listChats, chatInbox, MAX_POLL_BATCH, MAX_ACK_TOKENS,
+  deliverRelayed, listDirectoryPeers,
 } from "../broker.ts";
 import type { ChatDirectory, ChatCandidate } from "../shared/chat-directory.ts";
 import { chatRouteId } from "../shared/broker-addressing.ts";
@@ -233,4 +234,50 @@ test("polls are bounded and oversized acks are refused", () => {
   for (let i = 0; i < MAX_POLL_BATCH + 5; i++) send(me, "y-claude", `m${i}`);
   expect(pollMessages(db, you.id, you.session_token).length).toBe(MAX_POLL_BATCH);
   expect(() => ackMessages(db, { id: you.id, session_token: you.session_token, lease_tokens: Array(MAX_ACK_TOKENS + 1).fill("x") })).toThrow();
+});
+
+test("relayed delivery resolves locally only and shows the remote sender", () => {
+  const val = hermesOwner();
+  configureAddressing({
+    chats: fakeChats,
+    senderForMessage: (id) => id > 0 ? { from_id: "remote-uuid-1", from_name: "kepler@mike-macbook", from_peer_type: "claude", from_cwd: "/w/k", from_summary: "Kepler: hi" } : null,
+  });
+  const r = deliverRelayed(db, { to_address: "valentina@mike-mac-studio/email shit", text: "relayed", from_id: "remote-uuid-1", from_chat: null, message_uid: "uid-1", sent_at: "2026-10-31T00:00:00Z" });
+  expect(r.ok).toBe(true);
+  const [m] = pollMessages(db, val.id, val.session_token, undefined, "email shit");
+  expect(m!.from_name).toBe("kepler@mike-macbook");
+  expect(m!.from_id).toBe("remote-uuid-1");
+  const miss = deliverRelayed(db, { to_address: "valentina/emai", text: "x", from_id: "r", from_chat: null, message_uid: "uid-2", sent_at: "" });
+  expect(miss.code).toBe("chat_miss");
+  expect(deliverRelayed(db, { to_address: "nobody", text: "x", from_id: "r", from_chat: null, message_uid: "uid-3", sent_at: "" }).code).toBe("unknown_peer");
+});
+
+test("remote UUID routes go to the federation hook before name parsing", () => {
+  const me = reg({ name: "m-claude" });
+  const seen: string[] = [];
+  configureAddressing({
+    chats: fakeChats,
+    remoteRoute: (id) => id === "11111111-2222-3333-4444-555555555555" ? { host: "studio", name: "ezra-hermes", chat: null } : null,
+    remote: (r) => { seen.push(`${r.name}@${r.host}`); return { ok: true, notice: "queued" }; },
+  });
+  expect(send(me, "11111111-2222-3333-4444-555555555555").ok).toBe(true);
+  expect(seen).toEqual(["ezra-hermes@studio"]);
+});
+
+test("directory lists live and retained durable agents with persona statuses", () => {
+  reg({ name: "marco-imekka-director-ops-droid", peer_type: "droid", git_root: "/w/imekka-director-ops", summary: "x" });
+  reg({ name: "marco-hermes", peer_type: "hermes", cwd: "/h/marco" });
+  reg({ name: "eph-claude", durable: false });
+  // Make the durable Hermes row stale: it must still be listed.
+  db.query("UPDATE peers SET last_seen = '2000-01-01T00:00:00.000Z' WHERE name = 'marco-hermes'").run();
+  const all = listDirectoryPeers(db).map((p) => p.name).sort();
+  expect(all).toEqual(["eph-claude", "marco-hermes", "marco-imekka-director-ops-droid"]);
+  expect(listDirectoryPeers(db, { query: "marco" }).map((p) => p.name).sort()).toEqual(["marco-hermes", "marco-imekka-director-ops-droid"]);
+  expect(listDirectoryPeers(db, { query: "marco" }).find((p) => p.name.endsWith("droid"))!.summary).toBe("Marco: x");
+  expect(JSON.stringify(listDirectoryPeers(db))).not.toContain("session_token");
+});
+
+test("unknown names carry a machine-readable code for the federation fallback", () => {
+  const me = reg({ name: "m-claude" });
+  expect(send(me, "valentina").code).toBe("unknown_peer");
 });

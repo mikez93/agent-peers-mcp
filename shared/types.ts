@@ -120,6 +120,9 @@ export interface SendMessageResponse {
   /** v3: when an address was ambiguous or a chat title missed, the exact
    *  addresses the sender can resend to. */
   candidates?: string[];
+  /** v3: machine-readable failure reason. "unknown_peer" lets the broker's
+   *  federation layer try other machines; old clients ignore it. */
+  code?: "unknown_peer" | "stale_peer" | "mailbox_full" | "ambiguous" | "chat_miss" | "invalid" | "unauthorized";
 }
 
 export interface PollMessagesRequest {
