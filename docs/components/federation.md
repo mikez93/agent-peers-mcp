@@ -47,8 +47,8 @@ For example, a fleet map can contain:
 
 ```json
 {
-  "macbook": "https://macbook.example-tailnet.ts.net/agent-peers",
-  "studio": "https://studio.example-tailnet.ts.net/agent-peers"
+  "macbook": "https://macbook.example-tailnet.ts.net",
+  "studio": "https://studio.example-tailnet.ts.net"
 }
 ```
 
@@ -57,6 +57,23 @@ These are placeholder URLs, not installed destinations. Base URLs do not include
 `/federation/directory`, `/federation/relay`, and `/federation/health` paths.
 The broker stays bound to localhost. Relay requests do not follow redirects.
 Plain HTTP is accepted only for loopback fixtures.
+
+Expose only the federation mount, not the broker's root or whole TCP port:
+
+```sh
+tailscale serve --bg --https=443 --set-path=/federation http://127.0.0.1:7900/federation
+```
+
+This is a deployment recipe, not an automatically executed setup step. Check
+existing Serve mappings first and preserve unrelated services; do not use
+`serve reset` or Funnel. The matching removal is
+`tailscale serve --https=443 --set-path=/federation off`, not a global reset.
+At cutover, verify the federation health route with the separate credential,
+and verify that local-only paths such as `/register` are not exposed by this
+mount. Docs/CLI syntax is not live proxy-path or authorization proof.
+
+Reference: [Tailscale Serve CLI](https://tailscale.com/docs/reference/tailscale-cli/serve),
+checked with the installed `tailscale serve --help` on 2026-10-31.
 
 Do not reuse, rotate, or replace the local broker secret during this rollout.
 Old running adapters cache it. The federation secret is reread on every incoming

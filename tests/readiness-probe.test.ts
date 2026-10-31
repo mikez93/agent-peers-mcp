@@ -10,14 +10,13 @@ import { createReadinessProbe, expectedDbIdentityHash, SECRET_HEADER } from "../
 
 const GOOD_SECRET = "s".repeat(40);
 const DB_PATH = "/tmp/probe-test.db";
-const PORT = 7961;
 
 type ReadyBody = { ok?: boolean; protocol?: number; owner?: string; db_id?: string };
 let readyBody: ReadyBody | null = { ok: true, protocol: 1, owner: "launchd", db_id: expectedDbIdentityHash(DB_PATH) };
 let requireSecret = true;
 
 const server = Bun.serve({
-  port: PORT,
+  port: 0,
   hostname: "127.0.0.1",
   fetch(req) {
     const url = new URL(req.url);
@@ -35,7 +34,7 @@ const server = Bun.serve({
 afterAll(() => server.stop(true));
 
 function probe(secret: string | null) {
-  return createReadinessProbe(`http://127.0.0.1:${PORT}`, () => secret, {
+  return createReadinessProbe(`http://127.0.0.1:${server.port}`, () => secret, {
     expectedDbPath: () => DB_PATH,
   });
 }

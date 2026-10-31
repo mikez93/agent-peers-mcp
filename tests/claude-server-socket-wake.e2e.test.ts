@@ -11,7 +11,6 @@ import { join } from "node:path";
 import { startBroker } from "../broker.ts";
 import { createClient } from "../shared/broker-client.ts";
 
-const PORT = 7931;
 const dir = mkdtempSync(join(tmpdir(), "ap-claude-e2e-"));
 const DB = join(dir, "broker.db");
 const SECRET = join(dir, "secret");
@@ -26,12 +25,13 @@ let client: ReturnType<typeof createClient>;
 let sender: { id: string; session_token: string };
 
 beforeAll(async () => {
-  handle = startBroker(PORT, DB, SECRET);
-  client = createClient(`http://127.0.0.1:${PORT}`, readFileSync(SECRET, "utf8").trim());
+  handle = startBroker(0, DB, SECRET);
+  client = createClient(`http://127.0.0.1:${handle.server.port}`, readFileSync(SECRET, "utf8").trim());
   const reg = await client.register({ peer_type: "codex", pid: process.pid, cwd: "/tmp", git_root: null, tty: null, summary: "", name: "e2e-sender" });
   sender = { id: reg.id, session_token: reg.session_token };
 });
 afterAll(() => {
+  if (!handle) return;
   clearInterval(handle.gcTimer);
   handle.server.stop(true);
   handle.db.close();
@@ -54,7 +54,7 @@ function launch(name: string, stateDir: string, socketPath: string, flags: strin
     env: {
       PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "",
       AGENT_PEERS_ENABLED: "1", AGENT_PEERS_SPAWN_BROKER: "1",
-      AGENT_PEERS_PORT: String(PORT), AGENT_PEERS_DB: DB, AGENT_PEERS_SECRET_PATH: SECRET,
+      AGENT_PEERS_PORT: String(handle.server.port), AGENT_PEERS_DB: DB, AGENT_PEERS_SECRET_PATH: SECRET,
       AGENT_PEERS_STATE_DIR: stateDir, AGENT_PEERS_DISABLE_TAB_TITLE: "1",
       AGENT_PEERS_IDLE_POLL_MS: "200", PEER_NAME: name,
       CLAUDE_CODE_MESSAGING_SOCKET: socketPath, CLAUDE_CODE_MESSAGING_TOKEN: "tok-e2e",

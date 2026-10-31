@@ -4,18 +4,39 @@
 // with queued mail, and rollback (federation off keeps relayed sender names).
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { join } from "node:path";
-import { createClient, SECRET_HEADER } from "../shared/broker-client.ts";
+import { createClient, expectedDbIdentityHash, SECRET_HEADER } from "../shared/broker-client.ts";
 import { readSharedSecret } from "../shared/shared-secret.ts";
 
 const BROKER = join(import.meta.dir, "..", "broker.ts");
 const root = mkdtempSync(join(tmpdir(), "fed-int-"));
-const PORTS = { alpha: 7941, beta: 7942 } as const;
-type Host = keyof typeof PORTS;
+type Host = "alpha" | "beta";
+const PORTS: Record<Host, number> = { alpha: 0, beta: 0 };
 const FED_SECRET = "f".repeat(16) + "e".repeat(16) + "d".repeat(16);
 const procs: Partial<Record<Host, ReturnType<typeof Bun.spawn>>> = {};
+
+async function allocatePorts() {
+  // Concurrent worktrees run this suite too. Hold both ephemeral ports until
+  // allocated so they are distinct; authenticated readiness catches bind races.
+  const reservations = await Promise.all((["alpha", "beta"] as const).map(async host => {
+    const server = createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("missing test listener port");
+    PORTS[host] = address.port;
+    return server;
+  }));
+  await Promise.all(reservations.map(server => new Promise<void>((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve());
+  })));
+}
 
 function home(host: Host) { return join(root, host); }
 function setupHome(host: Host) {
@@ -30,8 +51,8 @@ function setupHome(host: Host) {
 
 async function start(host: Host, federation = true) {
   const h = home(host);
-  procs[host] = Bun.spawn(["bun", BROKER], {
-    stdout: "ignore", stderr: "ignore",
+  const child = Bun.spawn([process.execPath, BROKER], {
+    stdout: "ignore", stderr: "pipe",
     env: {
       PATH: process.env.PATH ?? "", HOME: h,
       AGENT_PEERS_PORT: String(PORTS[host]),
@@ -40,9 +61,23 @@ async function start(host: Host, federation = true) {
       ...(federation ? { AGENT_PEERS_FEDERATION: "1" } : {}),
     },
   });
+  procs[host] = child;
   const end = Date.now() + 10000;
   while (Date.now() < end) {
-    try { if ((await fetch(`http://127.0.0.1:${PORTS[host]}/health`)).ok) return; } catch { /* starting */ }
+    if (child.exitCode !== null) {
+      throw new Error(`${host} broker exited ${child.exitCode}: ${await new Response(child.stderr).text()}`);
+    }
+    const secret = readSharedSecret(join(h, "secret"));
+    try {
+      if (secret) {
+        const response = await fetch(`http://127.0.0.1:${PORTS[host]}/ready`, {
+          headers: { [SECRET_HEADER]: secret }, signal: AbortSignal.timeout(500),
+        });
+        const body = await response.json() as { ok?: boolean; protocol?: number; db_id?: string };
+        if (response.ok && body.ok && body.protocol === 1
+          && body.db_id === expectedDbIdentityHash(join(h, "peers.db"))) return;
+      }
+    } catch { /* starting */ }
     await Bun.sleep(100);
   }
   throw new Error(`${host} broker did not start`);
@@ -74,6 +109,7 @@ let vector: { id: string; session_token: string };
 let kepler: { id: string; session_token: string };
 
 beforeAll(async () => {
+  await allocatePorts();
   setupHome("alpha");
   setupHome("beta");
   await start("alpha");
@@ -181,3 +217,50 @@ test("rollback: federation off keeps relayed senders and local service", async (
   expect(sent.ok).toBe(false);
   expect(sent.error).toContain("not enabled");
 }, 90000);
+
+test("SIGTERM aborts an active relay before closing the DB and pending mail recovers", async () => {
+  await stop("alpha");
+  await start("alpha"); // Re-enable after the preceding rollback test.
+  await stop("beta");
+  let admitted = false;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const slow = Bun.serve({ hostname: "127.0.0.1", port: PORTS.beta, fetch: async req => {
+    if (new URL(req.url).pathname === "/federation/relay") {
+      await req.text();
+      admitted = true;
+      await held;
+    }
+    return Response.json({ error: "synthetic unavailable relay" }, { status: 503 });
+  } });
+  const text = "survives shutdown during active relay";
+  try {
+    await api("alpha").heartbeat({ id: vector.id, session_token: vector.session_token });
+    const sent = await api("alpha").sendMessage({ from_id: vector.id, session_token: vector.session_token,
+      to_id_or_name: "kepler-claude@beta", text });
+    expect(sent.ok).toBe(true);
+    await until(async () => admitted, 5000);
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Less than the normal 2 s relay timeout: shutdown must actively abort it.
+      await Promise.race([stop("alpha"), new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("in-flight relay was not aborted on shutdown")), 1500);
+      })]);
+    } finally { if (deadline) clearTimeout(deadline); }
+    const db = new Database(join(home("alpha"), "peers.db"), { readonly: true });
+    try {
+      expect(db.query("SELECT status FROM federation_outbox WHERE id=?").get(-sent.message_id!))
+        .toEqual({ status: "pending" });
+    } finally { db.close(); }
+  } finally {
+    release();
+    slow.stop(true);
+  }
+  await start("beta");
+  await start("alpha");
+  const mail = await until(async () => {
+    const messages = await api("beta").pollMessages({ id: kepler.id, session_token: kepler.session_token });
+    return messages.find(message => message.text === text) ?? null;
+  });
+  expect(mail.from_id).toBe(vector.id);
+}, 30000);
