@@ -1,0 +1,6 @@
+name: agent-peers-desktop-wake
+version: 0.1.0
+description: "Wakes a Hermes chat that is open in this Desktop/TUI backend when Agent Peers mail arrives for that chat. Inert until opted in."
+author: "Vector (fleet)"
+kind: standalone
+provides_hooks: []

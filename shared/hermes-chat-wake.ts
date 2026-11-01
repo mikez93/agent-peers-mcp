@@ -30,14 +30,22 @@
 //
 // State is daemon-owned JSON under <stateDir>/chat-wake/<profile>/: one ledger per chat
 // and per-attempt CLI logs under logs/. The broker stores no wake state.
+//
+// A chat open in Hermes Desktop is woken by the in-process plugin
+// hermes-plugins/agent-peers-desktop-wake instead. It shares these ledgers: it records a
+// desktop_attempt (intent, then accepted or unknown) around ctx.inject_message, and both
+// executors take <ledger>.lock for every read-modify-write. While a desktop attempt is open
+// this driver never launches; it settles the attempt from durable evidence instead
+// (classifyDesktopAttempt, mirrored in the plugin). An unknown attempt blocks every re-wake
+// of that chat until evidence or an operator (`cli.ts hermes-desktop-clear`) resolves it.
 
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { open, readdir, readFile } from "node:fs/promises";
+import { open, readdir, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { GENERAL_MAILBOX, type ChatCandidate, type ChatDirectory, type ChatPeer, type ChatResolution } from "./chat-directory.ts";
 import { atomicWriteJson, ensurePrivateDir } from "./file-state.ts";
 import { personaOf } from "./peer-address.ts";
@@ -183,6 +191,22 @@ export function lineageTip(db: Database, rootId: string): string {
   return current?.id ?? rootId;
 }
 
+/** Every stored session of a chat, root to tip (compression continuations only). */
+export function lineageIds(db: Database, rootId: string): string[] {
+  const ids = [rootId];
+  let current = getRow(db, rootId);
+  const seen = new Set<string>([rootId]);
+  while (current && current.end_reason === "compression") {
+    const children = db.query(`SELECT ${ROW_SQL} FROM sessions WHERE parent_session_id = ? ORDER BY started_at ASC`).all(current.id) as SessionRow[];
+    const next = children.find((child) => !isForkChild(child));
+    if (!next || seen.has(next.id)) break;
+    seen.add(next.id);
+    ids.push(next.id);
+    current = next;
+  }
+  return ids;
+}
+
 // ---------------------------------------------------------------------------
 // Registry: who holds the chat open right now
 
@@ -195,6 +219,12 @@ function readRegistry(hermesHome: string, profile: string): RegistryEntry[] {
   } catch {
     return [];
   }
+}
+
+/** Whether process `pid` holds the active-session slot of any of `sessionIds`. */
+export function registryHeldBy(hermesHome: string, profile: string, sessionIds: string[], pid: number): boolean {
+  const wanted = new Set(sessionIds);
+  return readRegistry(hermesHome, profile).some((e) => wanted.has(String(e.session_id ?? "")) && Number(e.pid) === pid);
 }
 
 /** The live holder of a chat's active-session slot, or null. A dead pid is a stale entry, not a holder. */
@@ -324,7 +354,8 @@ export type HermesChatWakeState =
   | "launched"         // this call started a hermes turn
   | "running"          // an earlier attempt is still in flight
   | "done"             // the latest mail (max_id) has been handled by a completed turn
-  | "waiting_desktop"  // chat open in Desktop or a terminal; re-checked every tick
+  | "waiting_desktop"  // chat open in Desktop or a terminal, or a desktop wake is open; re-checked every tick
+  | "desktop_unknown"  // a desktop-plugin wake may or may not have run; no re-wake until resolved
   | "waiting_turn"     // another executor holds the turn lease; re-checked every tick
   | "waiting_gateway"  // the gateway already holds work for this chat; re-checked every tick
   | "cooldown"         // a launch failed; next attempt at nextAttemptAt
@@ -359,6 +390,43 @@ export interface HermesChatWakeLedger {
   last_admission_id: string | null;
   detail: string;
   updated_at: string;
+  /** Open wake by the in-process Desktop plugin; while set, this driver never launches. */
+  desktop_attempt?: HermesDesktopAttempt | null;
+  last_desktop_attempt?: HermesDesktopAttemptRecord | null;
+}
+
+export type HermesDesktopAttemptState = "intent" | "accepted" | "unknown";
+
+/** Written by the plugin before ctx.inject_message ("intent") and after it returned True
+ *  ("accepted": queued in the open chat, not handled). Same JSON in Python and TypeScript. */
+export interface HermesDesktopAttempt {
+  attempt_id: string;
+  chat_key: string;
+  session_key: string;   // the stored session id the Desktop backend hosts (its registry entry)
+  max_id: number;        // broker mail up to this id is what the wake covers
+  host_pid: number;      // the Desktop backend process whose in-memory queue holds the wake
+  state: HermesDesktopAttemptState;
+  created_at: string;
+  accepted_at: string | null;
+  detail: string;
+}
+
+export interface HermesDesktopAttemptRecord extends HermesDesktopAttempt {
+  outcome: "handled" | "lost" | "not_submitted" | "cleared" | "cleared_handled";
+  resolved_at: string;
+}
+
+/** handled: the marked wake reached a completed turn. running: that turn started and its host is
+ *  alive. pending: accepted and still queued in a live host. lost: no turn started and the host's
+ *  in-memory queue is gone. unknown: model work may have happened; never re-wake automatically. */
+export type HermesDesktopVerdict = "handled" | "running" | "pending" | "lost" | "unknown";
+
+export const DESKTOP_INTENT_UNKNOWN_MS = 60_000;
+export const DESKTOP_CLOSED_GRACE_MS = 120_000;
+export const LEDGER_LOCK_STALE_MS = 30_000;
+
+export function desktopWakeMarker(attemptId: string): string {
+  return `[agent-peers-wake ${attemptId}]`;
 }
 
 export interface HermesChatWakeRequest {
@@ -418,6 +486,100 @@ function emptyLedger(req: HermesChatWakeRequest, now: Date): HermesChatWakeLedge
 
 async function readJson<T>(path: string): Promise<T | null> {
   try { return JSON.parse(await readFile(path, "utf8")) as T; } catch { return null; }
+}
+
+// ---------------------------------------------------------------------------
+// Desktop-plugin attempts (same rules as hermes-plugins/agent-peers-desktop-wake)
+
+const COMPLETED_ASSISTANT_SQL = "role = 'assistant' AND finish_reason IS NOT NULL AND finish_reason NOT IN ('tool_calls', 'tool_use')";
+
+/**
+ * Settle a desktop attempt from durable evidence only. The marked user row is persisted when
+ * the host drains the queued wake into a turn; a completed assistant row after it means the
+ * turn ended. Without the row, a dead host means the in-memory queue died with it (lost); a
+ * live host that never confirmed the call, or that no longer holds the chat after the grace
+ * period, is unknown. Unknown never resolves by timeout.
+ */
+export function classifyDesktopAttempt(
+  db: Database | null, attempt: HermesDesktopAttempt, hostAlive: boolean, heldByHost: boolean, nowMs: number,
+): HermesDesktopVerdict {
+  if (db) {
+    const ids = lineageIds(db, lineageRoot(db, attempt.chat_key));
+    const marks = ids.map(() => "?").join(",");
+    const marker = db.query(`SELECT id FROM messages WHERE session_id IN (${marks}) AND role = 'user' AND instr(content, ?) > 0 ORDER BY id LIMIT 1`)
+      .get(...ids, desktopWakeMarker(attempt.attempt_id)) as { id: number } | null;
+    if (marker) {
+      const done = db.query(`SELECT 1 AS ok FROM messages WHERE session_id IN (${marks}) AND id > ? AND ${COMPLETED_ASSISTANT_SQL} LIMIT 1`)
+        .get(...ids, marker.id);
+      if (done) return "handled";
+      return hostAlive ? "running" : "unknown";
+    }
+  }
+  if (!hostAlive) return "lost";
+  if (attempt.state === "unknown") return "unknown";
+  if (attempt.state === "intent") return nowMs - Date.parse(attempt.created_at) > DESKTOP_INTENT_UNKNOWN_MS ? "unknown" : "pending";
+  if (heldByHost) return "pending";
+  return nowMs - Date.parse(attempt.accepted_at ?? attempt.created_at) > DESKTOP_CLOSED_GRACE_MS ? "unknown" : "pending";
+}
+
+/** Apply a verdict to a ledger in place; returns the ledger state and detail to save. */
+export function applyDesktopVerdict(ledger: HermesChatWakeLedger, verdict: HermesDesktopVerdict, now: Date): [HermesChatWakeState, string] {
+  const attempt = ledger.desktop_attempt!;
+  const id = attempt.attempt_id.slice(0, 8);
+  const close = (outcome: HermesDesktopAttemptRecord["outcome"]) => {
+    ledger.last_desktop_attempt = { ...attempt, outcome, resolved_at: now.toISOString() };
+    ledger.desktop_attempt = null;
+  };
+  switch (verdict) {
+    case "handled":
+      // The desktop turn counts as the launch for this mail, so the gateway path's
+      // "already handled" check (launched_max_id) sees it too.
+      ledger.handled_max_id = Math.max(ledger.handled_max_id, attempt.max_id);
+      ledger.launched_max_id = Math.max(ledger.launched_max_id, attempt.max_id);
+      ledger.attempts = 0;
+      ledger.next_attempt_at = null;
+      close("handled");
+      return ["done", `desktop wake ${id} reached a completed turn`];
+    case "lost":
+      close("lost");
+      return ["waiting_desktop", `desktop wake ${id} lost: host pid ${attempt.host_pid} exited before the turn started`];
+    case "unknown":
+      attempt.state = "unknown";
+      return ["desktop_unknown", `desktop wake ${id} outcome unknown; no re-wake until evidence or cli.ts hermes-desktop-clear`];
+    case "running":
+      return ["waiting_desktop", `desktop wake ${id} turn is running in pid ${attempt.host_pid}`];
+    default:
+      return ["waiting_desktop", `desktop wake ${id} is ${attempt.state} in pid ${attempt.host_pid}`];
+  }
+}
+
+/**
+ * Exclusive lock beside a ledger: "<pid> <epoch ms>" in <ledger>.lock, created with O_EXCL.
+ * A lock whose pid is dead or that is older than LEDGER_LOCK_STALE_MS is broken. Returns a
+ * release function, or null when another live executor holds it past the wait.
+ */
+export async function acquireLedgerLock(ledgerPath: string, waitMs = 2000): Promise<(() => Promise<void>) | null> {
+  const lockPath = `${ledgerPath}.lock`;
+  await ensurePrivateDir(dirname(lockPath));
+  const until = Date.now() + waitMs;
+  for (;;) {
+    try {
+      const handle = await open(lockPath, "wx", 0o600);
+      try { await handle.writeFile(`${process.pid} ${Date.now()}`, "utf8"); } finally { await handle.close(); }
+      return async () => { await unlink(lockPath).catch(() => undefined); };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const [pidText, atText] = (await readFile(lockPath, "utf8").catch(() => "")).trim().split(/\s+/);
+    const holder = Number(pidText);
+    const at = Number(atText);
+    if (!pidAlive(holder) || !Number.isFinite(at) || Date.now() - at > LEDGER_LOCK_STALE_MS) {
+      await unlink(lockPath).catch(() => undefined);
+      continue;
+    }
+    if (Date.now() >= until) return null;
+    await Bun.sleep(25);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +664,19 @@ export class HermesChatWakeDriver {
 
   /** One daemon tick for one chat-inbox entry. Idempotent: call it as often as the daemon polls. */
   async wake(req: HermesChatWakeRequest): Promise<HermesChatWakeOutcome> {
+    const release = await acquireLedgerLock(this.ledgerPath(req.profile, req.chatKey));
+    if (!release) {
+      const held = await this.readLedger(req.profile, req.chatKey);
+      return { state: held?.state ?? "running", detail: "ledger locked by another executor; next tick", sessionId: held?.session_id ?? null };
+    }
+    try {
+      return await this.wakeLocked(req);
+    } finally {
+      await release();
+    }
+  }
+
+  private async wakeLocked(req: HermesChatWakeRequest): Promise<HermesChatWakeOutcome> {
     const now = this.now();
     let ledger = (await this.readLedger(req.profile, req.chatKey)) ?? emptyLedger(req, now);
     if (req.title) ledger.title = req.title;
@@ -509,6 +684,10 @@ export class HermesChatWakeDriver {
 
     ledger = await this.reconcileLedger(ledger);
     if (ledger.state === "running") return this.outcome(ledger);
+
+    // An open desktop-plugin wake owns this chat's mail until evidence settles it.
+    ledger = await this.reconcileDesktop(ledger);
+    if (ledger.desktop_attempt) return this.outcome(ledger);
 
     // New mail since the last launch resets the ladder and clears terminal states.
     if (req.maxId > ledger.launched_max_id) {
@@ -582,26 +761,82 @@ export class HermesChatWakeDriver {
   /** Settle in-flight attempts for a profile; call once per daemon pass before or after wake(). */
   async reconcile(profile: string): Promise<HermesChatWakeLedger[]> {
     const out: HermesChatWakeLedger[] = [];
-    for (const ledger of await this.listLedgers(profile)) out.push(await this.reconcileLedger(ledger));
+    for (const listed of await this.listLedgers(profile)) {
+      const settled = await this.locked(profile, listed.chat_key, async (ledger) => {
+        if (!ledger) return null;
+        return this.reconcileDesktop(await this.reconcileLedger(ledger));
+      });
+      out.push(settled ?? listed);
+    }
     return out;
   }
 
   /** Chats whose mail is parked, for the daemon's visible pending status. */
   async pending(profile: string): Promise<HermesChatWakeLedger[]> {
-    return (await this.reconcile(profile)).filter((l) => ["waiting_desktop", "waiting_turn", "waiting_gateway", "cooldown", "input_required", "exhausted"].includes(l.state));
+    return (await this.reconcile(profile)).filter((l) => ["waiting_desktop", "desktop_unknown", "waiting_turn", "waiting_gateway", "cooldown", "input_required", "exhausted"].includes(l.state));
   }
 
   async cancel(profile: string, chatKey: string | null, peerName = `${profile}-hermes`): Promise<void> {
-    const ledger = (await this.readLedger(profile, chatKey)) ?? emptyLedger({ peerName, profile, chatKey, title: null, unread: 0, maxId: 0 }, this.now());
-    await this.save(ledger, "cancelled", "wakes stopped by operator");
+    await this.locked(profile, chatKey, async (found) => {
+      const ledger = found ?? emptyLedger({ peerName, profile, chatKey, title: null, unread: 0, maxId: 0 }, this.now());
+      return this.save(ledger, "cancelled", "wakes stopped by operator");
+    }, true);
   }
 
   async uncancel(profile: string, chatKey: string | null): Promise<void> {
-    const ledger = await this.readLedger(profile, chatKey);
-    if (ledger?.state === "cancelled") await this.save(ledger, "done", "wakes re-enabled by operator");
+    await this.locked(profile, chatKey, async (ledger) => (ledger?.state === "cancelled" ? this.save(ledger, "done", "wakes re-enabled by operator") : ledger), true);
+  }
+
+  /**
+   * Operator resolution of a desktop wake. `handled` records that the reviewed wake did reach a
+   * turn (its mail is not re-woken); otherwise the next tick may wake the chat again.
+   */
+  async clearDesktop(profile: string, chatKey: string | null, handled = false): Promise<HermesChatWakeLedger | null> {
+    return this.locked(profile, chatKey, async (ledger) => {
+      if (!ledger?.desktop_attempt) return ledger;
+      const attempt = ledger.desktop_attempt;
+      if (handled) {
+        ledger.handled_max_id = Math.max(ledger.handled_max_id, attempt.max_id);
+        ledger.launched_max_id = Math.max(ledger.launched_max_id, attempt.max_id);
+      }
+      ledger.last_desktop_attempt = { ...attempt, outcome: handled ? "cleared_handled" : "cleared", resolved_at: this.now().toISOString() };
+      ledger.desktop_attempt = null;
+      return this.save(ledger, handled ? "done" : "waiting_desktop", `desktop wake ${attempt.attempt_id.slice(0, 8)} cleared by operator${handled ? " as handled" : ""}`);
+    }, true);
   }
 
   // -- internals -----------------------------------------------------------
+
+  /** Run fn on the freshly read ledger under its lock. Null when the lock stayed busy (or must=true throws). */
+  private async locked<T>(profile: string, chatKey: string | null, fn: (ledger: HermesChatWakeLedger | null) => Promise<T>, must = false): Promise<T | null> {
+    const release = await acquireLedgerLock(this.ledgerPath(profile, chatKey));
+    if (!release) {
+      if (must) throw new Error(`ledger for ${profile}/${chatKey ?? GENERAL_MAILBOX} is locked by another executor`);
+      return null;
+    }
+    try {
+      return await fn(await this.readLedger(profile, chatKey));
+    } finally {
+      await release();
+    }
+  }
+
+  private async reconcileDesktop(ledger: HermesChatWakeLedger): Promise<HermesChatWakeLedger> {
+    const attempt = ledger.desktop_attempt;
+    if (!attempt) return ledger;
+    const db = openReadOnly(stateDbPath(this.hermesHome, ledger.profile));
+    try {
+      const ids = db ? lineageIds(db, lineageRoot(db, attempt.chat_key)) : [attempt.chat_key];
+      if (!ids.includes(attempt.session_key)) ids.push(attempt.session_key);
+      const verdict = classifyDesktopAttempt(
+        db, attempt, this.alive(attempt.host_pid), registryHeldBy(this.hermesHome, ledger.profile, ids, attempt.host_pid), this.now().getTime(),
+      );
+      const [state, detail] = applyDesktopVerdict(ledger, verdict, this.now());
+      return this.save(ledger, state, detail);
+    } finally {
+      db?.close();
+    }
+  }
 
   private admissionSeq(db: Database, sessionId: string): number {
     try {

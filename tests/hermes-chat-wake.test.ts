@@ -4,7 +4,8 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  HermesChatDirectory, HermesChatWakeDriver, classifyHermesCliOutput, defaultWakeText, hermesProfileForPeer, lineageRoot, lineageTip,
+  HermesChatDirectory, HermesChatWakeDriver, acquireLedgerLock, classifyHermesCliOutput, defaultWakeText, desktopWakeMarker, hermesProfileForPeer,
+  lineageRoot, lineageTip, type HermesChatWakeLedger, type HermesDesktopAttempt,
 } from "../shared/hermes-chat-wake.ts";
 
 // Minimal copy of the Hermes v0.22.5 tables the module reads (hermes_state_common.py).
@@ -13,7 +14,7 @@ CREATE TABLE sessions (
   id TEXT PRIMARY KEY, source TEXT NOT NULL, title TEXT, parent_session_id TEXT, started_at REAL NOT NULL,
   last_activity_at REAL, end_reason TEXT, archived INTEGER NOT NULL DEFAULT 0, model_config TEXT
 );
-CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, timestamp REAL NOT NULL);
+CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, timestamp REAL NOT NULL, finish_reason TEXT);
 CREATE TABLE session_turn_leases (conversation_id TEXT PRIMARY KEY, holder TEXT NOT NULL, acquired_at REAL NOT NULL, expires_at REAL NOT NULL);
 CREATE TABLE session_admissions (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, admission_id TEXT NOT NULL UNIQUE, target_session_id TEXT NOT NULL,
@@ -416,4 +417,144 @@ test("unknown chat key, cancelled chat, and missing profile", async () => {
   const other = await d.wake(baseReq({ profile: "nobody", chatKey: "x" }));
   expect(other.state).toBe("not_found");
   expect(other.detail).toContain('no Hermes state for profile "nobody"');
+});
+
+// ---------------------------------------------------------------------------
+// Desktop-plugin attempts (hermes-plugins/agent-peers-desktop-wake shares these ledgers)
+
+const HOST = 4242;
+const CHAT = "20261028_100000_aaaaaa";
+// Same vector as tests/python/test_hermes_desktop_wake.py LEDGER_VECTOR.
+const LEDGER_VECTOR = "ad69ef69c99512d6b0e552be05c19843";
+
+function ledgerFile(): string {
+  return join(stateDir, "chat-wake", PROFILE, `${LEDGER_VECTOR}.json`);
+}
+
+function writeDesktopLedger(attempt: Partial<HermesDesktopAttempt>, over: Partial<HermesChatWakeLedger> = {}) {
+  const now = new Date(T0 * 1000).toISOString();
+  const ledger: HermesChatWakeLedger = {
+    peer_name: PEER.name, profile: PROFILE, chat_key: CHAT, session_id: CHAT, title: "Instagram ads",
+    state: "waiting_desktop", handled_max_id: 0, launched_max_id: 0, attempts: 0, next_attempt_at: null, last_launch: null,
+    last_admission_id: null, detail: "desktop wake", updated_at: now,
+    desktop_attempt: {
+      attempt_id: "a1b2c3d4e5f60718", chat_key: CHAT, session_key: CHAT, max_id: 10, host_pid: HOST,
+      state: "accepted", created_at: now, accepted_at: now, detail: "queued", ...attempt,
+    },
+    ...over,
+  };
+  mkdirSync(join(stateDir, "chat-wake", PROFILE), { recursive: true });
+  writeFileSync(ledgerFile(), JSON.stringify(ledger));
+}
+
+function readLedgerFile(): HermesChatWakeLedger {
+  return JSON.parse(readFileSync(ledgerFile(), "utf8")) as HermesChatWakeLedger;
+}
+
+const atT0 = (seconds = 0) => () => new Date((T0 + seconds) * 1000);
+
+test("the ledger file name for a chat key matches the Python plugin", async () => {
+  const db = profileDb();
+  addSession(db, CHAT, "Instagram ads");
+  db.close();
+  await driver({ now: atT0(), alive: () => true }).cancel(PROFILE, CHAT);
+  expect(readLedgerFile().state).toBe("cancelled");
+});
+
+test("an open desktop attempt in a live host blocks the gateway launch, even for newer mail", async () => {
+  const db = profileDb();
+  addSession(db, CHAT, "Instagram ads");
+  db.close();
+  writeDesktopLedger({});
+  writeRegistry([{ session_id: CHAT, surface: "desktop", pid: HOST }]);
+  const d = driver({ now: atT0(5), alive: (pid) => pid === HOST });
+  const out = await d.wake(baseReq({ chatKey: CHAT, maxId: 12 }));
+  expect(out.state).toBe("waiting_desktop");
+  expect(out.detail).toContain("accepted in pid 4242");
+  expect(recordedArgs()).toEqual([]);
+  // Closed by Mike with the wake still queued: pending through the grace period, then unknown.
+  writeRegistry([]);
+  expect((await driver({ now: atT0(60), alive: (pid) => pid === HOST }).wake(baseReq({ chatKey: CHAT, maxId: 12 }))).state).toBe("waiting_desktop");
+  expect((await driver({ now: atT0(200), alive: (pid) => pid === HOST }).wake(baseReq({ chatKey: CHAT, maxId: 12 }))).state).toBe("desktop_unknown");
+  expect(recordedArgs()).toEqual([]);
+});
+
+test("a dead host with no marked turn is lost, and the gateway wake proceeds", async () => {
+  const db = profileDb();
+  addSession(db, CHAT, "Instagram ads");
+  db.close();
+  writeDesktopLedger({});
+  const out = await driver({ now: atT0(5), alive: () => false }).wake(baseReq({ chatKey: CHAT, maxId: 10 }));
+  expect(out.state).toBe("launched");
+  const ledger = readLedgerFile();
+  expect(ledger.desktop_attempt).toBeNull();
+  expect(ledger.last_desktop_attempt?.outcome).toBe("lost");
+});
+
+test("a completed marked turn settles handled and the same mail is not relaunched", async () => {
+  const db = profileDb();
+  addSession(db, CHAT, "Instagram ads");
+  const marker = desktopWakeMarker("a1b2c3d4e5f60718");
+  db.run("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, ?)", [CHAT, `Mike's own words\n\n${marker} Agent Peers automation`, T0]);
+  db.run("INSERT INTO messages (session_id, role, content, timestamp, finish_reason) VALUES (?, 'assistant', 'step', ?, 'tool_calls')", [CHAT, T0]);
+  db.close();
+  writeDesktopLedger({});
+  // Turn started but not finished: a dead host makes it unknown, never lost.
+  expect((await driver({ now: atT0(5), alive: () => false }).wake(baseReq({ chatKey: CHAT, maxId: 10 }))).state).toBe("desktop_unknown");
+  const db2 = new Database(join(hermesHome, "profiles", PROFILE, "state.db"));
+  db2.run("INSERT INTO messages (session_id, role, content, timestamp, finish_reason) VALUES (?, 'assistant', 'done', ?, 'stop')", [CHAT, T0]);
+  db2.close();
+  const out = await driver({ now: atT0(10), alive: () => false }).wake(baseReq({ chatKey: CHAT, maxId: 10 }));
+  expect(out.state).toBe("done");
+  const ledger = readLedgerFile();
+  expect(ledger.handled_max_id).toBe(10);
+  expect(ledger.last_desktop_attempt?.outcome).toBe("handled");
+  expect(recordedArgs()).toEqual([]);
+});
+
+test("a stale intent is unknown, blocks new mail, shows as pending, and only an operator clears it", async () => {
+  const db = profileDb();
+  addSession(db, CHAT, "Instagram ads");
+  db.close();
+  writeDesktopLedger({ state: "intent", accepted_at: null });
+  writeRegistry([{ session_id: CHAT, surface: "desktop", pid: HOST }]);
+  const d = driver({ now: atT0(120), alive: (pid) => pid === HOST });
+  expect((await d.wake(baseReq({ chatKey: CHAT, maxId: 20 }))).state).toBe("desktop_unknown");
+  expect((await d.pending(PROFILE)).map((l) => l.state)).toEqual(["desktop_unknown"]);
+  writeRegistry([]);
+  expect((await d.wake(baseReq({ chatKey: CHAT, maxId: 25 }))).state).toBe("desktop_unknown");
+  expect(recordedArgs()).toEqual([]);
+  const cleared = await d.clearDesktop(PROFILE, CHAT);
+  expect(cleared?.last_desktop_attempt?.outcome).toBe("cleared");
+  expect((await d.wake(baseReq({ chatKey: CHAT, maxId: 25 }))).state).toBe("launched");
+});
+
+test("clearDesktop --handled records the reviewed mail as handled", async () => {
+  const db = profileDb();
+  addSession(db, CHAT, "Instagram ads");
+  db.close();
+  writeDesktopLedger({ state: "unknown" }, { state: "desktop_unknown" });
+  const d = driver({ now: atT0(5), alive: (pid) => pid === HOST });
+  const cleared = await d.clearDesktop(PROFILE, CHAT, true);
+  expect(cleared?.state).toBe("done");
+  expect(cleared?.handled_max_id).toBe(10);
+  expect((await d.wake(baseReq({ chatKey: CHAT, maxId: 10 }))).state).toBe("done");
+  expect(recordedArgs()).toEqual([]);
+});
+
+test("the ledger lock: a live holder makes wake skip; a dead holder's lock is broken", async () => {
+  const db = profileDb();
+  addSession(db, CHAT, "Instagram ads");
+  db.close();
+  mkdirSync(join(stateDir, "chat-wake", PROFILE), { recursive: true });
+  writeFileSync(`${ledgerFile()}.lock`, `${process.pid} ${Date.now()}`);
+  const busy = await new HermesChatWakeDriver({ hermesHome, stateDir, hermesBin: join(binDir, "hermes"), env: { ...process.env, HERMES_FAKE_ARGS: argsLog } })
+    .wake(baseReq({ chatKey: CHAT }));
+  expect(busy.detail).toContain("ledger locked");
+  expect(recordedArgs()).toEqual([]);
+  writeFileSync(`${ledgerFile()}.lock`, `999999 ${Date.now()}`);
+  const release = await acquireLedgerLock(ledgerFile(), 100);
+  expect(release).not.toBeNull();
+  await release!();
+  expect((await driver({ now: atT0(), alive: () => true }).wake(baseReq({ chatKey: CHAT }))).state).toBe("launched");
 });

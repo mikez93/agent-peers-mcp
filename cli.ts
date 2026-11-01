@@ -839,6 +839,18 @@ switch (sub) {
   case "stranded-messages":
     await cmdStrandedMessages();
     break;
+  case "hermes-desktop-clear": {
+    const args = rest.filter((a) => a !== "--handled");
+    if (args.length !== 2) {
+      console.error("usage: cli.ts hermes-desktop-clear <profile> <chat-key> [--handled]");
+      process.exit(2);
+    }
+    const { HermesChatWakeDriver } = await import("./shared/hermes-chat-wake.ts");
+    const driver = new HermesChatWakeDriver({ stateDir: resolveStateDir({ runtime: "hermes", kind: "coordination" }) });
+    const ledger = await driver.clearDesktop(args[0]!, args[1]!, rest.includes("--handled"));
+    console.log(ledger ? `${ledger.state}: ${ledger.detail}` : "no ledger for that chat");
+    break;
+  }
   case "gc-inboxes": {
     const ageIdx = rest.indexOf("--min-age-days");
     const minAge = ageIdx !== -1 ? parseFloat(rest[ageIdx + 1] ?? "7") : 7;
@@ -860,6 +872,7 @@ switch (sub) {
   bun cli.ts inboxes [--stranded]
   bun cli.ts stranded-messages
   bun cli.ts gc-inboxes [--apply] [--min-age-days N]
+  bun cli.ts hermes-desktop-clear <profile> <chat-key> [--handled]
   bun cli.ts kill-broker`);
     process.exit(sub ? 2 : 0);
 }
