@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -261,6 +262,61 @@ class Ap10806Regressions(Base):
         self.wake.inbox = swap_to_b
         self.wake.tick()
         self.assertEqual(self.ctx.calls, [])
+
+
+class Ap10817Regression(Base):
+    """Marco AP10817: stale-lock reaping broke exclusivity. Red on 58f034b, green here."""
+
+    def test_reaper_interleaving_never_gives_two_holders(self):
+        # Marco's interleaving: A judges the dead owner's lock and pauses; B reaps it and
+        # acquires; A renames B's live lock aside; C takes the vacant path; A's restore fails.
+        ledger = self.tmp / "chat.json"
+        lock = self.tmp / "chat.json.lock"
+        dead = subprocess.Popen(["/usr/bin/true"])
+        dead.wait()
+        lock.write_text(json.dumps({"pid": dead.pid, "start": None, "token": "dead"}))
+        observed_dead, let_reap, removed_fresh, let_restore = (threading.Event() for _ in range(4))
+        original_gone = getattr(dw, "_holder_gone", lambda owner: False)
+        original_rename = os.rename
+        results: dict = {}
+
+        def gate_gone(owner):
+            gone = original_gone(owner)
+            if threading.current_thread().name == "stale-reaper" and owner.get("token") == "dead":
+                observed_dead.set()
+                let_reap.wait(5)
+            return gone
+
+        def gate_rename(src, dst, *args, **kwargs):
+            out = original_rename(src, dst, *args, **kwargs)
+            if threading.current_thread().name == "stale-reaper" and Path(src) == lock:
+                removed_fresh.set()
+                let_restore.wait(5)
+            return out
+
+        def reaper():
+            results["A"] = dw.acquire_lock(ledger, wait=0)
+
+        b = c = None
+        with patch.object(dw, "_holder_gone", gate_gone, create=True), patch.object(dw.os, "rename", gate_rename):
+            thread = threading.Thread(target=reaper, name="stale-reaper")
+            thread.start()
+            try:
+                while thread.is_alive() and not observed_dead.is_set():
+                    time.sleep(0.005)
+                b = dw.acquire_lock(ledger, wait=0)
+                let_reap.set()
+                while thread.is_alive() and not removed_fresh.is_set():
+                    time.sleep(0.005)
+                c = dw.acquire_lock(ledger, wait=0)
+            finally:
+                let_reap.set()
+                let_restore.set()
+                thread.join(5)
+        holders = [r for r in (results.get("A"), b, c) if r is not None]
+        self.assertLessEqual(len(holders), 1, "two processes hold the ledger lock at once")
+        self.assertEqual(holders, [], "a dead owner's lock is never cleared automatically")
+        self.assertEqual(json.loads(lock.read_text())["token"], "dead")
 
 
 class Gates(Base):
@@ -606,20 +662,20 @@ class Classifier(Base):
         self.assertEqual(c(started, self.attempt(), alive=False), "unknown", "turn started, host died")
         self.assertEqual(c(ended, self.attempt(state="unknown"), alive=False, held=None), "handled")
 
-    def test_lock_reaps_only_dead_or_reused_holders_and_restores_a_fresh_one(self):
+    def test_lock_fails_closed_until_an_operator_removes_it(self):
         ledger = self.tmp / "chat.json"
         lock = self.tmp / "chat.json.lock"
-        lock.write_text(json.dumps({"pid": 999_999, "start": None, "token": "dead"}))
+        for content in (json.dumps({"pid": 999_999, "start": None, "token": "dead"}),
+                        json.dumps({"pid": os.getpid(), "start": "Thu Jan  1 00:00:00 1970", "token": "reused"}),
+                        "", "garbage"):
+            lock.write_text(content)
+            self.assertIsNone(dw.acquire_lock(ledger, wait=0.05))
+            self.assertEqual(lock.read_text(), content)
+        lock.unlink()  # the operator step, with both executors stopped
         release = dw.acquire_lock(ledger, wait=0)
         self.assertIsNotNone(release)
         release()
-        lock.write_text(json.dumps({"pid": os.getpid(), "start": "Thu Jan  1 00:00:00 1970", "token": "reused"}))
-        release = dw.acquire_lock(ledger, wait=0)
-        self.assertIsNotNone(release)
-        release()
-        lock.write_text("fresh")
-        dw._reap(lock, "what we judged")
-        self.assertEqual(lock.read_text(), "fresh")
+        self.assertFalse(lock.exists())
 
     def test_ledger_name_matches_the_typescript_driver(self):
         self.assertEqual(dw.ledger_path(Path("/s"), "ezra", "20261028_100000_aaaaaa"),

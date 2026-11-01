@@ -76,10 +76,12 @@ Code: `hermes-plugins/agent-peers-desktop-wake/`. Tests:
   `{"pid","start","token"}`.
   - The owner writes a private temp file and `link()`s it into place, so the
     lock never exists without a complete owner record.
-  - A holder is reaped only when its pid is dead, or alive with a different
-    start time. Never on age. Unparseable content counts as a live holder.
-  - Reaping renames the lock aside and restores it if a fresh owner took it
-    in between.
+  - Acquire fails closed whenever the lock file exists, whatever its content
+    and whether or not its holder is alive. Nothing clears it automatically:
+    a reaper racing a fresh owner can leave two owners (Marco AP10817). A lock
+    left by a crashed holder blocks only that one chat until an operator
+    clears it (see "Clearing a dead lock" below). The gateway driver's status
+    then reads `ledger lock held by dead pid <pid>`.
   - Release removes the lock only while it still carries the owner's token.
 - **Cancellation.** `cli.ts` cancel survives every settlement and record
   step. A cancelled chat is never woken; its open attempt can still settle,
@@ -87,9 +89,15 @@ Code: `hermes-plugins/agent-peers-desktop-wake/`. Tests:
 - **Settlement from correlated turn evidence only** (Kepler §20 as amended
   by AP10808). The plugin registers two hooks:
   - `pre_llm_call` writes `<state>/chat-wake/<profile>/evidence/<attempt>.started.json`;
-  - `post_llm_call`, which Hermes fires once per uninterrupted turn with a
-    final response, after the session is persisted, writes
-    `<attempt>.ended.json`.
+  - `post_llm_call` writes `<attempt>.ended.json`.
+
+  `ended` means the wake's turn ended. It is not proof that the turn
+  succeeded or that the session was persisted, and it is distinct from the
+  mail being handled in a business sense. Hermes fires `post_llm_call` once
+  per turn that was not interrupted, including failed turns: the
+  turn-completion explainer fills an empty or abnormal response before the
+  hook (`turn_finalizer.py:649-652`), and a persist error is caught
+  (`:637`). The hook payload has no failed, completed or persisted flag.
 
   Each hook writes only when the turn's own `user_message` carries the
   attempt's marker, the turn's `session_id` is in the chat's lineage, and the
@@ -98,7 +106,7 @@ Code: `hermes-plugins/agent-peers-desktop-wake/`. Tests:
 
   | Evidence (`classifyDesktopAttempt`, mirrored in Python) | Verdict |
   |---|---|
-  | `ended` recorded | `handled`: raises `handled_max_id` and `launched_max_id` |
+  | `ended` recorded | `handled` (the wake's turn ended): raises `handled_max_id` and `launched_max_id` |
   | `started` recorded, host alive | `running` (blocks) |
   | `started` recorded, host dead or reused | `unknown` |
   | Evidence exists but cannot be read | `unknown` |
@@ -122,20 +130,50 @@ Code: `hermes-plugins/agent-peers-desktop-wake/`. Tests:
   config does not stop code that is already loaded, so use a kill switch
   first.
 
+## Known limitation: failed wake turns settle as handled
+
+A wake turn that fails still fires `post_llm_call`, so its attempt settles
+`handled` and that mail is not woken again. Examples that write `ended`:
+`session_persistence_failed`, `all_retries_exhausted_no_response`,
+`pending_tool_result`, `max_iterations_reached` and `guardrail_halt`. The mail
+itself stays unread in the broker until `check_messages` reads it, and newer
+mail wakes the chat again. Tracked in bd-b2in.22, due before D. The future
+signal is `on_session_end` (`turn_finalizer.py:796-808`), which carries
+`failed`, `interrupted` and `turn_exit_reason`; it is not built yet.
+
 ## Known blocking cases (safe, need an operator)
 
 These leave the chat blocked rather than risk a duplicate wake. Each ends
-with `hermes-desktop-clear` after a look at the chat.
+with an operator step after a look at the chat.
 
-- **Interrupted or failed wake turn.** `post_llm_call` does not fire, so the
-  attempt stays `running` while the host lives and becomes `unknown` if it
-  dies.
+- **Interrupted wake turn.** `post_llm_call` does not fire, so the attempt
+  stays `running` while the host lives and becomes `unknown` if it dies.
+  Clear it with `hermes-desktop-clear`.
 - **Closed with the wake still queued.** Hermes drops the queued prompt; the
   attempt becomes `unknown` at the next settle.
 - **Duplicate text.** `_enqueue_prompt` can drop an exact duplicate of the
   in-flight text and still return True. The attempt stays `pending` while the
   chat is open. The per-attempt marker makes an exact duplicate practically
   impossible.
+- **A crashed lock holder.** Its `<ledger>.lock` stays and blocks only that
+  chat. Clear it as below.
+
+## Clearing a dead lock
+
+Do this only when the chat is blocked and the status names a dead pid. Both
+executors must be stopped, so nothing can take the lock while you remove it.
+
+1. Engage the kill switch: create `~/.agent-peers-hermes/disabled` (and
+   `<state>/disabled` if `AGENT_PEERS_STATE_DIR` points elsewhere). If the
+   gateway wake daemon is running (step D), stop it too; it has no flag-file
+   switch. Wait one plugin tick (5 s).
+2. Confirm no holder is alive: read the lock's `pid`, and check that
+   `ps -o lstart= -p <pid>` prints nothing, or a start time different from
+   the lock's `start`.
+3. Remove `<ledger>.lock`. The ledger name is
+   `<state>/chat-wake/<profile>/<sha256(chat-key)[:32]>.json`.
+4. Release the kill switch: remove the flag file and restart the daemon if
+   you stopped it.
 
 ## Adoption path (needs runtime GO)
 
@@ -201,13 +239,14 @@ with `hermes-desktop-clear` after a look at the chat.
   never uses `metadata.live_session_id`. Still to confirm live: the registry
   `pid` of a Desktop SSH session is the backend's own pid
   (`active_sessions.py` writes `os.getpid()` of the claimant).
-- **A4.** Settled only by the hooks above. Still to confirm live, from code
-  reading only (`agent/turn_context.py:811`, `agent/turn_finalizer.py:470`):
-  - both hooks fire in the Desktop serve backend for a TUI-injected turn,
-    with the drained (possibly merged) text as `user_message`;
-  - in a multi-profile backend such as 42495, hooks reach the plugin
-    instance of the chat's own profile. If they do not, nothing is recorded
-    and the attempt blocks until an operator clears it, which is safe.
+- **A4.** Settled only by the hooks above (`agent/turn_context.py:811`,
+  `agent/turn_finalizer.py`). Kepler confirmed from source (AP10819, §21)
+  that both hooks fire once per turn for a TUI-drained turn, that the marker
+  survives a merge with Mike's text, and that profile routing holds through
+  `session['profile_home']`. Not yet seen live. If the hooks did not reach
+  the plugin, nothing would be recorded and the attempt would block for an
+  operator, which is safe. `ended` is not success; see the known limitation
+  above.
 
 The gateway driver's `registryHolder` checks only the chat's root session, not
 its compression tip. That is a real gap, but harmless today: no Desktop chat

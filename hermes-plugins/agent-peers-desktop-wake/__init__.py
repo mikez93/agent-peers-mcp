@@ -25,14 +25,15 @@ Scope and safety (Marco AP10789, AP10806; Kepler §19-§20 as amended AP10808):
 - ``inject_message() == True`` only means queued/accepted. A durable attempt is
   written before the call (intent) and after it (accepted / not_submitted /
   unknown) into the per-chat ledger the gateway driver uses, under the same
-  ``.lock`` (atomic owner publication, owner-checked release, no reaping of a live
-  holder). While an attempt is open neither executor wakes that chat.
+  ``.lock`` (atomic owner publication, owner-checked release, never reaped
+  automatically). While an attempt is open neither executor wakes that chat.
 - Settlement uses positive, correlated turn-lifecycle evidence only. The plugin's
-  ``pre_llm_call`` hook records "started" and its ``post_llm_call`` hook (fired
-  once per uninterrupted turn with a final response, after the session is
-  persisted) records "ended", each only when the turn's own ``user_message``
-  carries this attempt's marker and its ``session_id`` is this chat's. Transcript
-  rows, finish_reason, absence and timeouts never settle anything. Anything
+  ``pre_llm_call`` hook records "started" and its ``post_llm_call`` hook records
+  "ended", each only when the turn's own ``user_message`` carries this attempt's
+  marker and its ``session_id`` is this chat's. "ended" means the wake's turn
+  ended. It is not proof of success or persistence: Hermes also fires
+  post_llm_call on failed turns (bd-b2in.22). Transcript rows, finish_reason,
+  absence and timeouts never settle anything. Anything
   uncertain or unreadable is ``unknown`` and blocks every re-wake of the chat
   until an operator runs ``cli.ts hermes-desktop-clear``. Cancellation is kept
   through settlement.
@@ -188,52 +189,12 @@ def empty_ledger(peer_name: str, profile: str, chat_key: str, title: Optional[st
 #
 # <ledger>.lock holds {"pid", "start", "token"}. It only ever appears complete:
 # the owner writes a private temp file and link()s it into place (link fails if
-# the lock exists). A holder is reaped only when its pid is dead, or alive but
-# started at a different time (pid reuse); never on age. Unreadable or foreign
-# content counts as a live holder. Reaping renames the lock aside and restores it
-# if a fresh owner took it in between. Release removes the lock only if it still
-# carries the owner's token.
-
-def _parse_owner(text: str) -> Optional[dict]:
-    try:
-        value = json.loads(text)
-    except ValueError:
-        return None
-    if isinstance(value, dict) and isinstance(value.get("pid"), int) and isinstance(value.get("token"), str):
-        return value
-    return None
-
-
-def _holder_gone(owner: dict) -> bool:
-    if not pid_alive(owner["pid"]):
-        return True
-    recorded = owner.get("start")
-    if not isinstance(recorded, str) or not recorded:
-        return False
-    current = process_start(owner["pid"])
-    return current is not None and current != recorded
-
-
-def _reap(lock: Path, judged: str) -> None:
-    aside = lock.with_name(f"{lock.name}.reap.{os.getpid()}.{uuid.uuid4().hex}")
-    try:
-        os.rename(lock, aside)
-    except OSError:
-        return
-    try:
-        taken = aside.read_text("utf-8")
-    except OSError:
-        taken = None
-    if taken != judged:
-        try:
-            os.link(aside, lock)  # a fresh owner took it between our read and the rename: give it back
-        except OSError:
-            pass
-    try:
-        aside.unlink()
-    except OSError:
-        pass
-
+# the lock exists). Acquire fails closed whenever the lock exists, whatever its
+# content and whether or not its holder is alive. Nothing reaps it, because a
+# reaper racing a fresh owner can leave two owners (Marco AP10817). A lock left
+# by a crashed holder blocks only its own chat until an operator clears it
+# (docs/components/hermes-desktop-wake.md, "Clearing a dead lock"). Release
+# removes the lock only if it still carries the owner's token.
 
 def acquire_lock(ledger: Path, wait: float = LOCK_WAIT_SECONDS) -> Optional[Callable[[], None]]:
     lock = ledger.with_name(ledger.name + ".lock")
@@ -266,16 +227,6 @@ def acquire_lock(ledger: Path, wait: float = LOCK_WAIT_SECONDS) -> Optional[Call
                 except OSError:
                     pass
             return release
-        try:
-            text = lock.read_text("utf-8")
-        except FileNotFoundError:
-            continue
-        except OSError:
-            text = ""
-        owner = _parse_owner(text)
-        if owner is not None and _holder_gone(owner):
-            _reap(lock, text)
-            continue
         if time.monotonic() >= deadline:
             return None
         time.sleep(0.025)

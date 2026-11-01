@@ -579,7 +579,7 @@ test("cancellation survives settlement and operator clear", async () => {
   expect(recordedArgs()).toEqual([]);
 });
 
-test("the ledger lock: live and unparseable holders are kept; a dead holder's lock is broken", async () => {
+test("the ledger lock fails closed on any existing lock; a dead holder is reported, not reaped", async () => {
   chatDb().close();
   mkdirSync(join(stateDir, "chat-wake", PROFILE), { recursive: true });
   const lock = `${ledgerFile()}.lock`;
@@ -590,11 +590,12 @@ test("the ledger lock: live and unparseable holders are kept; a dead holder's lo
   writeFileSync(lock, "");
   expect(await acquireLedgerLock(ledgerFile(), 0)).toBeNull();
   writeFileSync(lock, JSON.stringify({ pid: 999_999, start: null, token: "dead" }));
-  const release = await acquireLedgerLock(ledgerFile(), 100);
-  expect(release).not.toBeNull();
-  await release!();
-  expect(existsSync(lock)).toBe(false);
+  expect(await acquireLedgerLock(ledgerFile(), 100)).toBeNull();
+  const stuck = await driver({ now: atT0(), alive: () => true }).wake(baseReq({ chatKey: CHAT }));
+  expect(stuck.detail).toContain("ledger lock held by dead pid 999999");
+  expect(existsSync(lock)).toBe(true);
   expect(recordedArgs()).toEqual([]);
+  rmSync(lock); // the operator step, with both executors stopped
   expect((await driver({ now: atT0(), alive: () => true }).wake(baseReq({ chatKey: CHAT }))).state).toBe("launched");
 });
 
@@ -611,12 +612,14 @@ ${code}`, plugin, ledger], { stdio: ["ignore", "pipe", "inherit"] });
     child.stdout!.on("data", (b) => { out += String(b); });
     return () => out;
   };
-  // Python holds it: TypeScript must wait; when Python exits without releasing, the dead holder is reaped.
+  // Python holds it: TypeScript must wait, and still fails closed after Python dies holding it.
   const holder = py(`r = dw.acquire_lock(Path(sys.argv[2]), wait=0); print("held" if r else "busy", flush=True); time.sleep(1.2)`);
   const holderOut = lines(holder);
   await settle(() => holderOut().includes("held"));
   expect(await acquireLedgerLock(ledger, 0)).toBeNull();
   await new Promise((r) => holder.on("exit", r));
+  expect(await acquireLedgerLock(ledger, 50)).toBeNull();
+  rmSync(`${ledger}.lock`); // the operator step
   const release = await acquireLedgerLock(ledger, 200);
   expect(release).not.toBeNull();
   // TypeScript holds it: Python is refused.

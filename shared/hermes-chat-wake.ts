@@ -45,7 +45,7 @@ import { Database } from "bun:sqlite";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { link, open, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { link, open, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { GENERAL_MAILBOX, type ChatCandidate, type ChatDirectory, type ChatPeer, type ChatResolution } from "./chat-directory.ts";
@@ -553,9 +553,10 @@ export function readDesktopEvidence(stateDir: string, profile: string, attemptId
 
 /**
  * Settle a desktop attempt from positive, correlated evidence only (Kepler §20 as amended,
- * AP10808; Marco AP10806). "ended" is written by the plugin's post_llm_call hook, which Hermes
- * fires once per uninterrupted turn with a final response after the session is persisted, and
- * only when that turn's own prompt carries this attempt's marker. Transcript rows,
+ * AP10808; Marco AP10806). "ended" is written by the plugin's post_llm_call hook, only when
+ * that turn's own prompt carries this attempt's marker. It means the wake's turn ended, not that
+ * it succeeded or persisted: Hermes also fires post_llm_call on failed turns (bd-b2in.22, before
+ * D). Transcript rows,
  * finish_reason, absence of evidence, a closed chat and timeouts settle nothing: whatever is not
  * proven is pending (still plausibly queued) or unknown (operator adjudication).
  */
@@ -602,6 +603,15 @@ export function applyDesktopVerdict(ledger: HermesChatWakeLedger, verdict: Herme
   return result;
 }
 
+/** Status for a held ledger lock; names a dead holder so the manual clearance is visible. */
+async function lockedDetail(ledgerPath: string): Promise<string> {
+  let pid = Number.NaN;
+  try { pid = Number((JSON.parse(await readFile(`${ledgerPath}.lock`, "utf8")) as { pid?: unknown }).pid); } catch { /* unreadable */ }
+  return Number.isInteger(pid) && !pidAlive(pid)
+    ? `ledger lock held by dead pid ${pid}; see "Clearing a dead lock" in docs/components/hermes-desktop-wake.md`
+    : "ledger locked by another executor; next tick";
+}
+
 /** `ps -o lstart=` for pid, whitespace-normalized; null when unavailable. Same string as the plugin. */
 export function processStartTime(pid: number): string | null {
   try {
@@ -619,44 +629,15 @@ function selfStart(): string | null {
   return selfStartCache;
 }
 
-interface LockOwner { pid: number; start: string | null; token: string }
-
-function parseLockOwner(text: string): LockOwner | null {
-  try {
-    const value = JSON.parse(text) as Partial<LockOwner>;
-    if (Number.isInteger(value.pid) && typeof value.token === "string") {
-      return { pid: value.pid!, start: typeof value.start === "string" ? value.start : null, token: value.token };
-    }
-  } catch { /* foreign or partial content */ }
-  return null;
-}
-
-/** Reapable only when the pid is dead, or alive but started at a different time (pid reuse). Never on age. */
-function lockHolderGone(owner: LockOwner): boolean {
-  if (!pidAlive(owner.pid)) return true;
-  if (!owner.start) return false;
-  const current = processStartTime(owner.pid);
-  return current !== null && current !== owner.start;
-}
-
-async function reapLock(lockPath: string, judged: string): Promise<void> {
-  const aside = `${lockPath}.reap.${process.pid}.${randomUUID()}`;
-  try { await rename(lockPath, aside); } catch { return; }
-  const taken = await readFile(aside, "utf8").catch(() => null);
-  if (taken !== judged) {
-    // A fresh owner took the lock between our read and the rename: give it back.
-    await link(aside, lockPath).catch(() => undefined);
-  }
-  await unlink(aside).catch(() => undefined);
-}
-
 /**
  * Exclusive lock beside a ledger, shared with the Python plugin. <ledger>.lock holds
  * {"pid","start","token"} and only ever appears complete: the owner writes a private temp file
- * and link()s it into place, which fails if a lock exists. Unparseable content counts as a live
- * holder. A holder is reaped only when lockHolderGone; reaping renames the lock aside and restores
- * it if it turned out fresh. The release removes the lock only while it still carries our token.
- * Returns the release function, or null when a live holder kept it past the wait.
+ * and link()s it into place, which fails if a lock exists. Acquire fails closed whenever the lock
+ * exists, whatever its content and whether or not its holder is alive. Nothing reaps it, because
+ * a reaper racing a fresh owner can leave two owners (Marco AP10817); a crashed holder's lock
+ * blocks only its chat until an operator clears it (docs/components/hermes-desktop-wake.md).
+ * The release removes the lock only while it still carries our token.
+ * Returns the release function, or null when the lock stayed held past the wait.
  */
 export async function acquireLedgerLock(ledgerPath: string, waitMs = 2000): Promise<(() => Promise<void>) | null> {
   const lockPath = `${ledgerPath}.lock`;
@@ -680,18 +661,6 @@ export async function acquireLedgerLock(ledgerPath: string, waitMs = 2000): Prom
         const current = await readFile(lockPath, "utf8").catch(() => null);
         if (current === body) await unlink(lockPath).catch(() => undefined);
       };
-    }
-    let text: string;
-    try {
-      text = await readFile(lockPath, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      text = "";
-    }
-    const owner = parseLockOwner(text);
-    if (owner && lockHolderGone(owner)) {
-      await reapLock(lockPath, text);
-      continue;
     }
     if (Date.now() >= until) return null;
     await Bun.sleep(25);
@@ -785,7 +754,7 @@ export class HermesChatWakeDriver {
     const release = await acquireLedgerLock(this.ledgerPath(req.profile, req.chatKey));
     if (!release) {
       const held = await this.readLedger(req.profile, req.chatKey);
-      return { state: held?.state ?? "running", detail: "ledger locked by another executor; next tick", sessionId: held?.session_id ?? null };
+      return { state: held?.state ?? "running", detail: await lockedDetail(this.ledgerPath(req.profile, req.chatKey)), sessionId: held?.session_id ?? null };
     }
     try {
       return await this.wakeLocked(req);
