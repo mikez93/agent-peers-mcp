@@ -16,6 +16,9 @@ export const UNREACHABLE_HOSTS_HEADER = "x-agent-peers-unreachable-hosts";
 const BODY_LIMIT = 2 * 1024 * 1024;
 const MAX_TEXT = 100_000;
 const PEER_TYPES: PeerType[] = ["claude", "codex", "hermes", "droid"];
+// /federation/chats input limits, checked by both sides.
+const CHAT_PEER_MAX = 200;
+const CHAT_QUERY_MAX = 4096;
 const REJECTIONS = new Set(["unknown_peer", "stale_peer", "mailbox_full", "ambiguous", "chat_miss", "invalid"]);
 
 export interface FederationSender {
@@ -169,6 +172,11 @@ function safeResult(value: unknown): SendMessageResponse | null {
     ...(str(value.notice, 16_384) ? { notice: value.notice } : {}),
     ...(Array.isArray(value.candidates) ? { candidates: value.candidates as string[] } : {}) };
 }
+/** A non-OK federation answer. The message stays "federation HTTP <n>" (the
+ *  relay records only that); `detail` is the remote's short error, when asked. */
+class FederationHttpError extends Error {
+  constructor(readonly status: number, readonly detail: string | null) { super(`federation HTTP ${status}`); }
+}
 async function boundedJson(message: Request | Response, timeoutMs: number): Promise<unknown> {
   if (Number(message.headers.get("content-length") ?? "0") > BODY_LIMIT || !message.body) {
     throw new Error("invalid federation body size");
@@ -310,7 +318,7 @@ export class FederationService {
     return this.deps.sendLocal({ ...req, to_id_or_name: candidates[0]! });
   }
 
-  private async request(host: string, path: string, timeoutMs: number, body?: unknown): Promise<unknown> {
+  private async request(host: string, path: string, timeoutMs: number, body?: unknown, withDetail = false): Promise<unknown> {
     const secret = this.secret();
     const base = this.config.hosts[host];
     if (!secret || !base) throw new Error("federation auth or host configuration unavailable");
@@ -322,8 +330,16 @@ export class FederationService {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     if (!response.ok) {
-      void response.body?.cancel().catch(() => {});
-      throw new Error(`federation HTTP ${response.status}`);
+      let detail: string | null = null;
+      if (withDetail && (response.status === 400 || response.status >= 500)) {
+        try {
+          const answer = await boundedJson(response, timeoutMs);
+          if (plain(answer) && str(answer.error, 200)) detail = answer.error;
+        } catch { /* no usable detail */ }
+      } else {
+        void response.body?.cancel().catch(() => {});
+      }
+      throw new FederationHttpError(response.status, detail);
     }
     return boundedJson(response, timeoutMs);
   }
@@ -363,18 +379,30 @@ export class FederationService {
     if (!Object.hasOwn(this.config.hosts, host) || this.isLocalHost(host)) {
       return { ok: false, error: `unknown remote machine "${rawHost}"` };
     }
-    const params = new URLSearchParams({ peer: req.peer });
-    if (req.query !== undefined) params.set("query", req.query);
-    if (req.limit !== undefined) params.set("limit", String(req.limit));
-    if (req.offset !== undefined) params.set("offset", String(req.offset));
+    // Check locally what the other side would refuse. Raw HTTP callers can
+    // send null or non-numbers; those mean "not given", never the text "null".
+    const peer = typeof req.peer === "string" ? req.peer.trim() : "";
+    if (!str(peer, CHAT_PEER_MAX)) return { ok: false, error: `list_chats needs a peer name of at most ${CHAT_PEER_MAX} characters` };
+    const query = typeof req.query === "string" ? req.query.trim() : "";
+    if (query.length > CHAT_QUERY_MAX) return { ok: false, error: `query is too long (at most ${CHAT_QUERY_MAX} characters)` };
+    const params = new URLSearchParams({ peer });
+    if (query) params.set("query", query);
+    for (const key of ["limit", "offset"] as const) {
+      const value = req[key];
+      if (typeof value === "number" && Number.isFinite(value)) params.set(key, String(value));
+    }
     let body: unknown;
     try {
-      body = await this.request(host, `chats?${params}`, this.config.discoveryTimeoutMs ?? 1500);
+      body = await this.request(host, `chats?${params}`, this.config.discoveryTimeoutMs ?? 1500, undefined, true);
     } catch (error) {
+      const status = error instanceof FederationHttpError ? error.status : 0;
+      const detail = error instanceof FederationHttpError ? error.detail : null;
       // 404 means the other broker predates remote chat lookup.
-      const status = error instanceof Error ? error.message : "";
-      const reason = status === "federation HTTP 404" ? "its broker is too old to list chats remotely"
-        : status === "federation HTTP 401" ? "it refused this machine's federation credentials"
+      const reason = status === 404 ? "its broker is too old to list chats remotely"
+        : status === 401 ? "it refused this machine's federation credentials"
+        : status === 400 ? `bad request: ${detail ?? "the lookup was rejected"}`
+        : status >= 500 ? `error on ${host} (HTTP ${status}${detail ? `: ${detail}` : ""})`
+        : status > 0 ? `${host} answered HTTP ${status}`
         : "it is unreachable right now";
       return { ok: false, error: `can't list chats on ${host}: ${reason}` };
     }
@@ -408,7 +436,7 @@ export class FederationService {
       const q = url.searchParams;
       const peer = q.get("peer") ?? "";
       const query = q.get("query") ?? undefined;
-      if (!str(peer, 200) || (query !== undefined && !str(query, 4096, true))) {
+      if (!str(peer, CHAT_PEER_MAX) || (query !== undefined && !str(query, CHAT_QUERY_MAX, true))) {
         return Response.json({ error: "invalid chat query" }, { status: 400 });
       }
       const num = (key: string) => q.has(key) ? Number(q.get(key)) : undefined;

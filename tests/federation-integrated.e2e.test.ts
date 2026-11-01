@@ -6,7 +6,8 @@
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { join } from "node:path";
@@ -40,13 +41,17 @@ async function allocatePorts() {
 }
 
 function home(host: Host) { return join(root, host); }
+/** The fleet map a broker reads at start; `extra` adds machines such as a down gamma. */
+function writeFleet(host: Host, extra: Record<string, string> = {}) {
+  writeFileSync(join(home(host), ".agent-peers-fleet.json"), JSON.stringify({
+    alpha: `http://127.0.0.1:${PORTS.alpha}`, beta: `http://127.0.0.1:${PORTS.beta}`, ...extra,
+  }));
+}
 function setupHome(host: Host) {
   const h = home(host);
   mkdirSync(h, { recursive: true, mode: 0o700 });
   writeFileSync(join(h, ".agent-peers-host"), `${host}\n`);
-  writeFileSync(join(h, ".agent-peers-fleet.json"), JSON.stringify({
-    alpha: `http://127.0.0.1:${PORTS.alpha}`, beta: `http://127.0.0.1:${PORTS.beta}`,
-  }));
+  writeFleet(host);
   writeFileSync(join(h, ".agent-peers-federation-secret"), FED_SECRET, { mode: 0o600 });
   if (host === "beta") fakeHermes(h);
 }
@@ -110,6 +115,32 @@ async function stop(host: Host) {
   p.kill("SIGTERM");
   await p.exited;
   delete procs[host];
+}
+/** Everything a machine holds: every broker table's rows, plus every other file
+ *  under its home (Hermes state.db, chat claims, adoption state) by content. */
+function machineState(host: Host): Record<string, string> {
+  const h = home(host);
+  const out: Record<string, string> = {};
+  const db = new Database(join(h, "peers.db"), { readonly: true });
+  try {
+    for (const { name } of db.query<{ name: string }, []>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all()) {
+      out[`table:${name}`] = db.query(`SELECT * FROM "${name}"`).all().map((r) => JSON.stringify(r)).sort().join("\n");
+    }
+  } finally { db.close(); }
+  for (const entry of readdirSync(h, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile() || /^peers\.db/.test(entry.name)) continue;
+    const path = join(entry.parentPath, entry.name);
+    out[`file:${path.slice(h.length)}`] = createHash("sha256").update(readFileSync(path)).digest("hex");
+  }
+  return out;
+}
+async function deadPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
 }
 function api(host: Host) {
   return createClient(`http://127.0.0.1:${PORTS[host]}`, () => readSharedSecret(join(home(host), "secret")));
@@ -200,6 +231,7 @@ test("machine scope lists the other machine's peers, still as a bare array", asy
 
 test("list_chats finds a Hermes chat on another machine, read-only, and its address reaches that chat", async () => {
   const me = { id: vector.id, session_token: vector.session_token };
+  const before = machineState("beta");
   const found = await api("alpha").listChats({ ...me, peer: "ezra-hermes@beta", query: "drum" });
   expect(found).toMatchObject({ ok: true, peer: "ezra-hermes@beta" });
   expect(found!.chats!.map((c) => [c.title, c.address])).toEqual([
@@ -213,7 +245,9 @@ test("list_chats finds a Hermes chat on another machine, read-only, and its addr
   const bare = await api("alpha").listChats({ ...me, peer: "ezra", query: "practice" });
   expect(bare).toMatchObject({ ok: true, peer: "ezra-hermes@beta" });
   expect(bare!.chats!.map((c) => c.address)).toEqual([`ezra-hermes@beta/${DRUMS}`]);
-  // Listing stored and consumed nothing on beta.
+  // Three lookups changed nothing on beta: no row in any table, no file.
+  expect(Object.keys(before).length).toBeGreaterThan(5);
+  expect(machineState("beta")).toEqual(before);
   expect(await api("beta").pollMessages({ ...ezra, chat: DRUMS })).toEqual([]);
 
   // The listed address is a working send target for exactly that chat.
@@ -249,6 +283,39 @@ test("remote list_chats errors are clear, and the endpoint needs the fleet secre
   expect(((await ok.json()) as { chats: unknown[] }).chats).toHaveLength(3);
 });
 
+test("a bare-name chat lookup won't guess: duplicates on one machine, or a third machine down", async () => {
+  const me = { id: vector.id, session_token: vector.session_token };
+  // Two live Hermes agents answer to "ezra" on beta.
+  const twin = await api("beta").register({ peer_type: "hermes", name: "ezra-hermes-2", pid: process.pid, cwd: "/w/beta",
+    git_root: null, tty: null, summary: "", durable: false, capabilities: ["chat-mail"] });
+  try {
+    const dup = await api("alpha").listChats({ ...me, peer: "ezra" });
+    expect(dup!.ok).toBe(false);
+    expect([...dup!.candidates!].sort()).toEqual(["ezra-hermes-2@beta", "ezra-hermes@beta"]);
+    expect(dup!.error).toMatch(/^"ezra" matches 2 Hermes agents on beta: .+\. Use one exact name\.$/);
+    // One exact name still resolves to one agent.
+    expect((await api("alpha").listChats({ ...me, peer: "ezra-hermes" }))!.peer).toBe("ezra-hermes@beta");
+  } finally {
+    await api("beta").unregister(twin);
+  }
+
+  // Three machines: alpha and beta up, gamma configured but down.
+  await stop("alpha");
+  writeFleet("alpha", { gamma: `http://127.0.0.1:${await deadPort()}` });
+  await start("alpha");
+  try {
+    const down = await api("alpha").listChats({ ...me, peer: "ezra" });
+    expect(down).toEqual({ ok: false, candidates: ["ezra-hermes@beta"],
+      error: 'Can\'t resolve "ezra" while these machines are unreachable: gamma. Use an explicit name@host.' });
+    // An explicit address still works while gamma is down.
+    expect((await api("alpha").listChats({ ...me, peer: "ezra-hermes@beta" }))!.chats).toHaveLength(3);
+  } finally {
+    await stop("alpha");
+    writeFleet("alpha");
+    await start("alpha");
+  }
+}, 60000);
+
 test("an outage queues mail, reports the host, and delivers once on recovery", async () => {
   await stop("beta");
   const res = await fetch(`http://127.0.0.1:${PORTS.alpha}/list-peers`, {
@@ -262,7 +329,7 @@ test("an outage queues mail, reports the host, and delivers once on recovery", a
   expect((await api("alpha").listChats({ id: vector.id, session_token: vector.session_token, peer: "ezra-hermes@beta" }))!.error)
     .toBe("can't list chats on beta: it is unreachable right now");
   expect((await api("alpha").listChats({ id: vector.id, session_token: vector.session_token, peer: "ezra" }))!.error)
-    .toBe("unknown peer: ezra (not checked: beta unreachable)");
+    .toBe('Can\'t resolve "ezra" while these machines are unreachable: beta. Use an explicit name@host.');
   expect(Date.now() - t0).toBeLessThan(5000);
   // Launch-time name suggestion never waits on a down host.
   const t = Date.now();

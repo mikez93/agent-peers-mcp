@@ -507,3 +507,37 @@ test("remote chat lookup qualifies addresses and refuses old brokers, bad answer
   b.offline = true;
   expect((await a.service.chats("beta", { peer: "ezra-hermes" })).error).toBe("can't list chats on beta: it is unreachable right now");
 });
+
+test("remote chat lookup names each HTTP failure and checks input before sending", async () => {
+  const [a, b] = pair();
+  let seen = null as Record<string, unknown> | null;
+  b.deps.listLocalChats = (peer, req) => { seen = { peer, ...req }; return { ok: true, peer, chats: [] }; };
+  // Trimmed peer and query; null and non-finite values mean "not given", never the text "null".
+  await a.service.chats("beta", { peer: "  ezra-hermes ", query: "  drum  ", limit: Number.NaN, offset: 2 });
+  expect(seen).toEqual({ peer: "ezra-hermes", query: "drum", limit: undefined, offset: 2 });
+  await a.service.chats("beta", { peer: "ezra-hermes", query: null as never, limit: null as never });
+  expect(seen).toEqual({ peer: "ezra-hermes", query: undefined, limit: undefined, offset: undefined });
+  // What the other side would refuse is refused here, without a network call.
+  const calls = networkCalls;
+  expect((await a.service.chats("beta", { peer: "ezra-hermes", query: "x".repeat(4097) })).error)
+    .toBe("query is too long (at most 4096 characters)");
+  expect((await a.service.chats("beta", { peer: "x".repeat(201) })).error)
+    .toBe("list_chats needs a peer name of at most 200 characters");
+  expect((await a.service.chats("beta", { peer: "   " })).error)
+    .toBe("list_chats needs a peer name of at most 200 characters");
+  expect(networkCalls).toBe(calls);
+  // A remote failure inside the lookup is a 503 with its reason, not "unreachable".
+  b.deps.listLocalChats = () => { throw new Error("state.db locked"); };
+  expect((await a.service.chats("beta", { peer: "ezra-hermes" })).error)
+    .toBe("can't list chats on beta: error on beta (HTTP 503: chat lookup temporarily unavailable)");
+  // Other statuses, answered by a stand-in for beta.
+  for (const [response, expected] of [
+    [Response.json({ error: "invalid chat query" }, { status: 400 }), "bad request: invalid chat query"],
+    [new Response("gateway down", { status: 502 }), "error on beta (HTTP 502)"],
+    [new Response(null, { status: 403 }), "beta answered HTTP 403"],
+  ] as const) {
+    const custom = new FederationService({ ...a.deps, fetch: (async () => response) as unknown as typeof fetch });
+    expect((await custom.chats("beta", { peer: "ezra-hermes" })).error).toBe(`can't list chats on beta: ${expected}`);
+    await custom.stop();
+  }
+});

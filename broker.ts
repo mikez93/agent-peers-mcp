@@ -1128,20 +1128,28 @@ export async function listChatsRouted(
     return federation.service.chats(parsed.host!, { peer: parsed.name, ...opts });
   }
   const here = listChatsFor(db, parsed.name, req);
-  // Like send_message: a bare name that is unknown here may live on another
-  // machine. Exactly one remote Hermes match is listed; more is ambiguous.
+  // Same rules as a bare-name send: a name unknown here may live on another
+  // machine. Exactly one remote Hermes match is listed. Several matches, or a
+  // down machine that might hold another one, need an explicit name@host.
   if (here.ok || parsed.host || !federation?.config.enabled || !here.error?.startsWith("unknown peer:")) return here;
   const directory = await federation.service.directory(parsed.name);
   const remotes = directory.peers.filter((p) => !federation.service.isLocalHost(p.host) && p.peer_type === "hermes");
+  const names = remotes.map((p) => p.name);
+  const down = directory.unreachable_hosts;
+  if (down.length && remotes.length <= 1) {
+    return { ok: false, error: `Can't resolve "${parsed.name}" while these machines are unreachable: ${down.join(", ")}. Use an explicit name@host.`,
+      ...(names.length ? { candidates: names } : {}) };
+  }
   if (remotes.length === 1) {
     return federation.service.chats(remotes[0]!.host, { peer: parseAddress(remotes[0]!.name).name, ...opts });
   }
   if (remotes.length > 1) {
-    return { ok: false, error: `"${parsed.name}" matches Hermes agents on several machines; use name@host`,
-      candidates: remotes.map((p) => p.name) };
+    const hosts = [...new Set(remotes.map((p) => p.host))];
+    return { ok: false, candidates: names, error: hosts.length === 1
+      ? `"${parsed.name}" matches ${remotes.length} Hermes agents on ${hosts[0]}: ${names.join(", ")}. Use one exact name.`
+      : `"${parsed.name}" matches Hermes agents on several machines (${hosts.join(", ")}): ${names.join(", ")}. Use one exact name@host.` };
   }
-  const down = directory.unreachable_hosts;
-  return down.length ? { ...here, error: `${here.error} (not checked: ${down.join(", ")} unreachable)` } : here;
+  return here;
 }
 
 

@@ -13,13 +13,19 @@ and the existing poll/lease/confirm pipeline.
   an unreachable machine that prevents a certain answer, require an explicit
   address. Discovery does not adopt chats, wake agents, or consume mail.
 - `list_chats` works across machines. `name@host` lists that Hermes agent's
-  chats on its own machine through `GET /federation/chats`; a bare name unknown
-  locally is looked up like a bare-name send (exactly one remote Hermes match is
-  listed, several are ambiguous). Returned names and addresses are qualified
+  chats on its own machine through `GET /federation/chats`. A bare name unknown
+  locally follows the bare-name send rules: exactly one remote Hermes match is
+  listed; several matches, or an unreachable machine that might hold another,
+  need an explicit `name@host`. Returned names and addresses are qualified
   (`ezra-hermes@studio/<chat key>`), so sending to one reaches that chat. The
-  lookup is live and read-only: titles and status only, nothing stored, woken or
-  consumed. An unreachable machine, or one whose broker predates the endpoint
-  (404), returns a clear error.
+  lookup is live and returns titles and status only. The machine that owns the
+  chats writes nothing: no mail, peers, routes or chat state. The asking machine
+  stores no mail, chats or remote peers, but a bare-name lookup runs directory
+  discovery, which records each matching remote peer's reply route (UUID to
+  host) in `federation_routes`, exactly as a bare-name send does. Nothing is
+  woken or consumed. An unreachable machine, refused credentials (401), an old
+  broker without the endpoint (404), a bad request (400) and a remote server
+  error (5xx) each return their own message.
 - A successful remote send means **queued**, not delivered or seen. Enqueue is
   synchronous inside the broker's sender-authentication transaction. Network I/O
   happens later, outside that transaction. Negative receipt IDs identify remote
