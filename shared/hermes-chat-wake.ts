@@ -35,15 +35,17 @@
 // hermes-plugins/agent-peers-desktop-wake instead. It shares these ledgers: it records a
 // desktop_attempt (intent, then accepted or unknown) around ctx.inject_message, and both
 // executors take <ledger>.lock for every read-modify-write. While a desktop attempt is open
-// this driver never launches; it settles the attempt from durable evidence instead
-// (classifyDesktopAttempt, mirrored in the plugin). An unknown attempt blocks every re-wake
-// of that chat until evidence or an operator (`cli.ts hermes-desktop-clear`) resolves it.
+// this driver never launches. Settlement uses only the plugin's correlated turn-lifecycle
+// evidence (its pre_llm_call / post_llm_call hooks, written under <dir>/evidence/); transcript
+// rows, absence and timeouts never settle anything (classifyDesktopAttempt, mirrored in the
+// plugin). Uncertain or unreadable evidence is "unknown" and blocks every re-wake of that chat
+// until an operator runs `cli.ts hermes-desktop-clear`. Cancellation survives settlement.
 
 import { Database } from "bun:sqlite";
-import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { open, readdir, readFile, unlink } from "node:fs/promises";
+import { link, open, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { GENERAL_MAILBOX, type ChatCandidate, type ChatDirectory, type ChatPeer, type ChatResolution } from "./chat-directory.ts";
@@ -221,10 +223,29 @@ function readRegistry(hermesHome: string, profile: string): RegistryEntry[] {
   }
 }
 
-/** Whether process `pid` holds the active-session slot of any of `sessionIds`. */
-export function registryHeldBy(hermesHome: string, profile: string, sessionIds: string[], pid: number): boolean {
+/** Registry entries; [] when the file is absent; null when it exists but cannot be read. */
+function readRegistryStrict(hermesHome: string, profile: string): RegistryEntry[] | null {
+  let text: string;
+  try {
+    text = readFileSync(registryPath(hermesHome, profile), "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? [] : null;
+  }
+  try {
+    const parsed = JSON.parse(text) as { entries?: RegistryEntry[] } | RegistryEntry[];
+    const entries = Array.isArray(parsed) ? parsed : parsed.entries;
+    return Array.isArray(entries) ? entries : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether process `pid` holds the slot of any of `sessionIds`; null when the registry is unreadable. */
+export function registryHeldBy(hermesHome: string, profile: string, sessionIds: string[], pid: number): boolean | null {
+  const entries = readRegistryStrict(hermesHome, profile);
+  if (entries === null) return null;
   const wanted = new Set(sessionIds);
-  return readRegistry(hermesHome, profile).some((e) => wanted.has(String(e.session_id ?? "")) && Number(e.pid) === pid);
+  return entries.some((e) => wanted.has(String(e.session_id ?? "")) && Number(e.pid) === pid);
 }
 
 /** The live holder of a chat's active-session slot, or null. A dead pid is a stale entry, not a holder. */
@@ -405,6 +426,7 @@ export interface HermesDesktopAttempt {
   session_key: string;   // the stored session id the Desktop backend hosts (its registry entry)
   max_id: number;        // broker mail up to this id is what the wake covers
   host_pid: number;      // the Desktop backend process whose in-memory queue holds the wake
+  host_start?: string | null; // `ps -o lstart=` of host_pid when the attempt was made (pid-reuse guard)
   state: HermesDesktopAttemptState;
   created_at: string;
   accepted_at: string | null;
@@ -412,22 +434,32 @@ export interface HermesDesktopAttempt {
 }
 
 export interface HermesDesktopAttemptRecord extends HermesDesktopAttempt {
-  outcome: "handled" | "lost" | "not_submitted" | "cleared" | "cleared_handled";
+  outcome: "handled" | "not_submitted" | "cleared" | "cleared_handled";
   resolved_at: string;
 }
 
-/** handled: the marked wake reached a completed turn. running: that turn started and its host is
- *  alive. pending: accepted and still queued in a live host. lost: no turn started and the host's
- *  in-memory queue is gone. unknown: model work may have happened; never re-wake automatically. */
-export type HermesDesktopVerdict = "handled" | "running" | "pending" | "lost" | "unknown";
+/** handled: the plugin saw the end of the wake's own turn. running: it saw that turn start and the
+ *  host is alive. pending: accepted (or just written) in a live host that still holds the chat.
+ *  unknown: anything else; it blocks every re-wake of the chat until an operator clears it. */
+export type HermesDesktopVerdict = "handled" | "running" | "pending" | "unknown";
 
-export const DESKTOP_INTENT_UNKNOWN_MS = 60_000;
-export const DESKTOP_CLOSED_GRACE_MS = 120_000;
-export const LEDGER_LOCK_STALE_MS = 30_000;
-
-export function desktopWakeMarker(attemptId: string): string {
-  return `[agent-peers-wake ${attemptId}]`;
+/** One lifecycle event the plugin's hook recorded for the wake's own turn. */
+export interface HermesDesktopEvidenceEvent {
+  attempt_id: string;
+  kind: "started" | "ended";
+  turn_id: string | null;
+  session_id: string;
+  pid: number;
+  at: string;
 }
+
+export interface HermesDesktopEvidence {
+  started: HermesDesktopEvidenceEvent | null;
+  ended: HermesDesktopEvidenceEvent | null;
+}
+
+/** How long a just-written intent (the plugin's own call in flight) counts as pending. */
+export const DESKTOP_INTENT_PENDING_MS = 60_000;
 
 export interface HermesChatWakeRequest {
   peerName: string;
@@ -456,6 +488,8 @@ export interface HermesChatWakeOptions {
   backoffScheduleMs?: number[];
   deadlineMs?: number;
   pidAlive?: (pid: number) => boolean;
+  /** Start-time probe for the pid-reuse guard on desktop hosts (tests inject one). */
+  processStart?: (pid: number) => string | null;
   /** Title of the chat that reads the profile's general mailbox. */
   generalChatTitle?: string;
 }
@@ -491,45 +525,57 @@ async function readJson<T>(path: string): Promise<T | null> {
 // ---------------------------------------------------------------------------
 // Desktop-plugin attempts (same rules as hermes-plugins/agent-peers-desktop-wake)
 
-const COMPLETED_ASSISTANT_SQL = "role = 'assistant' AND finish_reason IS NOT NULL AND finish_reason NOT IN ('tool_calls', 'tool_use')";
-
-/**
- * Settle a desktop attempt from durable evidence only. The marked user row is persisted when
- * the host drains the queued wake into a turn; a completed assistant row after it means the
- * turn ended. Without the row, a dead host means the in-memory queue died with it (lost); a
- * live host that never confirmed the call, or that no longer holds the chat after the grace
- * period, is unknown. Unknown never resolves by timeout.
- */
-export function classifyDesktopAttempt(
-  db: Database | null, attempt: HermesDesktopAttempt, hostAlive: boolean, heldByHost: boolean, nowMs: number,
-): HermesDesktopVerdict {
-  if (db) {
-    const ids = lineageIds(db, lineageRoot(db, attempt.chat_key));
-    const marks = ids.map(() => "?").join(",");
-    const marker = db.query(`SELECT id FROM messages WHERE session_id IN (${marks}) AND role = 'user' AND instr(content, ?) > 0 ORDER BY id LIMIT 1`)
-      .get(...ids, desktopWakeMarker(attempt.attempt_id)) as { id: number } | null;
-    if (marker) {
-      const done = db.query(`SELECT 1 AS ok FROM messages WHERE session_id IN (${marks}) AND id > ? AND ${COMPLETED_ASSISTANT_SQL} LIMIT 1`)
-        .get(...ids, marker.id);
-      if (done) return "handled";
-      return hostAlive ? "running" : "unknown";
-    }
-  }
-  if (!hostAlive) return "lost";
-  if (attempt.state === "unknown") return "unknown";
-  if (attempt.state === "intent") return nowMs - Date.parse(attempt.created_at) > DESKTOP_INTENT_UNKNOWN_MS ? "unknown" : "pending";
-  if (heldByHost) return "pending";
-  return nowMs - Date.parse(attempt.accepted_at ?? attempt.created_at) > DESKTOP_CLOSED_GRACE_MS ? "unknown" : "pending";
+export function desktopEvidencePath(stateDir: string, profile: string, attemptId: string, kind: "started" | "ended"): string {
+  return join(stateDir, "chat-wake", profile, "evidence", `${attemptId}.${kind}.json`);
 }
 
-/** Apply a verdict to a ledger in place; returns the ledger state and detail to save. */
+/** The plugin's recorded events for an attempt; null when evidence exists but cannot be read. */
+export function readDesktopEvidence(stateDir: string, profile: string, attemptId: string): HermesDesktopEvidence | null {
+  const out: HermesDesktopEvidence = { started: null, ended: null };
+  for (const kind of ["started", "ended"] as const) {
+    let text: string;
+    try {
+      text = readFileSync(desktopEvidencePath(stateDir, profile, attemptId, kind), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return null;
+    }
+    try {
+      const value = JSON.parse(text) as HermesDesktopEvidenceEvent;
+      if (!value || value.attempt_id !== attemptId) return null;
+      out[kind] = value;
+    } catch {
+      return null;
+    }
+  }
+  return out;
+}
+
+/**
+ * Settle a desktop attempt from positive, correlated evidence only (Kepler §20 as amended,
+ * AP10808; Marco AP10806). "ended" is written by the plugin's post_llm_call hook, which Hermes
+ * fires once per uninterrupted turn with a final response after the session is persisted, and
+ * only when that turn's own prompt carries this attempt's marker. Transcript rows,
+ * finish_reason, absence of evidence, a closed chat and timeouts settle nothing: whatever is not
+ * proven is pending (still plausibly queued) or unknown (operator adjudication).
+ */
+export function classifyDesktopAttempt(
+  evidence: HermesDesktopEvidence | null, attempt: HermesDesktopAttempt, hostAlive: boolean, heldByHost: boolean | null, nowMs: number,
+): HermesDesktopVerdict {
+  if (evidence === null) return "unknown";
+  if (evidence.ended) return "handled";
+  if (evidence.started) return hostAlive ? "running" : "unknown";
+  if (attempt.state === "unknown" || !hostAlive) return "unknown";
+  if (attempt.state === "intent") return nowMs - Date.parse(attempt.created_at) <= DESKTOP_INTENT_PENDING_MS ? "pending" : "unknown";
+  if (heldByHost === null) return "unknown";
+  return heldByHost ? "pending" : "unknown";
+}
+
+/** Apply a verdict in place; returns the state and detail to save. A cancelled ledger stays cancelled. */
 export function applyDesktopVerdict(ledger: HermesChatWakeLedger, verdict: HermesDesktopVerdict, now: Date): [HermesChatWakeState, string] {
   const attempt = ledger.desktop_attempt!;
   const id = attempt.attempt_id.slice(0, 8);
-  const close = (outcome: HermesDesktopAttemptRecord["outcome"]) => {
-    ledger.last_desktop_attempt = { ...attempt, outcome, resolved_at: now.toISOString() };
-    ledger.desktop_attempt = null;
-  };
+  let result: [HermesChatWakeState, string];
   switch (verdict) {
     case "handled":
       // The desktop turn counts as the launch for this mail, so the gateway path's
@@ -538,43 +584,113 @@ export function applyDesktopVerdict(ledger: HermesChatWakeLedger, verdict: Herme
       ledger.launched_max_id = Math.max(ledger.launched_max_id, attempt.max_id);
       ledger.attempts = 0;
       ledger.next_attempt_at = null;
-      close("handled");
-      return ["done", `desktop wake ${id} reached a completed turn`];
-    case "lost":
-      close("lost");
-      return ["waiting_desktop", `desktop wake ${id} lost: host pid ${attempt.host_pid} exited before the turn started`];
+      ledger.last_desktop_attempt = { ...attempt, outcome: "handled", resolved_at: now.toISOString() };
+      ledger.desktop_attempt = null;
+      result = ["done", `desktop wake ${id} reached the end of its own turn`];
+      break;
     case "unknown":
       attempt.state = "unknown";
-      return ["desktop_unknown", `desktop wake ${id} outcome unknown; no re-wake until evidence or cli.ts hermes-desktop-clear`];
+      result = ["desktop_unknown", `desktop wake ${id} outcome unknown; no re-wake until cli.ts hermes-desktop-clear`];
+      break;
     case "running":
-      return ["waiting_desktop", `desktop wake ${id} turn is running in pid ${attempt.host_pid}`];
+      result = ["waiting_desktop", `desktop wake ${id} turn started in pid ${attempt.host_pid}`];
+      break;
     default:
-      return ["waiting_desktop", `desktop wake ${id} is ${attempt.state} in pid ${attempt.host_pid}`];
+      result = ["waiting_desktop", `desktop wake ${id} is ${attempt.state} in pid ${attempt.host_pid}`];
+  }
+  if (ledger.state === "cancelled") return ["cancelled", `wakes stopped by operator; ${result[1]}`];
+  return result;
+}
+
+/** `ps -o lstart=` for pid, whitespace-normalized; null when unavailable. Same string as the plugin. */
+export function processStartTime(pid: number): string | null {
+  try {
+    const run = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 });
+    const out = String(run.stdout ?? "").trim().split(/\s+/).join(" ");
+    return run.status === 0 && out ? out : null;
+  } catch {
+    return null;
   }
 }
 
+let selfStartCache: string | null | undefined;
+function selfStart(): string | null {
+  if (selfStartCache === undefined) selfStartCache = processStartTime(process.pid);
+  return selfStartCache;
+}
+
+interface LockOwner { pid: number; start: string | null; token: string }
+
+function parseLockOwner(text: string): LockOwner | null {
+  try {
+    const value = JSON.parse(text) as Partial<LockOwner>;
+    if (Number.isInteger(value.pid) && typeof value.token === "string") {
+      return { pid: value.pid!, start: typeof value.start === "string" ? value.start : null, token: value.token };
+    }
+  } catch { /* foreign or partial content */ }
+  return null;
+}
+
+/** Reapable only when the pid is dead, or alive but started at a different time (pid reuse). Never on age. */
+function lockHolderGone(owner: LockOwner): boolean {
+  if (!pidAlive(owner.pid)) return true;
+  if (!owner.start) return false;
+  const current = processStartTime(owner.pid);
+  return current !== null && current !== owner.start;
+}
+
+async function reapLock(lockPath: string, judged: string): Promise<void> {
+  const aside = `${lockPath}.reap.${process.pid}.${randomUUID()}`;
+  try { await rename(lockPath, aside); } catch { return; }
+  const taken = await readFile(aside, "utf8").catch(() => null);
+  if (taken !== judged) {
+    // A fresh owner took the lock between our read and the rename: give it back.
+    await link(aside, lockPath).catch(() => undefined);
+  }
+  await unlink(aside).catch(() => undefined);
+}
+
 /**
- * Exclusive lock beside a ledger: "<pid> <epoch ms>" in <ledger>.lock, created with O_EXCL.
- * A lock whose pid is dead or that is older than LEDGER_LOCK_STALE_MS is broken. Returns a
- * release function, or null when another live executor holds it past the wait.
+ * Exclusive lock beside a ledger, shared with the Python plugin. <ledger>.lock holds
+ * {"pid","start","token"} and only ever appears complete: the owner writes a private temp file
+ * and link()s it into place, which fails if a lock exists. Unparseable content counts as a live
+ * holder. A holder is reaped only when lockHolderGone; reaping renames the lock aside and restores
+ * it if it turned out fresh. The release removes the lock only while it still carries our token.
+ * Returns the release function, or null when a live holder kept it past the wait.
  */
 export async function acquireLedgerLock(ledgerPath: string, waitMs = 2000): Promise<(() => Promise<void>) | null> {
   const lockPath = `${ledgerPath}.lock`;
   await ensurePrivateDir(dirname(lockPath));
+  const body = JSON.stringify({ pid: process.pid, start: selfStart(), token: randomUUID() });
   const until = Date.now() + waitMs;
   for (;;) {
+    const tmp = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(tmp, body, { mode: 0o600, flag: "wx" });
+    let acquired = false;
     try {
-      const handle = await open(lockPath, "wx", 0o600);
-      try { await handle.writeFile(`${process.pid} ${Date.now()}`, "utf8"); } finally { await handle.close(); }
-      return async () => { await unlink(lockPath).catch(() => undefined); };
+      await link(tmp, lockPath);
+      acquired = true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    } finally {
+      await unlink(tmp).catch(() => undefined);
     }
-    const [pidText, atText] = (await readFile(lockPath, "utf8").catch(() => "")).trim().split(/\s+/);
-    const holder = Number(pidText);
-    const at = Number(atText);
-    if (!pidAlive(holder) || !Number.isFinite(at) || Date.now() - at > LEDGER_LOCK_STALE_MS) {
-      await unlink(lockPath).catch(() => undefined);
+    if (acquired) {
+      return async () => {
+        const current = await readFile(lockPath, "utf8").catch(() => null);
+        if (current === body) await unlink(lockPath).catch(() => undefined);
+      };
+    }
+    let text: string;
+    try {
+      text = await readFile(lockPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      text = "";
+    }
+    const owner = parseLockOwner(text);
+    if (owner && lockHolderGone(owner)) {
+      await reapLock(lockPath, text);
       continue;
     }
     if (Date.now() >= until) return null;
@@ -613,6 +729,7 @@ export class HermesChatWakeDriver {
   private readonly schedule: number[];
   private readonly deadlineMs: number;
   private readonly alive: (pid: number) => boolean;
+  private readonly startOf: (pid: number) => string | null;
   private readonly generalChatTitle: string;
   private readonly children = new Map<number, { exitCode: number | null; done: boolean }>();
 
@@ -625,6 +742,7 @@ export class HermesChatWakeDriver {
     this.schedule = opts.backoffScheduleMs?.length ? opts.backoffScheduleMs : DEFAULT_HERMES_CHAT_WAKE_BACKOFF_MS;
     this.deadlineMs = opts.deadlineMs ?? DEFAULT_HERMES_CHAT_WAKE_DEADLINE_MS;
     this.alive = opts.pidAlive ?? pidAlive;
+    this.startOf = opts.processStart ?? processStartTime;
     this.generalChatTitle = opts.generalChatTitle ?? GENERAL_CHAT_TITLE;
   }
 
@@ -801,7 +919,9 @@ export class HermesChatWakeDriver {
       }
       ledger.last_desktop_attempt = { ...attempt, outcome: handled ? "cleared_handled" : "cleared", resolved_at: this.now().toISOString() };
       ledger.desktop_attempt = null;
-      return this.save(ledger, handled ? "done" : "waiting_desktop", `desktop wake ${attempt.attempt_id.slice(0, 8)} cleared by operator${handled ? " as handled" : ""}`);
+      const detail = `desktop wake ${attempt.attempt_id.slice(0, 8)} cleared by operator${handled ? " as handled" : ""}`;
+      if (ledger.state === "cancelled") return this.save(ledger, "cancelled", `wakes stopped by operator; ${detail}`);
+      return this.save(ledger, handled ? "done" : "waiting_desktop", detail);
     }, true);
   }
 
@@ -821,21 +941,30 @@ export class HermesChatWakeDriver {
     }
   }
 
+  private hostAlive(attempt: HermesDesktopAttempt): boolean {
+    if (!this.alive(attempt.host_pid)) return false;
+    if (!attempt.host_start) return true;
+    const current = this.startOf(attempt.host_pid);
+    return current === null || current === attempt.host_start;
+  }
+
   private async reconcileDesktop(ledger: HermesChatWakeLedger): Promise<HermesChatWakeLedger> {
     const attempt = ledger.desktop_attempt;
     if (!attempt) return ledger;
     const db = openReadOnly(stateDbPath(this.hermesHome, ledger.profile));
+    let ids: string[];
     try {
-      const ids = db ? lineageIds(db, lineageRoot(db, attempt.chat_key)) : [attempt.chat_key];
-      if (!ids.includes(attempt.session_key)) ids.push(attempt.session_key);
-      const verdict = classifyDesktopAttempt(
-        db, attempt, this.alive(attempt.host_pid), registryHeldBy(this.hermesHome, ledger.profile, ids, attempt.host_pid), this.now().getTime(),
-      );
-      const [state, detail] = applyDesktopVerdict(ledger, verdict, this.now());
-      return this.save(ledger, state, detail);
+      ids = db ? lineageIds(db, lineageRoot(db, attempt.chat_key)) : [attempt.chat_key];
     } finally {
       db?.close();
     }
+    if (!ids.includes(attempt.session_key)) ids.push(attempt.session_key);
+    const verdict = classifyDesktopAttempt(
+      readDesktopEvidence(this.stateDir, ledger.profile, attempt.attempt_id), attempt, this.hostAlive(attempt),
+      registryHeldBy(this.hermesHome, ledger.profile, ids, attempt.host_pid), this.now().getTime(),
+    );
+    const [state, detail] = applyDesktopVerdict(ledger, verdict, this.now());
+    return this.save(ledger, state, detail);
   }
 
   private admissionSeq(db: Database, sessionId: string): number {

@@ -1,6 +1,9 @@
 """Unit tests for hermes-plugins/agent-peers-desktop-wake (fake Hermes ctx, real files).
 
 Run: python3 tests/python/test_hermes_desktop_wake.py  (bun test runs it too).
+DESKTOP_WAKE_PLUGIN=<path to __init__.py> runs the same tests against another copy of
+the plugin; the Ap10806Regressions class uses only APIs that 4e5fd81 also had, so it
+can show each of Marco's findings red on that commit and green here.
 """
 from __future__ import annotations
 
@@ -16,11 +19,12 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location(
-    "agent_peers_desktop_wake", ROOT / "hermes-plugins" / "agent-peers-desktop-wake" / "__init__.py")
+PLUGIN = Path(os.environ.get("DESKTOP_WAKE_PLUGIN") or ROOT / "hermes-plugins" / "agent-peers-desktop-wake" / "__init__.py")
+SPEC = importlib.util.spec_from_file_location("agent_peers_desktop_wake", PLUGIN)
 dw = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dw)
 
@@ -54,6 +58,7 @@ class FakeCtx:
         self._manager = manager
         self.calls: list[dict] = []
         self.unload: list = []
+        self.hooks: dict[str, list] = {}
         self.result = True
         self.allowed = True
         self.during = None
@@ -71,6 +76,9 @@ class FakeCtx:
                 "inject_message: TUI scheduling failed for plugin %s", self.plugin_id)
             return False
         return self.result
+
+    def register_hook(self, name, callback):
+        self.hooks.setdefault(name, []).append(callback)
 
     def on_unload(self, callback):
         self.unload.append(callback)
@@ -127,10 +135,132 @@ class Base(unittest.TestCase):
         dw.atomic_write_json(dw.ledger_path(self.state, PROFILE, chat), value)
 
     def add_turn(self, content: str, done: bool = True, session: str = CHAT_A) -> None:
+        """Transcript rows only. The plugin no longer reads them; tests use them to prove that."""
         self.db.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, ?)", (session, content, self.now))
         if done:
             self.db.execute("INSERT INTO messages (session_id, role, content, timestamp, finish_reason) VALUES (?, 'assistant', 'ok', ?, 'stop')", (session, self.now))
         self.db.commit()
+
+    def turn(self, prompt, session: str = CHAT_A, turn_id: str = "t1", end: bool = True) -> None:
+        """What Hermes does for one turn: pre_llm_call at the start, post_llm_call after persistence."""
+        self.assertIsNone(self.wake.on_pre_llm_call(session_id=session, task_id="x", turn_id=turn_id, user_message=prompt,
+                                                    conversation_history=[], is_first_turn=False, model="m", platform="desktop"))
+        if end:
+            self.assertIsNone(self.wake.on_post_llm_call(session_id=session, task_id="x", turn_id=turn_id, user_message=prompt,
+                                                         assistant_response="done", conversation_history=[], model="m", platform="desktop"))
+
+    def evidence(self, attempt_id: str, kind: str) -> Path:
+        return self.state / "chat-wake" / PROFILE / "evidence" / f"{attempt_id}.{kind}.json"
+
+
+class Ap10806Regressions(Base):
+    """Marco AP10806 findings 1-5. Red on 4e5fd81, green on this revision."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.opt_in(f"ezra {CHAT_A}\n")
+
+    def test_f1_provisional_assistant_rows_never_settle_the_wake(self):
+        self.wake.tick()
+        self.add_turn(self.ctx.calls[0]["content"], done=False)
+        for reason in ("verification_required", "verify_hook_continue", "stop"):
+            self.db.execute("INSERT INTO messages (session_id, role, content, timestamp, finish_reason) VALUES (?, 'assistant', 'interim', ?, ?)",
+                            (CHAT_A, self.now, reason))
+            self.db.commit()
+            self.wake.settle_own()
+            led = self.ledger()
+            self.assertNotEqual(led["state"], "done", f"a transcript row ({reason}) is not the wake's own turn ending")
+            self.assertEqual(led["handled_max_id"], 0)
+            self.assertIsNotNone(led["desktop_attempt"])
+
+    def test_f2_unreadable_transcript_with_dead_host_is_unknown_not_lost(self):
+        self.wake.tick()
+        self.add_turn(self.ctx.calls[0]["content"], done=False)
+        path = dw.ledger_path(self.state, PROFILE, CHAT_A)
+        led = self.ledger()
+        led["desktop_attempt"]["state"] = "unknown"
+        self.alive.clear()
+        with patch.object(dw, "open_ro", return_value=None):
+            self.wake._settle(path, led)
+        after = self.ledger()
+        self.assertEqual(after["state"], "desktop_unknown")
+        self.assertIsNotNone(after["desktop_attempt"], "uncertain stays open for the operator")
+        self.alive.add(HOST)
+        self.entries[1]["max_id"] = 15
+        self.wake.tick()
+        self.assertEqual(len(self.ctx.calls), 1, "no automatic re-inject")
+
+    def test_f3_lock_owner_is_published_atomically(self):
+        ledger = self.tmp / "chat.json"
+        original_fdopen = os.fdopen
+        second = []
+        armed = [True]
+
+        def during_create(fd, *args, **kwargs):
+            if armed[0]:
+                armed[0] = False
+                second.append(dw.acquire_lock(ledger, wait=0))
+            return original_fdopen(fd, *args, **kwargs)
+        with patch.object(dw.os, "fdopen", side_effect=during_create):
+            first = dw.acquire_lock(ledger, wait=0)
+        self.assertFalse(first is not None and second[0] is not None, "two simultaneous owners")
+        for release in (first, second[0]):
+            if release:
+                release()
+
+    def test_f3_live_holder_is_never_reaped_on_age(self):
+        ledger = self.tmp / "chat.json"
+        lock = self.tmp / "chat.json.lock"
+        lock.write_text(json.dumps({"pid": os.getpid(), "token": "someone-else"}))
+        self.assertIsNone(dw.acquire_lock(ledger, wait=0))
+        lock.write_text(f"{os.getpid()} {int(time.time() * 1000) - 31_000}")  # old format, "stale" by age
+        self.assertIsNone(dw.acquire_lock(ledger, wait=0))
+        self.assertTrue(lock.exists())
+
+    def test_f3_release_checks_the_owner(self):
+        ledger = self.tmp / "chat.json"
+        lock = self.tmp / "chat.json.lock"
+        release = dw.acquire_lock(ledger, wait=0)
+        self.assertIsNotNone(release)
+        lock.write_text(json.dumps({"pid": os.getpid(), "token": "successor"}))  # reaped and retaken meanwhile
+        release()
+        self.assertTrue(lock.exists(), "release removed another owner's lock")
+
+    def test_f4_cancellation_survives_settlement(self):
+        self.wake.tick()
+        path = dw.ledger_path(self.state, PROFILE, CHAT_A)
+        led = self.ledger()
+        led["state"] = "cancelled"
+        dw.atomic_write_json(path, led)
+        self.wake.tick()
+        self.assertEqual(self.ledger()["state"], "cancelled")
+        self.alive.clear()
+        self.wake._settle(path, self.ledger())
+        self.assertEqual(self.ledger()["state"], "cancelled")
+        self.alive.add(HOST)
+        self.add_turn(self.ctx.calls[0]["content"])
+        self.entries[1]["max_id"] = 15
+        self.wake.tick()
+        self.assertEqual(self.ledger()["state"], "cancelled")
+        self.assertEqual(len(self.ctx.calls), 1)
+
+    def test_f5_exact_chat_opt_in_is_rechecked_after_the_inbox_read(self):
+        entries = list(self.entries)
+
+        def opt_out():
+            self.opt_in("")
+            return entries
+        self.wake.inbox = opt_out
+        self.wake.tick()
+        self.assertEqual(self.ctx.calls, [])
+
+        def swap_to_b():
+            self.opt_in(f"ezra {CHAT_B}\n")  # a different chat's opt-in does not cover A
+            return [entries[1]]
+        self.opt_in(f"ezra {CHAT_A}\n")
+        self.wake.inbox = swap_to_b
+        self.wake.tick()
+        self.assertEqual(self.ctx.calls, [])
 
 
 class Gates(Base):
@@ -177,20 +307,39 @@ class Gates(Base):
             self.env.pop("AGENT_PEERS_WAKE_DISABLED", None)
         self.assertEqual(self.ctx.calls, [])
 
-    def test_kill_switch_is_rechecked_immediately_before_inject(self):
+    def test_kill_switch_after_the_inbox_read_stops_before_the_intent(self):
         self.opt_in(f"ezra {CHAT_A}\n")
         entries = list(self.entries)
 
         def inbox():
-            (self.state / "disabled").write_text("")  # flipped after the tick's first check
+            (self.state / "disabled").write_text("")
             return entries
         self.wake.inbox = inbox
         events = self.wake.tick()
         self.assertEqual(self.ctx.calls, [])
-        self.assertEqual(events[-1]["result"], "not_submitted")
-        led = self.ledger()
-        self.assertIsNone(led["desktop_attempt"])
-        self.assertEqual(led["last_desktop_attempt"]["outcome"], "not_submitted")
+        self.assertEqual(events[-1]["action"], "skip")
+        self.assertIn("disabled", events[-1]["why"])
+        self.assertFalse(dw.ledger_path(self.state, PROFILE, CHAT_A).exists(), "no intent written")
+
+    def test_kill_switch_or_opt_out_after_the_intent_stops_the_inject(self):
+        for flip in (lambda: (self.state / "disabled").write_text(""), lambda: self.opt_in(f"ezra {CHAT_B}\n")):
+            self.opt_in(f"ezra {CHAT_A}\n")
+            (self.state / "disabled").unlink(missing_ok=True)
+            dw.ledger_path(self.state, PROFILE, CHAT_A).unlink(missing_ok=True)
+            original = self.wake._save
+
+            def save(path, ledger, state, detail, original=original, flip=flip):
+                original(path, ledger, state, detail)
+                if "intent" in detail:
+                    flip()
+            self.wake._save = save
+            events = self.wake.tick()
+            self.wake._save = original
+            self.assertEqual(self.ctx.calls, [])
+            self.assertEqual(events[-1]["result"], "not_submitted")
+            led = self.ledger()
+            self.assertIsNone(led["desktop_attempt"])
+            self.assertEqual(led["last_desktop_attempt"]["outcome"], "not_submitted")
 
     def test_refuses_cli_gateway_and_hostless_processes(self):
         self.opt_in(f"ezra {CHAT_A}\n")
@@ -226,7 +375,7 @@ class Gates(Base):
         self.opt_in(f"ezra {CHAT_A}\n")
         path = dw.ledger_path(self.state, PROFILE, CHAT_A)
         path.parent.mkdir(parents=True, exist_ok=True)
-        (path.parent / (path.name + ".lock")).write_text(f"{os.getpid()} {int(time.time() * 1000)}")
+        (path.parent / (path.name + ".lock")).write_text(json.dumps({"pid": os.getpid(), "start": dw.self_start(), "token": "t"}))
         original = dw.LOCK_WAIT_SECONDS
         dw.acquire_lock.__defaults__ = (0.05,)
         try:
@@ -252,7 +401,7 @@ class Attempts(Base):
         self.assertEqual(led["state"], "waiting_desktop")
         self.assertEqual(led["desktop_attempt"]["state"], "accepted")
         self.assertEqual(led["handled_max_id"], 0, "accepted is not handled")
-        self.now += 3600  # a cooldown would have expired; the open attempt still dedupes
+        self.now += 3600  # a cooldown would have expired; the open attempt still blocks
         self.entries[1]["max_id"] = 15
         self.wake.tick()
         self.assertEqual(len(self.ctx.calls), 1)
@@ -284,15 +433,18 @@ class Attempts(Base):
             self.assertEqual(len(self.ctx.calls), calls + 1)
             self.assertEqual(self.ledger()["state"], "desktop_unknown")
 
-    def test_completed_marked_turn_settles_handled_then_only_new_mail_wakes(self):
+    def test_the_wakes_own_turn_settles_it_and_only_new_mail_wakes_again(self):
         self.wake.tick()
         attempt = self.ledger()["desktop_attempt"]
-        self.add_turn(f"Mike: please also check the drums\n\n{self.ctx.calls[0]['content']}", done=False)
+        prompt = f"Mike: please also check the drums\n\n{self.ctx.calls[0]['content']}"  # merged with Mike's text
+        self.turn(prompt, end=False)
+        self.assertTrue(self.evidence(attempt["attempt_id"], "started").exists())
         self.wake.tick()
-        self.assertEqual(self.ledger()["desktop_attempt"]["attempt_id"], attempt["attempt_id"], "running turn waits")
-        self.db.execute("INSERT INTO messages (session_id, role, content, timestamp, finish_reason) VALUES (?, 'assistant', 'done', ?, 'stop')", (CHAT_A, self.now))
-        self.db.commit()
-        self.wake.tick()  # settles handled; same max_id is not re-woken
+        led = self.ledger()
+        self.assertEqual(led["desktop_attempt"]["attempt_id"], attempt["attempt_id"], "a running turn waits")
+        self.assertIn("turn started", led["detail"])
+        self.wake.on_post_llm_call(session_id=CHAT_A, turn_id="t1", user_message=prompt, assistant_response="done")
+        self.wake.tick()  # settles handled; the same max_id is not woken again
         led = self.ledger()
         self.assertEqual(led["state"], "done")
         self.assertEqual(led["handled_max_id"], 10)
@@ -304,14 +456,119 @@ class Attempts(Base):
         self.assertEqual(len(self.ctx.calls), 2)
         self.assertEqual(self.ledger()["desktop_attempt"]["max_id"], 14)
 
-    def test_marker_found_in_a_compression_continuation(self):
+    def test_hooks_record_only_the_wakes_own_turn(self):
         self.wake.tick()
+        aid = self.ledger()["desktop_attempt"]["attempt_id"]
+        prompt = self.ctx.calls[0]["content"]
+        self.turn("Mike typed this; no marker")
+        self.turn(prompt, session=CHAT_B)  # the marker in another chat's turn
+        self.assertFalse(self.evidence(aid, "started").exists())
+        other = dw.DesktopWake(self.ctx, env=self.env, clock=lambda: self.now, pid=5555, alive=lambda pid: True, inbox=lambda: [])
+        other.on_pre_llm_call(session_id=CHAT_A, turn_id="t9", user_message=prompt)  # another process
+        self.assertFalse(self.evidence(aid, "started").exists())
+        self.turn(prompt, turn_id="t1", end=False)
+        self.wake.on_post_llm_call(session_id=CHAT_A, turn_id="t2", user_message=prompt)  # a different turn's end
+        self.assertFalse(self.evidence(aid, "ended").exists())
+        self.wake.settle_own()
+        self.assertEqual(self.ledger()["state"], "waiting_desktop")
+        self.wake.on_post_llm_call(session_id=CHAT_A, turn_id="t1", user_message=[{"type": "text", "text": prompt}])
+        self.assertTrue(self.evidence(aid, "ended").exists())
+        self.wake.settle_own()
+        self.assertEqual(self.ledger()["state"], "done")
+
+    def test_closed_with_the_wake_queued_is_unknown_never_reinjected_until_operator_clear(self):
+        self.wake.tick()
+        self.hold(CHAT_B)  # Mike closed chat A; Hermes drops a queued prompt at close
+        self.wake.settle_own()
+        self.assertEqual(self.ledger()["state"], "desktop_unknown")
+        self.hold(CHAT_A, CHAT_B)  # reopened, and new mail arrives
+        self.entries[1]["max_id"] = 15
+        self.now += 7200
+        self.wake.tick()
+        self.assertEqual(len(self.ctx.calls), 1, "no automatic re-inject")
+        # What cli.ts hermes-desktop-clear writes; after it the next tick may wake again.
+        led = self.ledger()
+        led["last_desktop_attempt"] = {**led["desktop_attempt"], "outcome": "cleared"}
+        led["desktop_attempt"] = None
+        led["state"] = "waiting_desktop"
+        dw.atomic_write_json(dw.ledger_path(self.state, PROFILE, CHAT_A), led)
+        self.wake.tick()
+        self.assertEqual(len(self.ctx.calls), 2)
+
+    def test_late_evidence_still_settles_an_unknown_attempt(self):
+        self.wake.tick()
+        prompt = self.ctx.calls[0]["content"]
+        self.hold(CHAT_B)
+        self.wake.settle_own()
+        self.assertEqual(self.ledger()["state"], "desktop_unknown")
+        self.turn(prompt)
+        self.wake.settle_own()
+        self.assertEqual(self.ledger()["state"], "done")
+
+    def test_duplicate_text_dropped_while_returning_true_stays_pending_and_blocks(self):
+        # _enqueue_prompt may drop an exact duplicate of the in-flight text and still return True.
+        self.wake.tick()
+        for _ in range(3):
+            self.now += 3600
+            self.entries[1]["max_id"] += 1
+            self.wake.tick()
+        led = self.ledger()
+        self.assertEqual(led["state"], "waiting_desktop")
+        self.assertEqual(led["desktop_attempt"]["state"], "accepted")
+        self.assertEqual(len(self.ctx.calls), 1, "pending blocks re-wake; only evidence or an operator ends it")
+
+    def test_lineage_after_compression_rekey(self):
+        self.wake.tick()
+        prompt = self.ctx.calls[0]["content"]
         self.db.execute("UPDATE sessions SET end_reason = 'compression' WHERE id = ?", (CHAT_A,))
         self.db.execute("INSERT INTO sessions (id, source, parent_session_id, started_at) VALUES ('tip', 'desktop', ?, ?)", (CHAT_A, T0 + 1))
         self.db.commit()
-        self.add_turn(self.ctx.calls[0]["content"], session="tip")
+        self.hold("tip", CHAT_B)  # the registry entry is re-keyed to the tip
+        self.wake.settle_own()
+        self.assertEqual(self.ledger()["state"], "waiting_desktop", "still held through the lineage")
+        self.turn(prompt, session="tip")
         self.wake.settle_own()
         self.assertEqual(self.ledger()["state"], "done")
+        self.entries[1]["max_id"] = 20
+        self.wake.tick()
+        self.assertEqual(self.ctx.calls[-1]["session_key"], "tip", "inject target is the registry entry's session_id")
+        self.assertEqual(self.ledger()["desktop_attempt"]["chat_key"], CHAT_A)
+
+    def test_unreadable_evidence_or_registry_is_unknown(self):
+        self.wake.tick()
+        aid = self.ledger()["desktop_attempt"]["attempt_id"]
+        self.evidence(aid, "started").parent.mkdir(parents=True, exist_ok=True)
+        self.evidence(aid, "started").write_text("{not json")
+        self.wake.settle_own()
+        self.assertEqual(self.ledger()["state"], "desktop_unknown")
+        self.evidence(aid, "started").unlink()
+        led = self.ledger()
+        led["desktop_attempt"]["state"] = "accepted"
+        dw.atomic_write_json(dw.ledger_path(self.state, PROFILE, CHAT_A), led)
+        (self.home / "runtime" / "active_sessions.json").write_text("{broken")
+        self.wake.settle_own()
+        self.assertEqual(self.ledger()["state"], "desktop_unknown")
+
+    def test_reused_host_pid_is_not_the_host(self):
+        self.wake.host_start = "Sat Nov  1 09:00:00 2026"
+        self.wake.tick()
+        self.assertEqual(self.ledger()["desktop_attempt"]["host_start"], "Sat Nov  1 09:00:00 2026")
+        self.wake.start_of = lambda pid: "Sat Nov  1 11:00:00 2026"  # same pid, different process
+        self.wake.settle_own()
+        self.assertEqual(self.ledger()["state"], "desktop_unknown")
+
+    def test_cancelled_ledger_keeps_cancelled_when_its_attempt_settles_handled(self):
+        self.wake.tick()
+        prompt = self.ctx.calls[0]["content"]
+        led = self.ledger()
+        led["state"] = "cancelled"
+        dw.atomic_write_json(dw.ledger_path(self.state, PROFILE, CHAT_A), led)
+        self.turn(prompt)
+        self.wake.settle_own()
+        led = self.ledger()
+        self.assertEqual(led["state"], "cancelled")
+        self.assertIsNone(led["desktop_attempt"])
+        self.assertEqual(led["last_desktop_attempt"]["outcome"], "handled")
 
     def test_merge_with_mikes_queued_text_keeps_both_and_labels_the_wake(self):
         text = dw.wake_text("abc123", CHAT_A)
@@ -330,31 +587,39 @@ class Classifier(Base):
         value.update(over)
         return value
 
-    def classify(self, attempt, alive=True, held=True, later=0.0):
-        db = dw.open_ro(self.home / "state.db")
-        try:
-            return dw.classify_attempt(db, attempt, alive, held, self.now + later)
-        finally:
-            db.close()
-
     def test_rules(self):
-        self.assertEqual(self.classify(self.attempt(), alive=False), "lost")
-        self.assertEqual(self.classify(self.attempt(state="unknown"), alive=False), "lost", "dead host, no row: nothing ran")
-        self.assertEqual(self.classify(self.attempt(state="unknown")), "unknown")
-        self.assertEqual(self.classify(self.attempt(state="intent")), "pending")
-        self.assertEqual(self.classify(self.attempt(state="intent"), later=61), "unknown")
-        self.assertEqual(self.classify(self.attempt(), held=True, later=9999), "pending", "queued behind a long turn")
-        self.assertEqual(self.classify(self.attempt(), held=False, later=60), "pending")
-        self.assertEqual(self.classify(self.attempt(), held=False, later=121), "unknown", "closed with a queued wake")
-        self.add_turn("x [agent-peers-wake a1] y", done=False)
-        self.assertEqual(self.classify(self.attempt()), "running")
-        self.assertEqual(self.classify(self.attempt(), alive=False), "unknown", "turn started, host died")
-        self.db.execute("INSERT INTO messages (session_id, role, content, timestamp, finish_reason) VALUES (?, 'assistant', '', ?, 'tool_calls')", (CHAT_A, self.now))
-        self.db.commit()
-        self.assertEqual(self.classify(self.attempt()), "running", "a tool-call step is not the end of the turn")
-        self.db.execute("INSERT INTO messages (session_id, role, content, timestamp, finish_reason) VALUES (?, 'assistant', 'ok', ?, 'stop')", (CHAT_A, self.now))
-        self.db.commit()
-        self.assertEqual(self.classify(self.attempt(), alive=False), "handled")
+        none = {"started": None, "ended": None}
+        started = {"started": {"attempt_id": "a1"}, "ended": None}
+        ended = {"started": {"attempt_id": "a1"}, "ended": {"attempt_id": "a1"}}
+
+        def c(ev, att, alive=True, held=True, later=0.0):
+            return dw.classify_attempt(ev, att, alive, held, self.now + later)
+        self.assertEqual(c(None, self.attempt()), "unknown", "unreadable evidence is never a negative")
+        self.assertEqual(c(none, self.attempt(), alive=False), "unknown", "a dead host proves nothing")
+        self.assertEqual(c(none, self.attempt(state="unknown")), "unknown")
+        self.assertEqual(c(none, self.attempt(state="intent")), "pending")
+        self.assertEqual(c(none, self.attempt(state="intent"), later=61), "unknown")
+        self.assertEqual(c(none, self.attempt(), later=99999), "pending", "queued behind a long turn")
+        self.assertEqual(c(none, self.attempt(), held=False), "unknown", "closed with a queued wake")
+        self.assertEqual(c(none, self.attempt(), held=None), "unknown", "registry unreadable")
+        self.assertEqual(c(started, self.attempt()), "running")
+        self.assertEqual(c(started, self.attempt(), alive=False), "unknown", "turn started, host died")
+        self.assertEqual(c(ended, self.attempt(state="unknown"), alive=False, held=None), "handled")
+
+    def test_lock_reaps_only_dead_or_reused_holders_and_restores_a_fresh_one(self):
+        ledger = self.tmp / "chat.json"
+        lock = self.tmp / "chat.json.lock"
+        lock.write_text(json.dumps({"pid": 999_999, "start": None, "token": "dead"}))
+        release = dw.acquire_lock(ledger, wait=0)
+        self.assertIsNotNone(release)
+        release()
+        lock.write_text(json.dumps({"pid": os.getpid(), "start": "Thu Jan  1 00:00:00 1970", "token": "reused"}))
+        release = dw.acquire_lock(ledger, wait=0)
+        self.assertIsNotNone(release)
+        release()
+        lock.write_text("fresh")
+        dw._reap(lock, "what we judged")
+        self.assertEqual(lock.read_text(), "fresh")
 
     def test_ledger_name_matches_the_typescript_driver(self):
         self.assertEqual(dw.ledger_path(Path("/s"), "ezra", "20261028_100000_aaaaaa"),
@@ -362,13 +627,14 @@ class Classifier(Base):
 
 
 class Lifecycle(Base):
-    def test_unload_stops_the_worker(self):
+    def test_register_hooks_and_unload_stops_the_worker(self):
         original = dw.POLL_SECONDS
         dw.POLL_SECONDS = 0.02
         try:
             ctx = FakeCtx(self.manager)
             os.environ.pop("AGENT_PEERS_WAKE_DISABLED", None)
             dw.register(ctx)
+            self.assertEqual(sorted(ctx.hooks), ["post_llm_call", "pre_llm_call"])
             self.assertEqual(len(ctx.unload), 1)
             workers = [t for t in threading.enumerate() if t.name == f"{dw.PLUGIN_NAME}:{PROFILE}"]
             self.assertTrue(workers and workers[0].is_alive())
@@ -386,6 +652,7 @@ class Lifecycle(Base):
         finally:
             os.environ.pop("AGENT_PEERS_WAKE_DISABLED", None)
         self.assertEqual(ctx.unload, [])
+        self.assertEqual(ctx.hooks, {})
 
 
 # Shared with tests/hermes-chat-wake.test.ts: the ledger file name for a chat key.
