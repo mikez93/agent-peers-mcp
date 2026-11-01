@@ -120,6 +120,10 @@ const RUNTIME_IS_DROID = RUNTIME_PEER_TYPE === "droid";
 // chat. Mail for one chat is never drawn or confirmed by a call from another.
 // Calls without a chat keep today's behavior: they read the general mailbox.
 const HERMES_CHAT_MAIL = RUNTIME_PEER_TYPE === "hermes" && process.env.AGENT_PEERS_HERMES_CHAT_MAIL !== "0";
+// Hermes always reads its local inbox by mailbox. With chat mail switched off,
+// every call is a general call, so chat mail saved while it was on stays hidden
+// and unconfirmed until it is switched back on.
+const HERMES_PARTITIONED = RUNTIME_PEER_TYPE === "hermes";
 const GENERAL_PARTITION = "general";
 function partitionOf(m: { to_chat?: string | null }): string { return m.to_chat ?? GENERAL_PARTITION; }
 // Claude/Codex MCP lifetime is the real working-session lineage. Hermes may
@@ -364,7 +368,7 @@ function enqueueAck(token: string) {
 async function waitForFreshPeerMessages(timeoutMs: number, from?: string, chat?: string): Promise<boolean> {
   // A chat wait polls that chat and ends only on that chat's mail.
   const chatHint = HERMES_CHAT_MAIL && chat && chat.trim().toLowerCase() !== GENERAL_PARTITION ? chat.trim() : undefined;
-  let chatKey: string | null = HERMES_CHAT_MAIL && !chatHint ? GENERAL_PARTITION : null;
+  let chatKey: string | null = HERMES_PARTITIONED && !chatHint ? GENERAL_PARTITION : null;
   return waitForFreshPeerMessagesLoop({
     timeoutMs,
     pollIntervalMs: WAIT_FOR_MESSAGES_POLL_MS,
@@ -383,7 +387,7 @@ async function waitForFreshPeerMessages(timeoutMs: number, from?: string, chat?:
     // 2026-08-08 §1: Marco's wait for Kepler ate an unrelated Vector message).
     isFresh: (m) =>
       !delivery.isBlocked(m.id) &&
-      (!HERMES_CHAT_MAIL || (chatKey !== null && partitionOf(m) === chatKey)) &&
+      (!HERMES_PARTITIONED || (chatKey !== null && partitionOf(m) === chatKey)) &&
       (!from || m.from_id === from || m.from_name === from),
     onError: (message) => log(`wait_for_peer_messages ${message}`),
   });
@@ -600,7 +604,8 @@ async function withPiggyback(
 async function acquireInboxBatch(callId: string, arrivalGen: number, chatHint?: string): Promise<{ fresh: LeasedMessage[]; note?: string }> {
   // ------------------------------------------------------------------------
   // STEP 0 (Hermes per-chat mail) — work out which mailbox this call reads.
-  // `key` null means no partitioning (Codex, Droid, chat mail switched off).
+  // `key` null means no partitioning (Codex, Droid). Hermes with chat mail
+  // switched off reads the general mailbox only.
   // A chat call polls its chat first, which also refreshes the lease tokens
   // of mail it presented earlier, so its confirm below acks fresh tokens.
   let key: string | null = null;
@@ -630,6 +635,8 @@ async function acquireInboxBatch(callId: string, arrivalGen: number, chatHint?: 
         note = `[agent-peers] Could not read mail for chat "${hint}" (${e instanceof Error ? e.message : String(e)}). Nothing was lost; try again.`;
       }
     }
+  } else if (HERMES_PARTITIONED) {
+    key = GENERAL_PARTITION;
   }
   const inPartition = (m: LeasedMessage) => readable && (key === null || partitionOf(m) === key);
 

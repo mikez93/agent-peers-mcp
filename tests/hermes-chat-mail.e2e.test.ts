@@ -5,7 +5,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configureAddressing, pollMessages, registerPeer, sendMessage, startBroker } from "../broker.ts";
@@ -208,3 +208,95 @@ test("rolling back per-chat mail for one profile (AGENT_PEERS_HERMES_CHAT_MAIL=0
     await off.close();
   }
 }, 30000);
+
+test("switching per-chat mail off and on again for the SAME profile keeps saved chat mail hidden, unconfirmed and then delivered to its chat", async () => {
+  // Marco's 2026-11-01 repro: chat A mail saved locally while chat mail was on
+  // must not leak into, or be cleared by, general reads after a reload with
+  // AGENT_PEERS_HERMES_CHAT_MAIL=0 under the same identity and state.
+  const state = join(root, "state-nora");
+  const spawn = async (chatMail: boolean) => {
+    const t = new StdioClientTransport({
+      command: process.execPath,
+      args: [join(import.meta.dir, "..", "hermes-server.ts")],
+      cwd: root,
+      stderr: "pipe",
+      env: {
+        PATH: process.env.PATH ?? "",
+        AGENT_PEERS_ENABLED: "1",
+        AGENT_PEERS_PORT: String(broker.server.port),
+        AGENT_PEERS_DB: join(root, "peers.db"),
+        AGENT_PEERS_SECRET_PATH: join(root, "secret"),
+        AGENT_PEERS_STATE_DIR: state,
+        AGENT_PEERS_AUTO_SUMMARY: "0",
+        AGENT_PEERS_DISABLE_TAB_TITLE: "1",
+        PEER_NAME: "nora-hermes",
+        ...(chatMail ? {} : { AGENT_PEERS_HERMES_CHAT_MAIL: "0" }),
+      },
+    });
+    const c = new Client({ name: `nora-${chatMail ? "on" : "off"}`, version: "1.0.0" });
+    await c.connect(t, { timeout: 8000 });
+    const text = async (name: string, args: Record<string, unknown> = {}) =>
+      ((await c.callTool({ name, arguments: args })).content as { text: string }[]).map((x) => x.text).join("");
+    const stop = async () => {
+      const pid = t.pid;
+      if (pid) { try { process.kill(pid, "SIGTERM"); } catch { /* gone */ } }
+      await c.close();
+      for (let i = 0; i < 50 && pid; i++) {
+        try { process.kill(pid, 0); } catch { break; }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    };
+    return { text, stop };
+  };
+  const nora = () => broker.db.query<{ id: string; capabilities: string | null }, [string]>(
+    "SELECT id, capabilities FROM peers WHERE name = ?").get("nora-hermes")!;
+  const send = (to: string, text: string) =>
+    expect(sendMessage(broker.db, { from_id: marco.id, session_token: marco.session_token, to_id_or_name: to, text }).ok).toBe(true);
+  const localIds = (id: string) =>
+    (JSON.parse(readFileSync(join(state, `${id}.json`), "utf8")) as { unread: { text: string }[] }).unread.map((m) => m.text);
+
+  // 1. Chat mail on: chat A's mail is read in chat A and saved locally, unconfirmed.
+  const on = await spawn(true);
+  const uuid = nora().id;
+  expect(nora().capabilities).toContain("chat-mail");
+  send("nora-hermes/email shit", "NA1 chat A");
+  send(`nora-hermes/${ADS}`, "NB1 chat B");
+  send("nora-hermes", "NG1 general");
+  expect(await on.text("check_messages", { chat: EMAIL })).toContain("NA1 chat A");
+  expect(acked("NA1 chat A")).toBe(0);
+  expect(localIds(uuid)).toContain("NA1 chat A");
+  await on.stop();
+
+  // 2. Same profile, same identity and state, chat mail off.
+  const off = await spawn(false);
+  expect(nora().id).toBe(uuid);
+  expect(nora().capabilities ?? "").not.toContain("chat-mail");
+  const g1 = await off.text("check_messages");
+  expect(g1).toContain("NG1 general");
+  expect(g1).not.toContain("NA1 chat A");
+  expect(g1).not.toContain("NB1 chat B");
+  const g2 = await off.text("check_messages");
+  expect(g2).not.toContain("NA1 chat A");
+  expect(acked("NG1 general")).toBe(1);
+  // Chat mail stays unconfirmed at the broker and saved locally.
+  expect(acked("NA1 chat A")).toBe(0);
+  expect(acked("NB1 chat B")).toBe(0);
+  expect(localIds(uuid)).toContain("NA1 chat A");
+  await off.stop();
+
+  // 3. Chat mail back on: each chat gets exactly its own mail and confirms it.
+  const back = await spawn(true);
+  expect(nora().id).toBe(uuid);
+  const a = await back.text("check_messages", { chat: EMAIL });
+  expect(a).toContain("NA1 chat A");
+  expect(a).not.toContain("NB1 chat B");
+  await back.text("check_messages", { chat: EMAIL });
+  expect(acked("NA1 chat A")).toBe(1);
+  expect(acked("NB1 chat B")).toBe(0);
+  const b = await back.text("check_messages", { chat: ADS });
+  expect(b).toContain("NB1 chat B");
+  expect(b).not.toContain("NA1 chat A");
+  await back.text("check_messages", { chat: ADS });
+  expect(acked("NB1 chat B")).toBe(1);
+  await back.stop();
+}, 60000);
