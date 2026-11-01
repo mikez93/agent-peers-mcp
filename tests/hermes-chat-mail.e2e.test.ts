@@ -173,3 +173,38 @@ test("a member surface keeps its tools, leaves the durable name to the owner and
     await member.close();
   }
 }, 30000);
+
+test("rolling back per-chat mail for one profile (AGENT_PEERS_HERMES_CHAT_MAIL=0) returns its chat sends to general mail", async () => {
+  const offTransport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(import.meta.dir, "..", "hermes-server.ts")],
+    cwd: root,
+    stderr: "pipe",
+    env: {
+      PATH: process.env.PATH ?? "",
+      AGENT_PEERS_ENABLED: "1",
+      AGENT_PEERS_PORT: String(broker.server.port),
+      AGENT_PEERS_DB: join(root, "peers.db"),
+      AGENT_PEERS_SECRET_PATH: join(root, "secret"),
+      AGENT_PEERS_STATE_DIR: join(root, "state-off"),
+      AGENT_PEERS_AUTO_SUMMARY: "0",
+      AGENT_PEERS_DISABLE_TAB_TITLE: "1",
+      PEER_NAME: "ezra-hermes",
+      AGENT_PEERS_HERMES_CHAT_MAIL: "0",
+    },
+  });
+  const off = new Client({ name: "hermes-chat-mail-off-test", version: "1.0.0" });
+  await off.connect(offTransport, { timeout: 8000 });
+  try {
+    const caps = broker.db.query<{ capabilities: string | null }, [string]>("SELECT capabilities FROM peers WHERE name = ?").get("ezra-hermes")?.capabilities ?? "";
+    expect(caps).not.toContain("chat-mail");
+    const r = sendMessage(broker.db, { from_id: marco.id, session_token: marco.session_token, to_id_or_name: "ezra-hermes/email shit", text: "E1 after rollback" });
+    expect(r.ok).toBe(true);
+    expect(broker.db.query<{ to_chat: string | null }, [string]>("SELECT to_chat FROM messages WHERE text = ?").get("E1 after rollback")?.to_chat).toBeNull();
+    const got = await off.callTool({ name: "check_messages", arguments: {} });
+    expect((got.content as { text: string }[]).map((c) => c.text).join("")).toContain("E1 after rollback");
+  } finally {
+    if (offTransport.pid) { try { process.kill(offTransport.pid, "SIGTERM"); } catch { /* gone */ } }
+    await off.close();
+  }
+}, 30000);
