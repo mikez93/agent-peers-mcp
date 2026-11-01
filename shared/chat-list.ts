@@ -12,7 +12,7 @@ export const LIST_CHATS_TOOL = {
   inputSchema: {
     type: "object" as const,
     properties: {
-      peer: { type: "string" as const, description: "The Hermes agent, e.g. valentina or valentina-hermes." },
+      peer: { type: "string" as const, description: "The Hermes agent, e.g. valentina or valentina-hermes. Add @host (ezra@studio) for an agent on another machine; with federation on, a bare name not found here is also looked up on the other machines." },
       query: { type: "string" as const, description: "Optional title search." },
       limit: { type: "number" as const, minimum: 1, maximum: 50 },
       offset: { type: "number" as const, minimum: 0 },

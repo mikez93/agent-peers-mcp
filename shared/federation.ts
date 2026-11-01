@@ -7,7 +7,7 @@ import { chatRouteId, defaultIsLocalHost, type RemoteSendRequest, type RemoteSen
 import { parseAddress } from "./peer-address.ts";
 import { readSharedSecret } from "./shared-secret.ts";
 import { validateFederationConfig, validHost, type FederationConfig } from "./federation-config.ts";
-import type { Peer, PeerType, SendMessageRequest, SendMessageResponse } from "./types.ts";
+import type { ListChatsResponse, Peer, PeerType, SendMessageRequest, SendMessageResponse } from "./types.ts";
 
 export { loadFederationConfig, type FederationConfig } from "./federation-config.ts";
 export const FEDERATION_SECRET_HEADER = "x-agent-peers-federation-secret";
@@ -59,9 +59,13 @@ export interface FederationDeps {
   }) => SendMessageResponse;
   /** Insert system mail even if its original recipient has since gone stale. */
   deliverNotice: (notice: FederationNotice) => { message_id: number };
+  /** Read-only chat lookup for a local Hermes agent; omitted means no
+   *  /federation/chats endpoint on this broker. */
+  listLocalChats?: (peer: string, req: ChatQuery) => ListChatsResponse;
   fetch?: typeof globalThis.fetch;
   now?: () => number;
 }
+export interface ChatQuery { query?: string; limit?: number; offset?: number }
 export interface FederationDirectory {
   peers: (Peer & { host: string })[];
   unreachable_hosts: string[];
@@ -123,6 +127,33 @@ function publicPeer(value: unknown): Peer | null {
     registered_at: value.registered_at, last_seen: value.last_seen,
     started_at: str(value.started_at, 64) ? value.started_at : value.registered_at,
     persona: str(value.persona, 96) ? value.persona : null };
+}
+/** Validate another broker's chat list and qualify every name with its host.
+ *  The remote's own error text is passed on; it never contains transcript text. */
+function remoteChats(body: unknown, host: string): ListChatsResponse | null {
+  if (!plain(body) || typeof body.ok !== "boolean") return null;
+  if (!body.ok) {
+    if (!str(body.error, 1000)) return null;
+    const candidates = Array.isArray(body.candidates) && body.candidates.length <= 50
+      && body.candidates.every(c => str(c, 200)) ? body.candidates as string[] : undefined;
+    return { ok: false, error: `${body.error} (on ${host})`,
+      ...(candidates?.length ? { candidates: candidates.map(c => qualified(c, host)) } : {}) };
+  }
+  if (!str(body.peer, 200) || !Array.isArray(body.chats) || body.chats.length > 50) return null;
+  const peer = body.peer;
+  const chats: NonNullable<ListChatsResponse["chats"]> = [];
+  for (const c of body.chats) {
+    if (!plain(c) || !str(c.chat_key, 512) || (c.title != null && !str(c.title, 1000, true))
+      || (c.last_active != null && !str(c.last_active, 100))
+      || (c.busy !== undefined && typeof c.busy !== "boolean")
+      || (c.archived !== undefined && typeof c.archived !== "boolean")) return null;
+    chats.push({ chat_key: c.chat_key, title: (c.title ?? null) as string | null,
+      ...(c.last_active != null ? { last_active: c.last_active as string } : {}),
+      ...(c.busy !== undefined ? { busy: c.busy as boolean } : {}),
+      ...(c.archived !== undefined ? { archived: c.archived as boolean } : {}),
+      address: qualified(peer, host, c.chat_key) });
+  }
+  return { ok: true, peer: qualified(peer, host), chats };
 }
 function qualified(name: string, host: string, chat: string | null = null): string {
   return `${name}@${host}${chat ? `/${chat}` : ""}`;
@@ -324,6 +355,32 @@ export class FederationService {
     return { peers, unreachable_hosts };
   }
 
+  /** Live, read-only chat lookup on another machine. Addresses come back
+   *  qualified (name@host/chat) so a send goes to the same machine. */
+  async chats(rawHost: string, req: ChatQuery & { peer: string }): Promise<ListChatsResponse> {
+    if (!this.config.enabled) return { ok: false, error: "federation is disabled on this machine" };
+    const host = rawHost.toLowerCase();
+    if (!Object.hasOwn(this.config.hosts, host) || this.isLocalHost(host)) {
+      return { ok: false, error: `unknown remote machine "${rawHost}"` };
+    }
+    const params = new URLSearchParams({ peer: req.peer });
+    if (req.query !== undefined) params.set("query", req.query);
+    if (req.limit !== undefined) params.set("limit", String(req.limit));
+    if (req.offset !== undefined) params.set("offset", String(req.offset));
+    let body: unknown;
+    try {
+      body = await this.request(host, `chats?${params}`, this.config.discoveryTimeoutMs ?? 1500);
+    } catch (error) {
+      // 404 means the other broker predates remote chat lookup.
+      const status = error instanceof Error ? error.message : "";
+      const reason = status === "federation HTTP 404" ? "its broker is too old to list chats remotely"
+        : status === "federation HTTP 401" ? "it refused this machine's federation credentials"
+        : "it is unreachable right now";
+      return { ok: false, error: `can't list chats on ${host}: ${reason}` };
+    }
+    return remoteChats(body, host) ?? { ok: false, error: `invalid chat list from ${host}` };
+  }
+
   /** Authenticated federation routes only; caller retains its local auth gate. */
   async handle(req: Request): Promise<Response | null> {
     const url = new URL(req.url);
@@ -346,6 +403,20 @@ export class FederationService {
       const peers = this.deps.listLocalPeers({ query }).map(publicPeer);
       if (peers.some(p => !p)) return Response.json({ error: "invalid local directory" }, { status: 500 });
       return Response.json({ host: this.config.host, peers });
+    }
+    if (url.pathname === "/federation/chats" && req.method === "GET" && this.deps.listLocalChats) {
+      const q = url.searchParams;
+      const peer = q.get("peer") ?? "";
+      const query = q.get("query") ?? undefined;
+      if (!str(peer, 200) || (query !== undefined && !str(query, 4096, true))) {
+        return Response.json({ error: "invalid chat query" }, { status: 400 });
+      }
+      const num = (key: string) => q.has(key) ? Number(q.get(key)) : undefined;
+      try {
+        return Response.json(this.deps.listLocalChats(peer, { query, limit: num("limit"), offset: num("offset") }));
+      } catch {
+        return Response.json({ error: "chat lookup temporarily unavailable" }, { status: 503 });
+      }
     }
     if (url.pathname !== "/federation/relay" || req.method !== "POST") {
       return Response.json({ error: "unknown federation endpoint" }, { status: 404 });

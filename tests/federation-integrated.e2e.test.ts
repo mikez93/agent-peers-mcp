@@ -1,7 +1,8 @@
 // End to end: two real broker processes federate over loopback HTTP, each with
 // its own home, local secret and database. Covers name@host delivery, replies
-// to the exact sender, bare-name discovery, machine-scope listing, an outage
-// with queued mail, and rollback (federation off keeps relayed sender names).
+// to the exact sender, bare-name discovery, machine-scope listing, remote chat
+// lookup, an outage with queued mail, and rollback (federation off keeps
+// relayed sender names).
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -47,6 +48,26 @@ function setupHome(host: Host) {
     alpha: `http://127.0.0.1:${PORTS.alpha}`, beta: `http://127.0.0.1:${PORTS.beta}`,
   }));
   writeFileSync(join(h, ".agent-peers-federation-secret"), FED_SECRET, { mode: 0o600 });
+  if (host === "beta") fakeHermes(h);
+}
+
+// Ezra's Hermes chats on beta, read by beta's real chat directory
+// (profiles/<profile>/state.db). Newest first: taxes, then the two drum chats.
+const DRUMS = "20261027_121754_6f5fff";
+const HEADS = "20261027_110952_70140e";
+const TAXES = "20261030_090000_cccccc";
+function fakeHermes(h: string) {
+  const dir = join(h, ".hermes", "profiles", "ezra");
+  mkdirSync(dir, { recursive: true });
+  const st = new Database(join(dir, "state.db"));
+  st.exec(`CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, title TEXT, parent_session_id TEXT,
+    started_at REAL NOT NULL, last_activity_at REAL, end_reason TEXT, archived INTEGER NOT NULL DEFAULT 0, model_config TEXT);
+    CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, timestamp REAL NOT NULL);`);
+  const add = st.query("INSERT INTO sessions (id, source, title, started_at) VALUES (?, 'desktop', ?, ?)");
+  add.run(HEADS, "Plan drum heads and Gurdjieff study site", 1_000);
+  add.run(DRUMS, "Plan drum practice before leaving", 2_000);
+  add.run(TAXES, "Quarterly taxes", 3_000);
+  st.close();
 }
 
 async function start(host: Host, federation = true) {
@@ -58,6 +79,7 @@ async function start(host: Host, federation = true) {
       AGENT_PEERS_PORT: String(PORTS[host]),
       AGENT_PEERS_DB: join(h, "peers.db"),
       AGENT_PEERS_SECRET_PATH: join(h, "secret"),
+      HERMES_HOME: join(h, ".hermes"),
       ...(federation ? { AGENT_PEERS_FEDERATION: "1" } : {}),
     },
   });
@@ -107,6 +129,7 @@ const reg = (host: Host, name: string, peer_type: "claude" | "codex" = "claude")
 
 let vector: { id: string; session_token: string };
 let kepler: { id: string; session_token: string };
+let ezra: { id: string; session_token: string };
 
 beforeAll(async () => {
   await allocatePorts();
@@ -116,6 +139,8 @@ beforeAll(async () => {
   await start("beta");
   vector = await reg("alpha", "vector-claude");
   kepler = await reg("beta", "kepler-claude");
+  ezra = await api("beta").register({ peer_type: "hermes", name: "ezra-hermes", pid: process.pid, cwd: "/w/beta",
+    git_root: null, tty: null, summary: "", durable: true, capabilities: ["chat-mail"] });
 }, 30000);
 
 afterAll(async () => {
@@ -173,6 +198,57 @@ test("machine scope lists the other machine's peers, still as a bare array", asy
   expect(localOnly.map((p) => p.name)).not.toContain("kepler-claude@beta");
 });
 
+test("list_chats finds a Hermes chat on another machine, read-only, and its address reaches that chat", async () => {
+  const me = { id: vector.id, session_token: vector.session_token };
+  const found = await api("alpha").listChats({ ...me, peer: "ezra-hermes@beta", query: "drum" });
+  expect(found).toMatchObject({ ok: true, peer: "ezra-hermes@beta" });
+  expect(found!.chats!.map((c) => [c.title, c.address])).toEqual([
+    ["Plan drum practice before leaving", `ezra-hermes@beta/${DRUMS}`],
+    ["Plan drum heads and Gurdjieff study site", `ezra-hermes@beta/${HEADS}`],
+  ]);
+  // Paging runs on the remote machine, newest first.
+  const page = await api("alpha").listChats({ ...me, peer: "ezra-hermes@beta", limit: 1, offset: 1 });
+  expect(page!.chats!.map((c) => c.chat_key)).toEqual([DRUMS]);
+  // A bare name unknown on alpha is looked up on beta, as send_message does.
+  const bare = await api("alpha").listChats({ ...me, peer: "ezra", query: "practice" });
+  expect(bare).toMatchObject({ ok: true, peer: "ezra-hermes@beta" });
+  expect(bare!.chats!.map((c) => c.address)).toEqual([`ezra-hermes@beta/${DRUMS}`]);
+  // Listing stored and consumed nothing on beta.
+  expect(await api("beta").pollMessages({ ...ezra, chat: DRUMS })).toEqual([]);
+
+  // The listed address is a working send target for exactly that chat.
+  expect((await api("alpha").sendMessage({ from_id: vector.id, session_token: vector.session_token,
+    to_id_or_name: found!.chats![0]!.address, text: "about the drums" })).ok).toBe(true);
+  const [m] = await until(async () => {
+    const got = await api("beta").pollMessages({ ...ezra, chat: DRUMS });
+    return got.length ? got : null;
+  });
+  expect(m!.text).toBe("about the drums");
+  expect(m!.from_name).toBe("vector-claude@alpha");
+  expect(await api("beta").pollMessages({ ...ezra, chat: HEADS })).toEqual([]);
+  await api("beta").ackMessages({ ...ezra, lease_tokens: [m!.lease_token] });
+}, 30000);
+
+test("remote list_chats errors are clear, and the endpoint needs the fleet secret", async () => {
+  const me = { id: vector.id, session_token: vector.session_token };
+  expect((await api("alpha").listChats({ ...me, peer: "kepler-claude@beta" }))!.error)
+    .toBe("kepler-claude is a claude peer; only Hermes agents have chats (on beta)");
+  expect((await api("alpha").listChats({ ...me, peer: "nobody-hermes@beta" }))!.error).toContain("unknown peer");
+  expect((await api("alpha").listChats({ ...me, peer: "ezra-hermes@gamma" }))!.error).toBe('unknown remote machine "gamma"');
+  expect((await api("alpha").listChats({ ...me, peer: "@beta" }))!.error).toBe("list_chats needs a peer name");
+  expect((await api("alpha").listChats({ id: vector.id, session_token: "wrong", peer: "ezra-hermes@beta" }))!.error)
+    .toBe("unauthorized or stale caller");
+  const url = `http://127.0.0.1:${PORTS.beta}/federation/chats?peer=ezra-hermes`;
+  // Beta's own local secret is not the fleet secret.
+  const local = await fetch(url, { headers: { [SECRET_HEADER]: readSharedSecret(join(home("beta"), "secret"))!,
+    "x-agent-peers-federation-host": "alpha" } });
+  expect(local.status).toBe(401);
+  const ok = await fetch(url, { headers: { "x-agent-peers-federation-secret": FED_SECRET,
+    "x-agent-peers-federation-host": "alpha" } });
+  expect(ok.status).toBe(200);
+  expect(((await ok.json()) as { chats: unknown[] }).chats).toHaveLength(3);
+});
+
 test("an outage queues mail, reports the host, and delivers once on recovery", async () => {
   await stop("beta");
   const res = await fetch(`http://127.0.0.1:${PORTS.alpha}/list-peers`, {
@@ -181,6 +257,13 @@ test("an outage queues mail, reports the host, and delivers once on recovery", a
     body: JSON.stringify({ scope: "machine", cwd: "/w/alpha", git_root: null }),
   });
   expect(res.headers.get("x-agent-peers-unreachable-hosts")).toBe("beta");
+  // A chat lookup on the down machine fails fast and says why.
+  const t0 = Date.now();
+  expect((await api("alpha").listChats({ id: vector.id, session_token: vector.session_token, peer: "ezra-hermes@beta" }))!.error)
+    .toBe("can't list chats on beta: it is unreachable right now");
+  expect((await api("alpha").listChats({ id: vector.id, session_token: vector.session_token, peer: "ezra" }))!.error)
+    .toBe("unknown peer: ezra (not checked: beta unreachable)");
+  expect(Date.now() - t0).toBeLessThan(5000);
   // Launch-time name suggestion never waits on a down host.
   const t = Date.now();
   await api("alpha").listPeers({ scope: "machine", cwd: "/w/alpha", git_root: null, local_only: true });
@@ -222,6 +305,11 @@ test("rollback: federation off keeps relayed senders and local service", async (
   const sent = await api("alpha").sendMessage({ from_id: vector.id, session_token: vector.session_token, to_id_or_name: "kepler-claude@beta", text: "after rollback" });
   expect(sent.ok).toBe(false);
   expect(sent.error).toContain("not enabled");
+  // With federation off, chat lookup stays local and says so.
+  expect((await api("alpha").listChats({ id: vector.id, session_token: vector.session_token, peer: "ezra-hermes@beta" }))!.error)
+    .toContain("federation");
+  expect((await api("alpha").listChats({ id: vector.id, session_token: vector.session_token, peer: "ezra" }))!.error)
+    .toBe("unknown peer: ezra");
 }, 90000);
 
 test("SIGTERM aborts an active relay before closing the DB and pending mail recovers", async () => {

@@ -18,9 +18,9 @@ import type {
 } from "./shared/types.ts";
 import { appendSuffixWithinLimit, generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 import { findConversation, hasConversationSchema, withConversationFence, dormantMailboxNotice, type ConversationOwner } from "./shared/hermes-conversation-fence.ts";
-import { personaOf, withPersonaPrefix } from "./shared/peer-address.ts";
+import { parseAddress, personaOf, withPersonaPrefix } from "./shared/peer-address.ts";
 import {
-  CHAT_MAIL_CAPABILITY, chatRouteId, findPeers, hasCapability, mailboxOwnerRow, recordChatRoute, resolveAddress,
+  CHAT_MAIL_CAPABILITY, chatRouteId, defaultIsLocalHost, findPeers, hasCapability, mailboxOwnerRow, recordChatRoute, resolveAddress,
   resolvePeerName, resolvePollScope, resolveSenderChat, rowByName,
   type AddressRow, type AddressingDeps, type RemoteSendRequest,
 } from "./shared/broker-addressing.ts";
@@ -1076,13 +1076,25 @@ export const BROKER_CAPABILITIES = ["persona-names", "chat-mail", "list-chats", 
 /** Read-only chat lookup: titles and status, never transcript text. It does
  *  not adopt, wake or consume mail. */
 export function listChats(db: Database, req: ListChatsRequest): ListChatsResponse {
+  if (!chatListCallerOk(db, req)) return { ok: false, error: "unauthorized or stale caller" };
+  return listChatsFor(db, String(req.peer ?? "").split("/")[0]!.trim(), req);
+}
+
+function chatListCallerOk(db: Database, req: { id: string; session_token: string }): boolean {
   const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
-  const caller = db.query<{ id: string }, [string, string, string]>(
+  return Boolean(db.query<{ id: string }, [string, string, string]>(
     "SELECT id FROM peers WHERE id = ? AND session_token = ? AND last_seen >= ?",
-  ).get(req.id, req.session_token, staleCutoff);
-  if (!caller) return { ok: false, error: "unauthorized or stale caller" };
-  const named = resolvePeerName(db, String(req.peer ?? "").split("/")[0]!.trim(), staleCutoff);
-  if (!named) return { ok: false, error: `unknown peer: ${req.peer}` };
+  ).get(req.id, req.session_token, staleCutoff));
+}
+
+/** The chat lookup itself, without caller authentication. The local route
+ *  authenticates the caller first; federation authenticates the machine. */
+export function listChatsFor(
+  db: Database, peer: string, req: { query?: string; limit?: number; offset?: number },
+): ListChatsResponse {
+  const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  const named = resolvePeerName(db, peer, staleCutoff);
+  if (!named) return { ok: false, error: `unknown peer: ${peer}` };
   if ("error" in named) return { ok: false, error: named.error, candidates: named.candidates };
   if (named.row.peer_type !== "hermes") return { ok: false, error: `${named.row.name} is a ${named.row.peer_type} peer; only Hermes agents have chats` };
   const owner = mailboxOwnerRow(db, named.row);
@@ -1096,6 +1108,40 @@ export function listChats(db: Database, req: ListChatsRequest): ListChatsRespons
     peer: owner.name,
     chats: chats.map((c) => ({ ...c, address: `${owner.name}/${c.chat_key}` })),
   };
+}
+
+/** The /list-chats route. `peer` may name another machine (name@host); then
+ *  the lookup runs on that machine's broker through federation. */
+export async function listChatsRouted(
+  db: Database, req: ListChatsRequest,
+  federation: { service: FederationService; config: FederationConfig } | null,
+): Promise<ListChatsResponse> {
+  if (!chatListCallerOk(db, req)) return { ok: false, error: "unauthorized or stale caller" };
+  const parsed = parseAddress(String(req.peer ?? ""));
+  if (!parsed.name) return { ok: false, error: "list_chats needs a peer name" };
+  const local = !parsed.host || (federation ? federation.service.isLocalHost(parsed.host) : defaultIsLocalHost(parsed.host));
+  const opts = { query: req.query, limit: req.limit, offset: req.offset };
+  if (!local) {
+    if (!federation) {
+      return { ok: false, error: `federation is off on this machine, so chats on ${parsed.host} can't be listed` };
+    }
+    return federation.service.chats(parsed.host!, { peer: parsed.name, ...opts });
+  }
+  const here = listChatsFor(db, parsed.name, req);
+  // Like send_message: a bare name that is unknown here may live on another
+  // machine. Exactly one remote Hermes match is listed; more is ambiguous.
+  if (here.ok || parsed.host || !federation?.config.enabled || !here.error?.startsWith("unknown peer:")) return here;
+  const directory = await federation.service.directory(parsed.name);
+  const remotes = directory.peers.filter((p) => !federation.service.isLocalHost(p.host) && p.peer_type === "hermes");
+  if (remotes.length === 1) {
+    return federation.service.chats(remotes[0]!.host, { peer: parseAddress(remotes[0]!.name).name, ...opts });
+  }
+  if (remotes.length > 1) {
+    return { ok: false, error: `"${parsed.name}" matches Hermes agents on several machines; use name@host`,
+      candidates: remotes.map((p) => p.name) };
+  }
+  const down = directory.unreachable_hosts;
+  return down.length ? { ...here, error: `${here.error} (not checked: ${down.join(", ")} unreachable)` } : here;
 }
 
 
@@ -1886,6 +1932,7 @@ function startFederation(db: Database): { service: FederationService; config: Fe
     service = new FederationService({
       db, config,
       listLocalPeers: (r) => listDirectoryPeers(db, r),
+      listLocalChats: (peer, r) => listChatsFor(db, peer, r),
       sendLocal: (r) => sendMessage(db, r),
       snapshotSender: (r) => snapshotSender(db, r),
       deliverLocal: (m) => deliverRelayed(db, m),
@@ -2058,7 +2105,7 @@ export function startBroker(
             if (typeof b.chat !== "string") return json({ messages: pollMessages(db, b.id, b.session_token) });
             return json(pollMessagesScoped(db, b.id, b.session_token, undefined, b.chat));
           }
-          case "/list-chats":    return json(listChats(db, await readJson(req)));
+          case "/list-chats":    return json(await listChatsRouted(db, await readJson(req), federation));
           case "/chat-inbox":    return json({ entries: chatInbox(db) });
           case "/ack-messages":  return json(ackMessages(db, await readJson(req)));
           case "/rename-peer":   return json(renamePeer(db, await readJson(req)));

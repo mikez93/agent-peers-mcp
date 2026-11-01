@@ -12,6 +12,14 @@ and the existing poll/lease/confirm pipeline.
   resolution. Only `unknown_peer` permits remote discovery. Multiple matches, or
   an unreachable machine that prevents a certain answer, require an explicit
   address. Discovery does not adopt chats, wake agents, or consume mail.
+- `list_chats` works across machines. `name@host` lists that Hermes agent's
+  chats on its own machine through `GET /federation/chats`; a bare name unknown
+  locally is looked up like a bare-name send (exactly one remote Hermes match is
+  listed, several are ambiguous). Returned names and addresses are qualified
+  (`ezra-hermes@studio/<chat key>`), so sending to one reaches that chat. The
+  lookup is live and read-only: titles and status only, nothing stored, woken or
+  consumed. An unreachable machine, or one whose broker predates the endpoint
+  (404), returns a clear error.
 - A successful remote send means **queued**, not delivered or seen. Enqueue is
   synchronous inside the broker's sender-authentication transaction. Network I/O
   happens later, outside that transaction. Negative receipt IDs identify remote
@@ -69,7 +77,8 @@ TCP 8443. Existing authorized access is separate. The fleet's effective boundary
 Verify the effective policy, including other grants, rather than inferring
 denial from the narrow federation grant alone.
 The configured proxy must forward the service's
-`/federation/directory`, `/federation/relay`, and `/federation/health` paths.
+`/federation/directory`, `/federation/chats`, `/federation/relay`, and
+`/federation/health` paths. The `/federation` mount below covers all of them.
 The broker stays bound to localhost. Relay requests do not follow redirects.
 Plain HTTP is accepted only for loopback fixtures.
 
@@ -122,6 +131,10 @@ callbacks:
 - `deliverLocal(message)`: local-only resolution and insertion on that same DB.
 - `deliverNotice(notice)`: insert system mail without requiring the original
   recipient to remain live; normal `prev_id` reclaim can recover it later.
+- `listLocalChats(peer, {query, limit, offset})` (optional): the broker's chat
+  lookup without caller authentication, since the fleet secret authenticates the
+  machine. Omitted, `/federation/chats` answers 404. `chats(host, request)` is
+  the client side; `/list-chats` authenticates the local caller first.
 
 Attach `enqueue`, `remoteRoute`, `senderForMessage`, and `isLocalHost` to the
 broker's addressing dependencies. Invoke `send(request)` outside any transaction

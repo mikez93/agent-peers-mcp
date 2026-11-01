@@ -469,3 +469,41 @@ test("config is opt-in, validates private auth separation and accepts loopback f
   expect(() => validateFederationConfig({ ...a.config, hosts: { beta: "https://user:password@example.test" } })).toThrow();
   expect(() => validateFederationConfig({ ...a.config, hosts: { beta: "http://127.0.0.1:17991" } })).not.toThrow();
 });
+
+test("remote chat lookup qualifies addresses and refuses old brokers, bad answers and unknown hosts", async () => {
+  const [a, b] = pair();
+  // Without listLocalChats the endpoint 404s, exactly like a broker that predates it.
+  expect(await a.service.chats("beta", { peer: "ezra-hermes" })).toEqual({
+    ok: false, error: "can't list chats on beta: its broker is too old to list chats remotely" });
+  let seen: unknown = null;
+  b.deps.listLocalChats = (peer, req) => {
+    seen = { peer, ...req };
+    return peer === "ezra-hermes"
+      ? { ok: true, peer: "ezra-hermes", chats: [{ chat_key: "20261027_121754_6f5fff",
+        title: "Plan drum practice before leaving", busy: true, address: "ezra-hermes/20261027_121754_6f5fff" }] }
+      : { ok: false, error: `unknown peer: ${peer}`, candidates: ["ezra-hermes"] };
+  };
+  expect(await a.service.chats("BETA", { peer: "ezra-hermes", query: "drum", limit: 5, offset: 0 })).toEqual({
+    ok: true, peer: "ezra-hermes@beta", chats: [{ chat_key: "20261027_121754_6f5fff",
+      title: "Plan drum practice before leaving", busy: true, address: "ezra-hermes@beta/20261027_121754_6f5fff" }] });
+  expect(seen).toEqual({ peer: "ezra-hermes", query: "drum", limit: 5, offset: 0 });
+  expect(await a.service.chats("beta", { peer: "ezra" })).toEqual({
+    ok: false, error: "unknown peer: ezra (on beta)", candidates: ["ezra-hermes@beta"] });
+  // A malformed answer is refused rather than passed on to the model.
+  b.deps.listLocalChats = () => ({ ok: true, peer: "ezra-hermes", chats: [{ chat_key: 42 }] }) as never;
+  expect((await a.service.chats("beta", { peer: "ezra-hermes" })).error).toBe("invalid chat list from beta");
+  // The endpoint is behind the fleet secret like every federation route.
+  const forged = await b.service.handle(new Request("http://127.0.0.1/federation/chats?peer=ezra-hermes", {
+    headers: { [FEDERATION_SECRET_HEADER]: LOCAL_SECRET, [FEDERATION_HOST_HEADER]: "alpha" } }));
+  expect(forged!.status).toBe(401);
+  // Unknown or local hosts never reach the network.
+  const calls = networkCalls;
+  expect((await a.service.chats("gamma", { peer: "x" })).error).toBe('unknown remote machine "gamma"');
+  expect((await a.service.chats("alpha", { peer: "x" })).error).toBe('unknown remote machine "alpha"');
+  expect(networkCalls).toBe(calls);
+  writeFileSync(b.config.secretPath, "a-different-fleet-secret-never-real", { mode: 0o600 });
+  expect((await a.service.chats("beta", { peer: "ezra-hermes" })).error)
+    .toBe("can't list chats on beta: it refused this machine's federation credentials");
+  b.offline = true;
+  expect((await a.service.chats("beta", { peer: "ezra-hermes" })).error).toBe("can't list chats on beta: it is unreachable right now");
+});
