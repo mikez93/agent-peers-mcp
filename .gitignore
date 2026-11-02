@@ -12,3 +12,7 @@ dist/
 # Beads / Dolt files (added by bd init)
 .dolt/
 .beads-credential-key
+
+# Python bytecode written when Hermes loads hermes-plugins/* from this checkout.
+# Untracked, it makes the fleet reconciler refuse to update the Studio.
+__pycache__/
