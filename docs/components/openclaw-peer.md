@@ -74,11 +74,13 @@ OpenClaw unloads an idle main thread's MCP runtime (observed about 30 minutes
 after the last turn on 2026-11-02; not a guaranteed TTL). The next turn in
 `agent:<id>:main` runs on a NEW Codex thread whose replayed history still holds
 the old token. The gate refuses that thread as secondary (step 5) until a newer
-token proves it: the next wake, since every wake carries one, or an operator
-`bind`. Until then **outbound Agent Peers from main is unavailable**: Alex
-cannot start a conversation on his own. Inbound mail heals it by itself,
-because the wake that delivers it re-proves the thread. Old tokens are never
-accepted, and nothing in OpenClaw is changed for this.
+token proves it. On 2026-11-02 that was an explicit operator `bind`
+(f093a925). A fresh inbound wake also carries a newer token and is designed to
+re-prove the new thread when the normal admission and binding conditions hold,
+but healing by an inbound wake after a real unload has not yet been
+demonstrated. Until a newer token proves the thread, **outbound Agent Peers
+from main is unavailable**: Alex cannot start a conversation on his own. Old
+tokens are never accepted, and nothing in OpenClaw is changed for this.
 
 ## Wake and custody (Marco #1, #2, #5)
 
@@ -135,19 +137,32 @@ Per enabled agent, each daemon tick (every 5 s on Hetzner):
 
 ### Clearing a dead lock
 
-Do this only when `bun cli.ts openclaw status <agent>` reports `held by dead
-pid <pid>`. Nothing may take the lock while you remove it.
+Do this only when `bun cli.ts openclaw status <agent>` (run from
+`/home/openclaw/agent-peers-mcp`) reports `held by dead pid <pid>`. Every
+ledger writer must have finished and stay quiet while you remove the lock. A
+fixed delay proves nothing.
 
-1. Quiet every ledger writer. Engage the kill switch:
-   `touch ~/.agent-peers-openclaw/disabled` (or `<AGENT_PEERS_STATE_DIR>/disabled`).
-   Daemon passes and `bind` then do nothing. `status`, `clear` and `rearm` still
-   take the same lock and write the ledger, so no shell or agent session (yours
-   or another lane's) may run any `bun cli.ts openclaw` subcommand until step 4.
-   Wait one daemon tick (5 s).
-2. Confirm the holder is dead: `ps -p <pid>` prints no process (or one whose
+1. Record whether the kill switch is already engaged
+   (`~/.agent-peers-openclaw/disabled`, or `<AGENT_PEERS_STATE_DIR>/disabled`).
+   Recovery restores exactly that state.
+2. If it is not engaged, engage it: `touch ~/.agent-peers-openclaw/disabled`.
+   Wake passes that start afterwards and `bind` then do nothing.
+3. Confirm every writer is quiet:
+   - the wake pass: on Hetzner `agent-peers-wake.service` runs
+     `codex-peer daemon 5`, a loop that starts `bun wake-daemon.ts` for each
+     pass. A pass that started before the switch may still be working, so
+     confirm no `wake-daemon.ts` process (`pgrep -af wake-daemon.ts`) started
+     before the switch is still running;
+   - operator writers: `status`, `clear`, `rearm` and `bind` take the same lock
+     and wait up to 10 seconds for it, so a call already waiting can outlive a
+     daemon tick. Confirm no `cli.ts openclaw` process is running
+     (`pgrep -af "cli.ts openclaw"`), and make sure no shell or agent session,
+     yours or another lane's, starts one until step 6.
+4. Confirm the holder is dead: `ps -p <pid>` prints no process (or one whose
    start time is after the lock's `at`).
-3. Remove `~/.agent-peers-openclaw/wake/<agent>.lock`.
-4. Release the kill switch: remove the `disabled` file.
+5. Remove `~/.agent-peers-openclaw/wake/<agent>.lock`.
+6. Restore the kill switch to the state recorded in step 1: remove the
+   `disabled` file only if it was absent before you started.
 
 There is no idle check before sending. `followup` makes the Gateway admit the
 input atomically: an idle session starts a turn, a busy one keeps it queued
@@ -216,16 +231,16 @@ Installed docs (mirror docs.openclaw.ai):
 
 | Claim | Status |
 | --- | --- |
-| `chat.send` params, `queueMode`, `deliver`, `idempotencyKey`=runId, ack shapes | Verified in installed source |
+| `chat.send` params, `queueMode`, `deliver`, ack shapes; the ack's `runId` equals our idempotencyKey | Verified in installed source and live. The ack's run id is not the custody proof: a followup drained after a busy run executes under a run id OpenClaw generates itself (Wake and custody, step 2). |
 | Main's `broker.ts` (1b6254b) opens a migrated DB holding an openclaw row and its mail | Verified once here by running main's `initDb` and `pollMessages` on it |
-| `chat.history inputReceipts` semantics and sessionId scope | Verified in installed source |
-| `followup` queues behind a busy run without steering | Documented; busy behavior tested only against a fake Gateway |
-| `deliver:false` produces no channel delivery | Verified in source; live check pending |
-| OpenClaw's bundled Codex 0.160.0 stamps `_meta.threadId` on MCP `tools/call` | **Assumed** (true for Codex CLI/Desktop in this repo); not visible in binary strings |
-| `mcp.servers` with `codex.agents` reaches the agent's Codex threads on this box | Documented, issue openclaw/openclaw#80814 fixed; **not proven live** |
-| One child per session thread; main's thread id stable across unload/compaction | **False across an idle unload** (Hetzner, 2026-11-02): main's bound child exited about 30 minutes after its last turn, and the next turn ran on a NEW Codex thread (01a199fe → 01a19a43) whose replayed history still holds the old token. The gate refused it as secondary, as designed. The next bind or wake token (newer than the binding's proof) moved the binding, and that same child took the identity. Consequence: after an idle unload, Alex cannot send peer mail on his own until a wake or bind arrives. |
+| `chat.history inputReceipts` semantics and sessionId scope | Verified in installed source and live. Queue receipts exist only while an input waits (last row). |
+| `followup` queues behind a busy run without steering | **Verified live** (Hetzner, 2026-11-02): busy wakes 019b1c56 and cfe0584e each showed "queued behind the active run"; the running synthetic turns finished whole (1000/1000 lines and their end markers); each wake ran once, afterwards. |
+| `deliver:false` suppresses OpenClaw's automatic delivery of the turn's reply to the session's channel | Verified in source and live: no Telegram delivery from any test turn. It does NOT stop the agent from calling an external messaging tool itself, so probe and wake texts forbid external sends, and the test turns' tool lists were checked (agent-peers tools and exec only, no Telegram sends). |
+| OpenClaw's bundled Codex 0.160.0 stamps `_meta.threadId` on MCP `tools/call` | **Verified live**: calls from a throwaway explicit session and from main threads 01a199fe and 01a19a43 carried it. |
+| `mcp.servers` with `codex.agents` reaches the agent's Codex threads on this box | **Verified live**: `agent-peers-claude` (`codex.agents: ["claude"]`) reaches Alex's Codex threads, one child per thread; children of other sessions refuse and register nothing. |
+| One child per session thread; main's thread id stable across unload/compaction | **False across an idle unload** (Hetzner, 2026-11-02): main's bound child exited about 30 minutes after its last turn, and the next turn ran on a NEW Codex thread (01a199fe → 01a19a43) whose replayed history still holds the old token. The gate refused it as secondary, as designed. An explicit operator bind (f093a925), newer than the binding's proof, moved the binding, and that same child took the identity. A fresh wake token is designed to do the same, but that has not been demonstrated after a real unload. Compaction is untested. |
 | A dead MCP child is relaunched for main's thread on its next turn (winner death, step-down, registration failure) | **Verified for idle unload** (Hetzner, 2026-11-02): the next main turn started a new child (pid 1065526), which served once a newer token proved main. Winner death and step-down are still untested live. |
-| `session_pending_inputs` rows outlive consumption long enough to read | **False for idle sends** (Hetzner, 2026-11-02): a `chat.send` that starts at once never gets a row. `inputReceipts()` therefore also accepts the transcript user event with `__openclaw.runId` = key and `idempotencyKey` = `<key>:user` (last 200 messages) as consumed. Older or missing evidence still goes `unknown` (safe, needs a clear) A followup that queued behind an active run is drained later under a run id OpenClaw generates itself (07dc066d for Alex's busy wake), but its user event keeps the exact `<key>:user` idempotencyKey; the queue row is deleted on completion. So the transcript match keys on that exact idempotencyKey alone and only requires a run id to be present. |
+| `session_pending_inputs` rows outlive consumption long enough to read | **False** (Hetzner, 2026-11-02). A `chat.send` that starts at once on an idle session never gets a row; a followup that queued behind an active run has one only while it waits, and it is deleted on completion. `inputReceipts()` therefore also accepts the transcript user event whose `idempotencyKey` is exactly `<key>:user`, with a non-empty event id and a run id present, which may be OpenClaw's own drain run id (last 200 messages, 2 MB). Native pending and cancelled receipts take precedence. Missing evidence leaves the submission `unknown`, which is re-read on every reconcile and settles when evidence appears; an operator clear is needed only when none ever appears or the session changed. |
 
 ## Adoption record (2026-11-02)
 
@@ -257,11 +272,13 @@ compaction.
 
 ## Operating runbook
 
-Run as `openclaw@hetzner-box-01`. Every `openclaw` command needs Node 24 first:
+Run as `openclaw@hetzner-box-01` from the checkout, since every `bun cli.ts`
+command below is relative to it: `cd /home/openclaw/agent-peers-mcp`. Every
+`openclaw` command needs Node 24 first:
 `export PATH=$HOME/.local/node/node-v24.22.1-linux-x64/bin:$HOME/.npm-global/bin:$PATH`.
 For Alex, `<id>` is `claude` and `<name>` is `alex-openclaw-hetzner`.
 
-1. Inspect: `bun ~/agent-peers-mcp/cli.ts openclaw status <id>` (binding
+1. Inspect: `bun cli.ts openclaw status <id>` (binding
    thread, submissions, wakes on or off), `bun cli.ts peers`, and
    `~/.agent-peers-openclaw/{wake/enabled,disabled}`.
 2. Wiring (already in place for Alex; change only this entry, and take a 0600
@@ -277,9 +294,8 @@ For Alex, `<id>` is `claude` and `<name>` is `alex-openclaw-hetzner`.
    (`mcp add --no-probe` cannot set `codex.agents`; `mcp set` does not probe.)
 3. Bind or re-bind: `bun cli.ts openclaw bind <id>`, then `status` until the
    submission is `consumed` and the binding shows a thread and a peer. One early
-   `unknown` is normal for an idle start (see Wake and custody, step 3). Re-bind
-   when the gate refuses main as secondary after an idle unload and you need
-   outbound before the next wake.
+   `unknown` is normal for an idle start (see Wake and custody, step 3). Re-bind when the gate refuses main as secondary after an idle unload and
+   outbound is needed.
 4. Wakes: on with `echo <id> >> ~/.agent-peers-openclaw/wake/enabled`; off with
    `sed -i '/^<id>$/d' ~/.agent-peers-openclaw/wake/enabled`. Turn them off and
    keep the evidence on any unknown, failed or halted custody.
