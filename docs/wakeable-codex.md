@@ -27,13 +27,24 @@ thread. Wakeable mode uses that to make wakeability a **launch-time property**:
 
 1. Start Codex under a managed app-server bound to one thread.
 2. Register `peer_id -> { app_server_url, thread_id, … }` in a durable wake registry.
-3. A small daemon watches for unread mail and, when the target thread is **loaded
-   and idle**, sends a **bodyless** wake prompt into that same thread — which makes
-   Codex call `check_messages` and surface the real content through the normal
-   tool-response path.
+3. A small daemon watches for unread mail and, when the target thread is **loaded**,
+   sends a **bodyless** wake prompt into that same thread — which makes Codex call
+   `check_messages` and surface the real content through the normal tool-response
+   path. An **idle** thread gets a new turn; a **busy** thread gets the prompt appended
+   to its running turn (see "Busy chats" below).
 
 The woken session is the **same live instance**: same thread, same rollout file,
 same visible TUI. It is never killed or restarted with fresh context.
+
+A Codex **desktop chat** can also become wakeable without `codex-peer`, by
+registering itself with the app-server the desktop app already runs. See "Codex
+desktop chats" below.
+
+This document covers Codex. Other harnesses wake differently: see
+[components/hermes-desktop-wake.md](components/hermes-desktop-wake.md),
+[components/openclaw-peer.md](components/openclaw-peer.md) and
+[wakeable-droid.md](wakeable-droid.md). The implementation-level reference for
+this file is [components/wake-subsystem.md](components/wake-subsystem.md).
 
 ## Components
 
@@ -41,12 +52,13 @@ same visible TUI. It is never killed or restarted with fresh context.
 |---|---|
 | `bin/codex-peer` | Operator CLI: launch wakeable peers, manage the background daemon, inspect/repair/retire |
 | `wakeable-codex.ts` → `shared/wakeable-launcher.ts` | Start the app-server, start/resume the thread, launch the visible TUI, write a launch claim |
-| `shared/app-server-client.ts` | Minimal Codex app-server JSON-RPC client (`thread/loaded/list`, `thread/read`, `thread/name/set`, `turn/start`) with bounded connect/request timeouts |
-| `shared/wake-registry.ts` | Durable `peer_id -> app-server/thread` registry (0o600), liveness checks, GC of dead rows |
+| `shared/app-server-client.ts` | Minimal Codex app-server JSON-RPC client (`thread/loaded/list`, `thread/read`, `thread/name/set`, `turn/start`, `thread/turns/list`, `turn/steer`) over `ws://` or `ws+unix://`, with bounded connect/request timeouts |
+| `shared/codex-desktop-wake.ts` | Registers a Codex desktop chat for wake by exact thread id, with no launcher involved |
+| `shared/wake-registry.ts` | Durable `peer_id -> app-server/thread` registry (0o600), liveness checks, GC of dead rows, cross-process file lock |
 | `shared/wake-launch-claims.ts` | Launcher ↔ MCP-child handshake so the visible session's `peer_id` is bound to the right app-server/thread; also arbitrates the single-identity election via atomic `tryAcquireRoot()` |
 | `shared/wake-launch-role.ts` | Decides whether an MCP child registers a peer identity (`standalone` / `root` / `secondary`) — the duplicate-identity gate |
 | `shared/codex-inbox.ts` | Durable on-disk inbox **plus bodyless metadata** the daemon reads |
-| `shared/wake-daemon.ts` → `wake-daemon.ts` | The wake engine: one pass over the registry + metadata, with backoff/cap + GC |
+| `shared/wake-daemon.ts` → `wake-daemon.ts` | The Codex wake engine: one pass over the registry + metadata, with backoff/cap + GC. The same entry point then runs the Hermes and OpenClaw passes, which stay inert until opted in (see [wake-daemon.md](wake-daemon.md)) |
 | `codex-server.ts` | Registers the wakeable session and writes bodyless metadata when mail arrives |
 
 ## The wake turn
@@ -65,6 +77,57 @@ The daemon never carries the message body. `check_messages` (and its `[PEER INBO
 block) remains the single authoritative delivery path, exactly as for non-wakeable
 Codex. The wake only causes a turn; it never *is* the message.
 
+## Busy chats: delivery into the running turn
+
+A chat that is in the middle of a task does not have to finish before it sees mail.
+When the daemon finds unread mail for a thread whose status is `active` (working,
+with no approval or user-input prompt pending), it finds the in-progress turn with
+`thread/turns/list` and appends the wake to it with `turn/steer`, passing that turn
+as `expectedTurnId`. This is the same thing as typing into a busy Codex chat. The
+steer text is bodyless like the idle prompt, and tells the agent to call
+`check_messages` once, handle the mail as a colleague would, and then carry on with
+its task. The daemon log shows it as `wake: steered`.
+
+If the turn ends before the steer lands, the daemon re-reads the thread. An idle
+thread gets a normal wake turn. A thread that is busy again, or in any other state,
+releases the ledger claim and the next pass tries again. The same ledger backoff
+applies, so a busy thread is steered once per new unread batch, not on every poll.
+This arrived in commit `237d5f7`. It does not apply to chats parked on an approval
+or user-input prompt; those are still not touched.
+
+## Codex desktop chats
+
+A chat opened in the Codex desktop app, including one running over SSH on another
+machine, is not started by `codex-peer`, so there is no launch claim. The desktop
+app runs an app-server for it and that app-server spawns the agent-peers MCP as a
+stdio child. `shared/codex-desktop-wake.ts` lets that MCP register the chat for
+wake by itself:
+
+1. **Eligibility.** The session must be Codex, with `AGENT_PEERS_WAKE_ENABLED`
+   neither `1` nor `0` and `AGENT_PEERS_WAKE_LAUNCH` not `1`. Managed launches,
+   sessions that switched wake off, and the other harnesses are excluded.
+2. **Identity.** The thread id comes only from the `_meta.threadId` that Codex
+   stamps on each tool call. It is read on the first tool call, after the
+   delivery barrier, so discovery cannot disturb confirm-on-next-call delivery.
+3. **One bounded discovery pass.** `lsof` lists the unix sockets owned by the MCP's
+   direct parent (the app-server). This works on macOS only, takes at most 3 s,
+   and never looks at other processes. For each socket the code connects over
+   `ws+unix://`, and accepts it only if the thread is loaded there, can be read
+   with the same id, is not `notLoaded`, and has the same working directory.
+   Exactly one match registers; zero or several leave the chat non-wakeable.
+4. **Registration.** A wake-registry row is written with the `ws+unix://` URL, the
+   socket path, the parent pid as the app-server pid and no TUI pid.
+5. **Rename and rejoin** republish the same binding under the new name or session.
+   If later calls report a different thread id, the registration is dropped and
+   never retargeted.
+
+A chat with no reachable parent socket (for example a remote-control relay chat)
+simply stays non-wakeable. After registration the daemon treats the row like any
+other, with the same validation, backoff and steering. `codex-peer live` lists these
+chats as wakeable. `repair-wake` does not apply to them; they re-register on their
+next tool call. The code only shows a socket owned by the parent process and the
+host's thread id; the "SSH" framing comes from the commit that added it (`12f6f2b`).
+
 ## Security model
 
 - **Bodyless wake.** The daemon reads only envelope metadata (sender id/name/type,
@@ -80,9 +143,11 @@ Codex. The wake only causes a turn; it never *is* the message.
   per-user 0o600 shared secret. No network surface is added.
 - **Same-thread targeting is validated before every wake.** The daemon re-reads the
   thread and refuses to nudge unless `thread_id`, `cwd`, and (when known) the
-  rollout path all match the registry, and the thread status is `idle`. Mismatches,
-  `active`, `waitingOnApproval`, `waitingOnUserInput`, and error states are skipped
-  — so a wake can never land on the wrong session or interrupt active/approval work.
+  rollout path all match the registry. An `idle` thread gets a new turn; an `active`
+  thread (a working turn, no prompt pending) is steered, never interrupted.
+  Mismatches, `waitingOnApproval`, `waitingOnUserInput`, `notLoaded` and error states
+  are skipped — so a wake can never land on the wrong session or break into an
+  approval prompt. The thread is read once more immediately before the wake is sent.
 
 ## Token-cost characteristics
 
@@ -101,7 +166,8 @@ Codex. The wake only causes a turn; it never *is* the message.
 - **Idle with no mail = zero model tokens.** The idle TUI runs no inference. The
   wake daemon's poll is local-only (read metadata files + local WebSocket JSON-RPC
   to the app-server) and never calls the model. A model turn (`turn/start`) fires
-  **only** when there is real unread mail for an idle thread.
+  **only** when there is real unread mail for a loaded thread that is idle (or, for
+  a busy thread, a `turn/steer` into the turn that is already running).
 - **Each wake re-bills the whole accumulated thread** as input tokens, because LLM
   turns are stateless and resend the full context; the prompt cache is cold after
   minutes. So per-wake cost grows with session age. This is inherent to the
@@ -117,9 +183,16 @@ Codex. The wake only causes a turn; it never *is* the message.
   still surfaces on the session's next tool call / user turn. This bounds the
   worst-case token cost of a stuck inbox to a handful of turns spread over hours,
   and removes the routine "one redundant wake" on the happy path. A new message
-  (different signature) bypasses the backoff and wakes immediately. An **active**
-  (deeply-thinking) thread is skipped before the ledger is touched, so long turns
-  never burn attempts and are never abandoned mid-thought.
+  (different signature) bypasses the backoff and wakes immediately. A wake that is
+  claimed but never sent (the final read found the thread parked on a prompt, or the
+  steer lost a race with the end of the turn) is released: the ledger goes back to
+  its previous record, so it spends neither an attempt nor a cooldown. A thread
+  parked on an approval or user-input prompt is not woken at all and is re-checked
+  every pass.
+- **Wake registry writes are serialized.** Every registry operation holds
+  `wake-registry.json.lock` (exclusive create, a 2 s wait, reclaimed only from a
+  provably dead owner) and re-reads the committed file under it, so several MCP
+  children and the CLI cannot overwrite one another's rows.
 - **Bounded app-server I/O.** Connect and every JSON-RPC request are timeout-bounded
   (5s default). A wedged or half-dead app-server fails fast (`app_server_unreachable`)
   so it can't stall the rest of the (sequential) wake pass.
@@ -128,7 +201,10 @@ Codex. The wake only causes a turn; it never *is* the message.
   doesn't grow without bound. Live sessions are never pruned; inbox **message** files
   are never touched.
 - **Ambiguity-safe repair.** Normal launches bind the visible session to its exact
-  app-server/thread via env, so they are unambiguous. The `repair-wake` fallback,
+  app-server/thread through the launch claim (matched on cwd + tty, see "One
+  agent-peers identity per launch" below), not through environment variables: in
+  `--remote` mode the TUI's own `-c` env is ignored, so the claim is authoritative.
+  The `repair-wake` fallback,
   which matches by cwd/tty, **refuses** when two or more live distinct-thread
   sessions share a cwd/tty (e.g. two Codex in the same repo with no distinct TTY)
   rather than guessing and attaching to the wrong thread.
@@ -303,9 +379,34 @@ Day-to-day wake-daemon operations — log format, how repeated skips are coalesc
 the wedged-peer (`systemError`) backoff + bounce signal, and rotation — are
 documented in [wake-daemon.md](wake-daemon.md).
 
-The launcher also injects internal `AGENT_PEERS_WAKE_*` config into the app-server's
-MCP child (app-server URL/pid, thread id, rollout path) so the visible session
-registers itself against the exact thread it is attached to.
+The launcher also writes a launch claim (app-server URL/pid, thread id, rollout path)
+that the elected root MCP child consumes, so the visible session registers itself
+against the exact thread it is attached to. `AGENT_PEERS_WAKE_*` environment hints
+are honored only for the legacy path (`AGENT_PEERS_WAKE_ENABLED=1` without
+`AGENT_PEERS_WAKE_LAUNCH`), never for a managed launch.
+
+`AGENT_PEERS_CODEX_STATE_DIR` is the **coordination** directory (registry, claims,
+ledgers, daemon log). Message bodies and metadata live in the **inbox** directory,
+which is `AGENT_PEERS_STATE_DIR` when set and otherwise the same directory. The
+daemon reads both when they differ. The generic `AGENT_PEERS_STATE_DIR` is
+deliberately ignored for the coordination directory so a rolling upgrade cannot
+move locks that running launchers already hold.
+
+### Running the daemon as a service
+
+`codex-peer` auto-starts the daemon on every launch, which is enough on a laptop.
+On a host with a service manager the daemon is a service that runs
+`bin/codex-peer daemon 5` and restarts on failure:
+
+- **macOS:** a LaunchAgent (`com.mike.agent-peers-wake`, machine state, not
+  tracked in this repo).
+- **Linux:** `agent-peers-wake.service`, a systemd user unit in
+  `deploy/linux/`, installed next to `agent-peers-broker.service` by
+  `deploy/linux/install.sh`. See [components/linux-brokers.md](components/linux-brokers.md).
+
+Because `codex-peer daemon` writes its own pidfile, the auto-start in a launch sees
+a live daemon and does nothing. `codex-peer daemon-stop` on such a host only
+restarts the service.
 
 ## Testing
 
@@ -321,8 +422,13 @@ The wake path is covered by focused tests:
 - `tests/wake-launch-role.test.ts` — single-identity election: a standalone `codex`
   session still registers, exactly one of N concurrent live children wins the root
   lock, and a lock held by a dead process is reclaimable
+- `tests/wake-daemon-observe.test.ts` — log coalescing and wedged-peer re-check backoff
+- `tests/codex-desktop-wake.test.ts` — desktop-chat eligibility, socket discovery, refresh and invalidation
+- `tests/codex-peer-script.test.ts` — the `bin/codex-peer` shell surface
+- `tests/state-dir.test.ts` — inbox versus coordination directory resolution
 - `tests/bounded-log.test.ts` — private log paths, permissions, and rotation
 - `tests/process-lifecycle.test.ts` — orphan-parent detection safety boundary
 - `tests/codex-inbox-store.test.ts` — durable queue + bodyless metadata + fail-closed perms
 
-Run `bunx tsc --noEmit` and `bun test` to verify.
+Run `bun run typecheck` and `bun test` to verify. A checkout without `node_modules`
+cannot load the four test files that import the MCP SDK; install dependencies first.

@@ -1,8 +1,11 @@
 # T1 opt-in activation and rollback
 
-> Retired on 2026-10-31 (bd-b2in.9). This document is historical, not an
-> activation runbook. V2 source is retained at `archive/hermes-v2-2026-10-31`.
-> See [retirement and data retention](legacy-hermes-v2.md) for current behavior.
+> **Status: history. Do not follow as a runbook.** Retired on 2026-10-31
+> (bd-b2in.9). The `AGENT_PEERS_HERMES_V2` switch, the paired host package and the
+> activation steps below no longer do anything: the flag is ignored with a
+> warning, and V2 source is retained only at `archive/hermes-v2-2026-10-31`.
+> Current Hermes chat mail is described in [delivery-contract.md](delivery-contract.md);
+> old-data handling is in [legacy-hermes-v2.md](legacy-hermes-v2.md).
 
 Tracking: `bd-1con`. Activation owner: Marco, coordinated with Kepler.
 Vector's automated proofs use temporary profiles/databases and real stdio MCP

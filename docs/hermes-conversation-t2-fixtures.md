@@ -1,8 +1,13 @@
 # T2 exact-wake coordinator fixtures
 
-> Retired on 2026-10-31 (bd-b2in.9). These fixtures describe the archived V2
-> runtime, not the stock Hermes driver. Source is retained at
-> `archive/hermes-v2-2026-10-31`; see [retirement notes](legacy-hermes-v2.md).
+> **Status: history. Superseded.** Retired on 2026-10-31 (bd-b2in.9). These
+> fixtures describe the archived V2 wake coordinator, not the stock Hermes
+> driver; source is retained at `archive/hermes-v2-2026-10-31`. Its replacements
+> are the gateway driver `shared/hermes-chat-wake.ts` (built, not enabled on the
+> Studio as of 2026-11-02) and the Desktop plugin, which is live; see
+> [hermes-desktop-wake.md](components/hermes-desktop-wake.md) and
+> [delivery-contract.md](delivery-contract.md). Retirement notes:
+> [legacy-hermes-v2.md](legacy-hermes-v2.md).
 
 Tracking: `bd-1con`. This is source-stage work, not a live wake release.
 The runtime selects composition through a host-issued private attachment or a

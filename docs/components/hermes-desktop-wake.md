@@ -1,15 +1,53 @@
 # Hermes Desktop-open chat wake (in-process plugin)
 
-Status: source and tests only (bd-b2in.16). Nothing here is enabled on any
-machine. Live adoption needs Marco's runtime GO.
+Status, 2026-11-02 (bd-b2in.16): **live, default-on** for four profiles on the
+Studio's Desktop backend. Source and tests verified at `9be6159`. The
+operational facts under "Live state" come from the 2026-11-02 rollout and are
+not provable from this repository's code. This plugin is currently the only
+live Hermes wake: the gateway driver for closed chats is built but switched off.
+
+## Live state (2026-11-02)
+
+- **Where.** The Studio's Desktop backend (port 42495) serves the profiles
+  `default`, `ezra`, `marco` and `valentina`. The plugin is on by default for
+  all four (Mike, 2026-11-02 03:01Z). The opt-in file is
+  `~/.agent-peers-hermes/chat-wake/desktop-enabled`, with one `<profile> *`
+  line per profile (format under "Safety model"). Removing a profile's line stops
+  wakes for that profile on the next tick, with no reload. The wildcard line was
+  tested on a throwaway chat (Kepler).
+- **The MacBook.** Its Hermes.app has no local backend and drives the Studio
+  backend over SSH, so the Studio facts above apply to it.
+- **Exceptions.**
+  - The **general mailbox is not Desktop-woken.** The plugin acts only on
+    chat-tagged mail, so mail to the profile's general mailbox waits until
+    something reads it. This is an open gap.
+  - **Ezra's dedicated backend (port 63023)** loads the plugin only at its next
+    spawn.
+- **The gateway driver is off.** It runs only for profiles listed in
+  `~/.agent-peers-hermes/chat-wake/enabled`, and that file does not exist on the
+  Studio (the v3 runbook's step D is staged and needs Marco's GO). Until it is
+  enabled, mail for a chat that is closed waits in the broker until that chat is
+  opened and reads it.
+- **How it was activated.** The serving backend was notified to load the plugin
+  (Marco-approved). `hermes plugins enable` was not used, because it also runs
+  `reload_running_gateway` and forces profile rediscovery. The Plugins Hub is the
+  UI route (Kepler).
+- **Reloading the MCP.** Hermes Desktop has no `/reload-mcp` (it is not in the
+  Desktop slash palette). Toggle the Agent Peers connector off and on under
+  Capabilities, Connectors. `/reload-mcp` still works in the Hermes CLI/TUI and
+  gateway chats. A reload is **process-wide**: it restarts the MCP for every chat
+  that backend hosts, so on the Studio one toggle touches all four profiles.
+  Durable inbox state survives, and mail drawn but not yet confirmed is shown
+  again.
 
 ## What it does
 
-Mail to a Hermes chat (`to_chat`) wakes that chat. A closed chat is woken by
-the gateway driver (`shared/hermes-chat-wake.ts`, `hermes chat --resume -q`).
-A chat Mike has open in Hermes Desktop is held by its Desktop backend, so the
-driver waits (`waiting_desktop`). This plugin runs inside that backend and
-uses Hermes's supported plugin API:
+Mail to a Hermes chat (`to_chat`) wakes that chat. A closed chat would be woken
+by the gateway driver (`shared/hermes-chat-wake.ts`, `hermes chat --resume -q`),
+which is available per profile and currently off (above). A chat Mike has open
+in Hermes Desktop is held by its Desktop backend, so the driver waits
+(`waiting_desktop`). This plugin runs inside that backend and uses Hermes's
+supported plugin API:
 
 ```python
 ctx.inject_message(text, session_key=<registry entry session_id>)
@@ -83,9 +121,10 @@ Code: `hermes-plugins/agent-peers-desktop-wake/`. Tests:
     clears it (see "Clearing a dead lock" below). The gateway driver's status
     then reads `ledger lock held by dead pid <pid>`.
   - Release removes the lock only while it still carries the owner's token.
-- **Cancellation.** `cli.ts` cancel survives every settlement and record
-  step. A cancelled chat is never woken; its open attempt can still settle,
-  and the ledger stays `cancelled`.
+- **Cancellation.** The driver's `cancel` marks a chat's ledger `cancelled`,
+  and that survives every settlement and record step. A cancelled chat is never
+  woken; its open attempt can still settle, and the ledger stays `cancelled`.
+  No `cli.ts` command exposes `cancel` or `uncancel` yet; only tests call them.
 - **Settlement from correlated turn evidence only** (Kepler §20 as amended
   by AP10808). The plugin registers two hooks:
   - `pre_llm_call` writes `<state>/chat-wake/<profile>/evidence/<attempt>.started.json`;
@@ -165,8 +204,8 @@ executors must be stopped, so nothing can take the lock while you remove it.
 
 1. Engage the kill switch: create `~/.agent-peers-hermes/disabled` (and
    `<state>/disabled` if `AGENT_PEERS_STATE_DIR` points elsewhere). If the
-   gateway wake daemon is running (step D), stop it too; it has no flag-file
-   switch. Wait one plugin tick (5 s).
+   gateway driver has been enabled (step D; it is off today), stop it too. It ignores the
+   flag file, so remove its profiles from `chat-wake/enabled` or stop the daemon. Wait one plugin tick (5 s).
 2. Confirm no holder is alive: read the lock's `pid`, and check that
    `ps -o lstart= -p <pid>` prints nothing, or a start time different from
    the lock's `start`.
@@ -175,7 +214,10 @@ executors must be stopped, so nothing can take the lock while you remove it.
 4. Release the kill switch: remove the flag file and restart the daemon if
    you stopped it.
 
-## Adoption path (needs runtime GO)
+## Activating on a backend (how the live rollout was done)
+
+Use this to bring another profile or backend under the plugin. The first step
+and the steps that follow are the same ones the 2026-11-02 rollout used.
 
 1. **Pick the backend.** Which backend hosts a chat is decided per chat, not
    per profile.
@@ -183,36 +225,38 @@ executors must be stopped, so nothing can take the lock while you remove it.
      `~/.hermes/profiles/<p>/runtime/active_sessions.json`. Its `pid` is the
      hosting backend.
    - Map that pid to `~/.hermes/desktop-ssh/<ownershipId>/backend.lock.json`.
-   - On the Studio today, Ezra's dedicated backend is 63023 and the
-     default-profile pool backend is 42495. 42495 hosts profiles default,
-     ezra, marco and valentina.
-   - If the host is 42495, its Agent Peers MCP is still pre-A code. Reload it
-     separately first, or chat-scoped `check_messages` will not work.
+   - On the Studio, Ezra's dedicated backend is 63023 and the default-profile
+     pool backend is 42495, which hosts `default`, `ezra`, `marco` and
+     `valentina`.
+   - The backend's Agent Peers MCP must run v3 code, or chat-scoped
+     `check_messages` will not work. Toggle the Desktop connector off and on
+     after a code update (process-wide; see "Live state").
 2. **Install, still inert.**
    - Link the plugin into the profile:
      `~/.hermes/profiles/<p>/plugins/agent-peers-desktop-wake` →
      `~/agent-peers-mcp/hermes-plugins/agent-peers-desktop-wake`, at the
      verified release SHA.
    - In that profile's config, add the plugin to `plugins.enabled` and set
-     `allow_gateway_injection: true`.
-   - The plugin stays inert until the opt-in file names a chat.
-3. **Preflight before adoption.** A live rescan unloads and reloads the
-   profile's other plugins (`plugins.py:1257`).
+     `plugins.entries.agent-peers-desktop-wake.allow_gateway_injection: true`.
+   - The plugin stays inert until the opt-in file names the profile.
+3. **Preflight before loading.** A live rescan unloads and reloads the
+   profile's other plugins.
    - Run it only when the backend is idle: no running turn and no queued
      prompt.
    - Scope it to that one profile.
    - List the loaded plugins (Hindsight, tools) before and after, and confirm
      they are unchanged.
    - No forced restart.
-4. **Adopt.**
-   - The targeted route is the Plugins Hub toggle for that backend's
-     connection (Mike, one click), or the backend's next natural spawn.
-   - `hermes plugins enable` from a shell reaches only the backend in the
-     host rendezvous record, plus the messaging gateway. On the Studio that
-     backend is 42495, not 63023. Inside the messaging gateway, this plugin
-     refuses by design.
+4. **Load it.**
+   - Notify the serving backend so it loads the plugin. The Plugins Hub toggle
+     for that backend's connection is the UI route, and the backend's next
+     natural spawn also loads it. This is what the rollout used.
+   - Do not use `hermes plugins enable`. It also runs `reload_running_gateway`
+     and forces profile rediscovery, and it reaches only the backend in the host
+     rendezvous record (on the Studio, 42495, not 63023) plus the messaging
+     gateway, where this plugin refuses by design.
    - A successful plugin load does not prove the chat has scoped mail.
-5. **Throwaway proof, with profile-wide D off.**
+5. **Throwaway proof, with the gateway driver (step D) off.**
    - Opt in one chat: `ezra <throwaway-chat-key>`.
    - Send one tagged non-business message to the chat's address.
    - Pass requires all of:
@@ -224,7 +268,7 @@ executors must be stopped, so nothing can take the lock while you remove it.
      - no other chat is touched.
    - Repeat with a turn already running. The wake must queue, Mike's turn
      must not be interrupted, and both texts must survive.
-6. **Rollback, live, no reload.** Either delete the opt-in line or create
+6. **Rollback, live, no reload.** Either delete the profile's opt-in line or create
    `~/.agent-peers-hermes/disabled`. Mail stays queued.
 
 ## Hermes-side assumptions (Kepler §20, amended AP10808)

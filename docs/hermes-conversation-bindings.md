@@ -1,16 +1,22 @@
 # Hermes per-conversation T1 integration
 
-> Retired on 2026-10-31 (bd-b2in.9). The implementation described below is
-> historical, retained at `archive/hermes-v2-2026-10-31`.
-> See [retirement and data retention](legacy-hermes-v2.md) for current behavior.
+> **Status: history. Not current.** Retired on 2026-10-31 (bd-b2in.9). The
+> implementation described below was the V2 per-conversation adapter. Its source
+> is retained at `archive/hermes-v2-2026-10-31`, and it no longer exists in this
+> tree except `shared/hermes-conversation-fence.ts`. `AGENT_PEERS_HERMES_V2=1` is
+> now ignored with a warning. Chat-level mail today is the stock adapter:
+> `to_chat` mail and the `chat` argument (see
+> [delivery-contract.md](delivery-contract.md)), with wakes by the gateway driver
+> and the Desktop plugin ([hermes-desktop-wake.md](components/hermes-desktop-wake.md)).
+> For what still applies to old data, see [legacy-hermes-v2.md](legacy-hermes-v2.md).
 
 Tracking: `bd-1con`. Design approved by Marco on 2026-09-08:
 `agentic-coding-resources/.specs/2026-09-08-hermes-conversation-peers-design.md`.
 
-## Current implementation boundary
+## Implementation boundary at the time (historical)
 
-**Opt-in source, not deployed by this change.** `hermes-server.ts` uses the legacy
-adapter unless `AGENT_PEERS_HERMES_V2=1`. T1 bootstrap uses the first strict host
+**Opt-in source, not deployed by this change.** At that time `hermes-server.ts`
+used the legacy adapter unless `AGENT_PEERS_HERMES_V2=1`. T1 bootstrap uses the first strict host
 metadata call for identity, with lease-only cleanup until T2. Normal startup does
 not install conversation tables. No HTTP endpoint accepts caller-asserted lifecycle
 evidence. Without these tables, existing identities, crons and retention behavior

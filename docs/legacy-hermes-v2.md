@@ -1,5 +1,12 @@
 # Retired Hermes V2 runtime
 
+**Status: current for old data, history for the runtime.** The runtime is gone
+and nothing selects it. What remains live is the compatibility fence and the
+retained V2 tables, described below. Chat-level Hermes mail now works through the
+stock adapter and `to_chat` mail ([delivery-contract.md](delivery-contract.md)),
+woken by the Desktop plugin ([hermes-desktop-wake.md](components/hermes-desktop-wake.md))
+and, once enabled per profile, the gateway driver.
+
 The private per-conversation adapter, lifecycle/GUI attachment bridge, wake
 coordinator and `hermes-conversations-cli.ts` were retired under `bd-b2in.9`.
 The complete pre-retirement source is preserved by the annotated local tag

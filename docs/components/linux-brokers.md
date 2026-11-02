@@ -20,7 +20,9 @@ Same as the macOS LaunchAgent, with systemd --user as the service manager:
 - Federation is on in the unit (`AGENT_PEERS_FEDERATION=1`) and reads
   `~/.agent-peers-host`, `~/.agent-peers-fleet.json` and
   `~/.agent-peers-federation-secret` (0600, one fleet-wide value, separate from the
-  local secret). Without those files the broker refuses to start; `install.sh` checks.
+  local secret). `install.sh` checks for them. If they are missing or unusable the
+  broker still starts, logs `federation config unusable, federation stays off`, and
+  serves only local peers (`startFederation` in `broker.ts`).
 
 ## Install or update
 

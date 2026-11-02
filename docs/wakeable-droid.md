@@ -1,5 +1,8 @@
 # Wakeable Factory Droid peers
 
+As of repo HEAD `9be6159`. Checked against `wakeable-droid.ts`, `shared/droid-*.ts`
+and `cli.ts`.
+
 ## Guarantee
 
 `droidpeer` opens Factory's native interactive terminal as a managed,
@@ -23,6 +26,21 @@ droidpeer start [peer-name] [cwd]
 droidpeer start --cwd <repo-path>
 droidpeer resume <factory-session-id> [peer-name] [cwd]
 ```
+
+Options (`droidpeer --help` prints the same list; `--version` prints the launcher version):
+
+| Option | Meaning |
+|---|---|
+| `--headless` | Use the ACP host without native chat |
+| `--resume`, `-r SESSION_ID` | Resume an exact Factory session (also `resume SESSION_ID`) |
+| `--model ID` | Model for a new session (env `DROID_PEER_MODEL`) |
+| `--reasoning-effort LEVEL` | Reasoning effort for a new session (env `DROID_PEER_REASONING_EFFORT`) |
+| `--autonomy-level LEVEL` | `low`, `medium` or `high`, or an ACP value; default `high` (env `DROID_PEER_AUTONOMY_LEVEL`) |
+| `--name NAME` | Override the persona-repository-droid default name |
+| `--cwd`, `-C DIR` | Working directory, default the current directory |
+| `--droid PATH` | Droid executable, default a `PATH` lookup |
+| `--poll-ms MS` | Inbox metadata poll interval, default 1000 |
+| `--claim-timeout-ms MS` | How long to wait for the MCP child to bind, default 15000 |
 
 Bare `droidpeer` starts in the current directory. `--resume` (or `-r`) accepts
 the session ID printed by native Droid; `droid-peer` is an executable alias.
@@ -81,8 +99,8 @@ cancellation nor queue deletion acknowledges unread broker mail.
 
 ## Trust boundaries
 
-- Claims, inboxes, and metadata live below `~/.agent-peers-droid` with a 0700
-  directory and 0600 files.
+- Claims, inboxes, and metadata live below `~/.agent-peers-droid` (override with
+  `AGENT_PEERS_DROID_STATE_DIR`) with a 0700 directory and 0600 files.
 - Claim binding uses the exact MCP child PID and broker peer UUID. It does not
   guess by cwd or display name.
 - The wake prompt never includes sender text, message content, or broker lease
@@ -124,7 +142,12 @@ successful close report.
 
 Run `bun cli.ts live` (or the fleet `peerstatus` wrapper) to distinguish Droid
 broker membership, launcher/session process liveness, MCP process liveness,
-wakeability, and unread count.
+wakeability, and unread count. Each Droid line reads
+`broker=registered|missing  session=live|dead  mcp=live|dead  wakeable=yes|no  unread=N`,
+followed by the working directory and Factory session id. A Droid is wakeable only
+when it is registered, the launcher and MCP child are both alive, the claim has a
+finalized session id, and the claim's MCP pid matches the broker's current pid for
+that peer.
 When crash residue and a resumed claim share a peer UUID, inspection prefers the
 live claim matching the broker's current MCP PID. A claim without a finalized
 Factory session ID cannot report wakeable.
