@@ -37,7 +37,7 @@ function slug(value: string): string {
  */
 /** Leading name tokens that name a harness or model, never a persona
  *  (e.g. "claude-sender", "codex-receiver", old "opus-*" sessions). */
-const HARNESS_WORDS = new Set(["claude", "codex", "hermes", "droid", "opus", "sonnet", "haiku", "fable", "gemini", "agent", "peer"]);
+const HARNESS_WORDS = new Set(["claude", "codex", "hermes", "droid", "openclaw", "opus", "sonnet", "haiku", "fable", "gemini", "agent", "peer"]);
 
 export function personaOf(row: { name: string; persona?: string | null; git_root?: string | null; cwd?: string | null }): string | null {
   if (row.persona && row.persona.trim()) return slug(row.persona) || null;

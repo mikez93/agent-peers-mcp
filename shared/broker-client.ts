@@ -6,7 +6,7 @@ import type {
   SendMessageRequest, SendMessageResponse, AckMessagesRequest, AckMessagesResponse,
   RenamePeerRequest, RenamePeerResponse,
   HeartbeatRequest, HeartbeatResponse, UnregisterRequest, PollMessagesRequest,
-  LeasedMessage, Peer, ListChatsRequest, ListChatsResponse, ChatInboxEntry,
+  LeasedMessage, Peer, ListChatsRequest, ListChatsResponse, ChatInboxEntry, PeerInboxEntry,
 } from "./types.ts";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -29,6 +29,8 @@ export interface BrokerClient {
   listChats(req: ListChatsRequest): Promise<ListChatsResponse | null>;
   /** v3. Null when the broker predates the chat inbox (404). */
   chatInbox(): Promise<ChatInboxEntry[] | null>;
+  /** Null when the broker predates /peer-inbox. */
+  peerInbox(peerType: "openclaw", peerIds?: string[]): Promise<PeerInboxEntry[] | null>;
   // Note: there is no adminRenamePeer() in the client anymore. cli.ts reads
   // the target peer's session_token from SQLite directly and calls renamePeer
   // with it — see cli.ts cmdRename.
@@ -192,6 +194,10 @@ export function createClient(
     listChats(req) { return postOptional<ListChatsResponse>("/list-chats", req); },
     async chatInbox() {
       const r = await postOptional<{ entries: ChatInboxEntry[] }>("/chat-inbox", {});
+      return r ? r.entries : null;
+    },
+    async peerInbox(peerType, peerIds = []) {
+      const r = await postOptional<{ entries: PeerInboxEntry[] }>("/peer-inbox", { peer_type: peerType, peer_ids: peerIds });
       return r ? r.entries : null;
     },
   };

@@ -15,7 +15,7 @@ export const FEDERATION_HOST_HEADER = "x-agent-peers-federation-host";
 export const UNREACHABLE_HOSTS_HEADER = "x-agent-peers-unreachable-hosts";
 const BODY_LIMIT = 2 * 1024 * 1024;
 const MAX_TEXT = 100_000;
-const PEER_TYPES: PeerType[] = ["claude", "codex", "hermes", "droid"];
+const PEER_TYPES: PeerType[] = ["claude", "codex", "hermes", "droid", "openclaw"];
 // /federation/chats input limits, checked by both sides.
 const CHAT_PEER_MAX = 200;
 const CHAT_QUERY_MAX = 4096;
@@ -541,13 +541,31 @@ export class FederationService {
       WHERE id = ? AND status = 'pending'`).run(this.now() + delay, error, row.id);
   }
   private async relay(row: OutboxRow): Promise<void> {
+    let message: FederationEnvelope | null = null;
     try {
-      const message = envelopeFrom(JSON.parse(row.envelope));
+      message = envelopeFrom(JSON.parse(row.envelope));
       if (!message) throw new Error("invalid persisted envelope");
-      const result = safeResult(await this.request(row.host, "relay", this.config.relayTimeoutMs ?? 2000, message));
+      const result = safeResult(await this.request(row.host, "relay", this.config.relayTimeoutMs ?? 2000, message, true));
       if (!result) throw new Error("invalid federation response");
       this.complete(row, message, result);
     } catch (error) {
+      // A 400 means the destination read this exact envelope and refused it;
+      // resending it unchanged cannot succeed. The usual cause is a rolling
+      // upgrade: an older broker does not know the sender's peer type (the
+      // openclaw type, bd-b2in.17). Bounce it to the sender explicitly instead
+      // of retrying it forever behind a "queued" notice nobody revisits.
+      // Only "invalid federation envelope" means that: the body arrived and
+      // was parsed. "invalid federation payload" also covers a slow or cut
+      // upload, which a retry can fix, so it stays on the retry path.
+      if (message && error instanceof FederationHttpError && error.status === 400
+          && error.detail === "invalid federation envelope") {
+        try {
+          this.complete(row, message, { ok: false, code: "invalid",
+            error: `${row.host} refused the message (HTTP 400: ${error.detail}). `
+              + `Its broker may predate the "${message.sender.peer_type}" peer type; it will not accept this message until it is upgraded.` });
+          return;
+        } catch { /* notice failed; fall through to a retry so nothing is lost */ }
+      }
       // Error messages from fetch can contain URLs. Record a bounded category,
       // never credentials, request bodies, or remote response text.
       this.retry(row, error instanceof Error && /^federation HTTP \d+$/.test(error.message)

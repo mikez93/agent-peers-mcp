@@ -47,3 +47,11 @@ test("coordination roots match old running owners even when inbox overrides diff
   expect(resolveStateDir({ runtime: "hermes", kind: "coordination",
     env: { HOME: "/home/test", AGENT_PEERS_CODEX_STATE_DIR: "/codex" } })).toBe("/home/test/.agent-peers-hermes");
 });
+
+test("openclaw has its own root for inbox and coordination, with no Codex inbox fallback", () => {
+  const env = { HOME: "/home/test", AGENT_PEERS_CODEX_STATE_DIR: "/codex" };
+  expect(resolveStateDir({ env: { ...env, AGENT_PEERS_RUNTIME: "openclaw" } })).toBe("/home/test/.agent-peers-openclaw");
+  expect(resolveStateDir({ runtime: "openclaw", kind: "coordination", env })).toBe("/home/test/.agent-peers-openclaw");
+  expect(resolveStateDir({ runtime: "openclaw", kind: "coordination", env: { ...env, AGENT_PEERS_STATE_DIR: "/one" } })).toBe("/one");
+  expect(resolveStateDir({ runtime: "openclaw", env: { ...env, AGENT_PEERS_OPENCLAW_STATE_DIR: "/oc" } })).toBe("/oc");
+});

@@ -12,7 +12,7 @@ export interface PeerIdentity {
 
 const GENERIC_IDENTITIES = new Set([
   "a", "an", "the", "not", "ai", "assistant", "agent", "codex", "claude", "chatgpt",
-  "droid", "gemini", "developer", "engineer", "reviewer", "runtime", "helpful",
+  "droid", "openclaw", "gemini", "developer", "engineer", "reviewer", "runtime", "helpful",
   "senior", "expert", "software", "coding", "lead", "principal", "technical",
 ]);
 

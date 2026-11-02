@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // codex-server.ts
-// Durable polling MCP stdio server shared by Codex CLI, Hermes Agent, and
-// Factory Droid. Runtime wrappers select their first-class peer type.
+// Durable polling MCP stdio server shared by Codex CLI, Hermes Agent, Factory
+// Droid, and OpenClaw. Runtime wrappers select their first-class peer type.
 //
 // DELIVERY PIPELINE — two layers with a strict division of labor, driven
 // by one invariant: no message is acked to the broker (nor pruned from
@@ -88,6 +88,8 @@ import { DroidLaunchClaimStore } from "./shared/droid-launch-claims.ts";
 import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
 import type { PeerId, LeasedMessage, PeerType } from "./shared/types.ts";
 import { paperclipAgentMarker, paperclipRefusalMessage } from "./shared/paperclip-guard.ts";
+import { OpenClawMailboxGate } from "./shared/openclaw-gate.ts";
+import { mainSessionKey, normalizeAgentId, openclawRoot, readBinding } from "./shared/openclaw-state.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -107,14 +109,29 @@ const RUNTIME_PEER_TYPE: PeerType = process.env.AGENT_PEERS_RUNTIME === "hermes"
   ? "hermes"
   : process.env.AGENT_PEERS_RUNTIME === "droid"
     ? "droid"
-    : "codex";
+    : process.env.AGENT_PEERS_RUNTIME === "openclaw"
+      ? "openclaw"
+      : "codex";
 const RUNTIME_DISPLAY_NAME = RUNTIME_PEER_TYPE === "hermes"
   ? "Hermes"
   : RUNTIME_PEER_TYPE === "droid"
     ? "Factory Droid"
-    : "Codex";
+    : RUNTIME_PEER_TYPE === "openclaw"
+      ? "OpenClaw"
+      : "Codex";
 const RUNTIME_IS_CODEX = RUNTIME_PEER_TYPE === "codex";
 const RUNTIME_IS_DROID = RUNTIME_PEER_TYPE === "droid";
+// bd-b2in.17. One child per OpenClaw session thread, none of which knows its
+// session. Only the child proven to run agent:<id>:main owns the mailbox; see
+// shared/openclaw-gate.ts. Every other child answers with an explanation.
+const RUNTIME_IS_OPENCLAW = RUNTIME_PEER_TYPE === "openclaw";
+const OPENCLAW_AGENT = RUNTIME_IS_OPENCLAW ? normalizeAgentId(process.env.AGENT_PEERS_OPENCLAW_AGENT) : null;
+// Longer than the broker's stale-reclaim cutoff (60 s) plus one heartbeat
+// interval (15 s): past that, a row whose process has exited is reclaimable
+// even when its pid lingers unreaped.
+const OPENCLAW_RECLAIM_WAIT_MS = Number(process.env.AGENT_PEERS_OPENCLAW_RECLAIM_WAIT_MS) || 90_000;
+let openclawGate: OpenClawMailboxGate | null = null;
+let openclawRegistration: { resolve: (p: { peerId: string; peerName: string }) => void; reject: (e: unknown) => void } | null = null;
 // v3 per-chat mail (bd-b2in.5). One agent-peers process serves every chat of a
 // Hermes profile and MCP calls carry no session, so each mail call names its
 // chat. Mail for one chat is never drawn or confirmed by a call from another.
@@ -133,8 +150,8 @@ const WORKING_SESSION_STARTED_AT = workingSessionStartedAt(RUNTIME_PEER_TYPE);
 // Hermes surfaces are per-turn processes that are never wakeable, so the
 // Codex-grade 5-minute wait is always wrong there: it pins the turn "working"
 // and the surface may be torn down before the wait ends. 60s is the ceiling.
-const WAIT_FOR_MESSAGES_DEFAULT_MS = RUNTIME_PEER_TYPE === "hermes" ? 60_000 : 300_000;
-const WAIT_FOR_MESSAGES_MAX_MS = RUNTIME_PEER_TYPE === "hermes" ? 60_000 : 300_000;
+const WAIT_FOR_MESSAGES_DEFAULT_MS = RUNTIME_PEER_TYPE === "hermes" || RUNTIME_IS_OPENCLAW ? 60_000 : 300_000;
+const WAIT_FOR_MESSAGES_MAX_MS = RUNTIME_PEER_TYPE === "hermes" || RUNTIME_IS_OPENCLAW ? 60_000 : 300_000;
 const WAIT_FOR_MESSAGES_POLL_MS = 500;
 
 function log(msg: string) {
@@ -188,7 +205,7 @@ const mcp = new Server(
 
 DELIVERY ON THIS SIDE (${RUNTIME_DISPLAY_NAME}) — READ CAREFULLY, THIS IS LOAD-BEARING:
 
-${RUNTIME_IS_CODEX ? "The current Codex CLI does NOT surface mid-task MCP push notifications" : "Do not assume this Hermes session will surface MCP messages while the agent is idle"}
+${RUNTIME_IS_CODEX ? "The current Codex CLI does NOT surface mid-task MCP push notifications" : `Do not assume this ${RUNTIME_DISPLAY_NAME} session will surface MCP messages while the agent is idle`}
 to the model. That means you do not see peer messages the instant they
 arrive — you only see them when YOU call an agent-peers tool. A peer
 can send you a DM at 10:00; if you don't touch agent-peers until 10:20,
@@ -247,7 +264,14 @@ named in a wake message; otherwise it is the value of $HERMES_SESSION_ID
 or when a wake message says general, use chat="general". A call without a
 chat reads the profile's general mailbox. When you finish handling woken
 mail, call check_messages with the same chat once more so the broker records
-that you read it.` : ""}`,
+that you read it.` : ""}${RUNTIME_IS_OPENCLAW ? `
+
+OPENCLAW:
+
+Peer mail for this agent is read and sent only in its main session
+(${OPENCLAW_AGENT ? mainSessionKey(OPENCLAW_AGENT) : "agent:<id>:main"}). In any other session these tools explain that and
+do nothing. When a wake or bind message gives a wake value, pass it as
+\`wake\` to check_messages, yourself, in that same session.` : ""}`,
   },
 );
 
@@ -259,7 +283,7 @@ const TOOLS = [
       type: "object" as const,
       properties: {
         scope: { type: "string" as const, enum: ["machine", "directory", "repo"] },
-        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes", "droid"] },
+        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes", "droid", "openclaw"] },
       },
       required: ["scope"],
     },
@@ -289,7 +313,12 @@ const TOOLS = [
     name: "check_messages",
     description:
       `Surface peer messages waiting in the inbox. Call this at the START of every user turn — ${RUNTIME_DISPLAY_NAME} receives authoritative message content through an agent-peers tool response. One cheap call.`,
-    inputSchema: { type: "object" as const, properties: {} },
+    inputSchema: {
+      type: "object" as const,
+      properties: RUNTIME_IS_OPENCLAW
+        ? { wake: { type: "string" as const, description: "The wake value from an [agent-peers wake] or [agent-peers bind] message, when there is one." } }
+        : {},
+    },
   },
   {
     name: "wait_for_peer_messages",
@@ -804,6 +833,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       : undefined)
     : undefined;
 
+  // OpenClaw: decide BEFORE withPiggyback, which would poll and draw mail.
+  // A child that cannot prove it runs the agent's main session must not
+  // touch the mailbox at all, not even to list peers.
+  if (RUNTIME_IS_OPENCLAW) {
+    const gate = openclawGate;
+    const admitted = gate
+      ? await gate.admit(req.params._meta, name === "check_messages" ? callArgs.wake : undefined)
+      : { ok: false as const, text: "agent-peers (OpenClaw) is misconfigured: set AGENT_PEERS_OPENCLAW_AGENT and PEER_NAME in its mcp.servers entry." };
+    if (!admitted.ok) return { content: [{ type: "text" as const, text: admitted.text }], isError: true };
+  }
+
   return withPiggyback(async () => {
     switch (name) {
       case "list_peers": {
@@ -875,6 +915,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       }
 
       case "rename_peer": {
+        if (RUNTIME_IS_OPENCLAW) {
+          return { text: "The OpenClaw peer name comes from PEER_NAME in its mcp.servers entry and the main-session binding; change it there.", isError: true };
+        }
         const { new_name } = args as { new_name: string };
         if (!isValidName(new_name)) {
           return { text: `Invalid name: must be 1-${NAME_MAX_LEN} chars, [a-zA-Z0-9_-] only, and cannot be a UUID.`, isError: true };
@@ -986,6 +1029,33 @@ async function main() {
     await mcp.connect(new StdioServerTransport());
     log("agent-peers disabled (set AGENT_PEERS_ENABLED=1 to activate); idle");
     return;
+  }
+
+  let openclawPrevId: string | undefined;
+  if (RUNTIME_IS_OPENCLAW) {
+    const peerName = process.env.PEER_NAME;
+    if (!OPENCLAW_AGENT || !peerName || !isValidName(peerName)) {
+      // Tools stay listed so the thread starts; every call explains the fix.
+      await mcp.connect(new StdioServerTransport());
+      log("openclaw: AGENT_PEERS_OPENCLAW_AGENT and PEER_NAME are required; taking no identity");
+      return;
+    }
+    const root = openclawRoot();
+    let proven!: () => void;
+    const provenSignal = new Promise<void>((resolve) => { proven = resolve; });
+    const registered = new Promise<{ peerId: string; peerName: string }>((resolve, reject) => {
+      openclawRegistration = { resolve, reject };
+    });
+    registered.catch(() => { /* surfaced to the waiting call by the gate */ });
+    openclawGate = new OpenClawMailboxGate({
+      root, agentId: OPENCLAW_AGENT, peerName, log,
+      becomeMain: async () => { proven(); return registered; },
+    });
+    await mcp.connect(new StdioServerTransport());
+    log(`openclaw: connected; registering nothing until a tools/call proves this child runs ${mainSessionKey(OPENCLAW_AGENT)}`);
+    await provenSignal;
+    openclawPrevId = (await readBinding(root, OPENCLAW_AGENT))?.peer_id;
+    log(`openclaw: proved to run ${mainSessionKey(OPENCLAW_AGENT)} on Codex thread ${openclawGate.thread}; registering ${peerName}`);
   }
 
   // ---- Single-identity election for wakeable launches -------------------
@@ -1119,7 +1189,7 @@ async function main() {
   })();
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  const reg = await client.register({
+  const registerOnce = () => client.register({
     peer_type: RUNTIME_PEER_TYPE,
     name: requestedName,
     pid: process.pid,
@@ -1130,10 +1200,32 @@ async function main() {
     started_at: WORKING_SESSION_STARTED_AT,
     durable: requestDurable,
     ...(droidResumeClaim?.previous_peer_id ? { prev_id: droidResumeClaim.previous_peer_id } : {}),
+    ...(openclawPrevId ? { prev_id: openclawPrevId } : {}),
     persona,
     ...(HERMES_CHAT_MAIL ? { capabilities: ["chat-mail"] } : {}),
     ...(HERMES_CHAT_MAIL && mailboxOwner ? { mailbox_owner: mailboxOwner } : {}),
   });
+  let reg = await registerOnce();
+  if (RUNTIME_IS_OPENCLAW) {
+    // A suffixed name means the row still looks live: usually the previous
+    // owner of main's mailbox (a session reset's old thread) has released
+    // the name claim but its pid has not been reaped yet, or its last
+    // heartbeat is under the broker's 60 s reclaim cutoff. Never keep a
+    // second identity; drop the suffixed row and retry until the old row is
+    // reclaimable, which keeps the same peer ID and mailbox.
+    const deadline = Date.now() + OPENCLAW_RECLAIM_WAIT_MS;
+    let delay = 250;
+    while (reg.name !== process.env.PEER_NAME) {
+      try { await client.unregister({ id: reg.id, session_token: reg.session_token }); } catch { /* best effort */ }
+      if (Date.now() > deadline) {
+        throw new Error(`broker gave "${reg.name}" instead of "${process.env.PEER_NAME}" for ${Math.round(OPENCLAW_RECLAIM_WAIT_MS / 1000)} s; another live row holds the name`);
+      }
+      log(`openclaw: ${process.env.PEER_NAME}'s row still looks live; retrying the reclaim in ${delay} ms`);
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 5_000);
+      reg = await registerOnce();
+    }
+  }
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
@@ -1169,8 +1261,22 @@ async function main() {
     });
   }
 
-  await mcp.connect(new StdioServerTransport());
-  log("MCP connected");
+  if (RUNTIME_IS_OPENCLAW) {
+    openclawRegistration?.resolve({ peerId: myId, peerName: myName });
+  } else {
+    await mcp.connect(new StdioServerTransport());
+    log("MCP connected");
+  }
+
+  // OpenClaw: a newer proof can move the binding to another Codex thread
+  // (session reset). The old owner then exits so the new thread's child can
+  // reclaim the same peer row and mailbox at once.
+  const openclawWatch = RUNTIME_IS_OPENCLAW ? setInterval(async () => {
+    const reason = await openclawGate?.supersededReason().catch(() => null);
+    if (!reason) return;
+    log(`${reason} Stepping down.`);
+    process.kill(process.pid, "SIGTERM");
+  }, 5_000) : null;
 
   let pollStopped = false;
   let pollTickTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1279,6 +1385,10 @@ async function main() {
   lifecycleCleanup = async () => {
     clearInterval(parentWatch);
     clearInterval(hb);
+    if (openclawWatch) clearInterval(openclawWatch);
+    if (openclawGate) {
+      try { await openclawGate.release(); } catch { /* best effort */ }
+    }
     pollStopped = true;
     if (pollTickTimer) clearTimeout(pollTickTimer);
     // Release the hermes name claim so the next surface (next turn's process)
@@ -1415,6 +1525,12 @@ async function resolveWakeRegistrationHints(opts: {
 
 main().catch(async (e) => {
   log(`fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+  if (openclawRegistration) {
+    // Let the call that proved main get an explicit error before we exit.
+    openclawRegistration.reject(e);
+    await new Promise((r) => setTimeout(r, 200));
+    try { await openclawGate?.release(); } catch { /* best effort */ }
+  }
   // Clear any title set before the failure so the shell that inherits the tab
   // doesn't briefly see `peer:<name>` before the 'exit' handler fires.
   clearTabTitleSync();

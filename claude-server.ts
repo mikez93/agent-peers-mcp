@@ -165,7 +165,7 @@ const TOOLS = [
       type: "object" as const,
       properties: {
         scope: { type: "string" as const, enum: ["machine", "directory", "repo"] },
-        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes", "droid"], description: "optional filter" },
+        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes", "droid", "openclaw"], description: "optional filter" },
       },
       required: ["scope"],
     },

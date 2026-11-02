@@ -6,6 +6,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runWakePass } from "./shared/wake-daemon.ts";
 import { runHermesWakePass, chatWakeDir } from "./shared/hermes-wake-pass.ts";
+import { runOpenClawWakePass } from "./shared/openclaw-wake-pass.ts";
+import { openclawRoot } from "./shared/openclaw-state.ts";
 import { atomicWriteJson } from "./shared/file-state.ts";
 
 const args = new Set(process.argv.slice(2));
@@ -54,4 +56,26 @@ try {
   if (changed) await atomicWriteJson(seenPath, seen);
 } catch (e) {
   console.log(`${new Date().toISOString()} hermes: wake pass failed: ${e instanceof Error ? e.message : String(e)}`);
+}
+
+// OpenClaw main sessions with unread mail (bd-b2in.17). Does nothing, and
+// calls neither the broker nor the Gateway, until an agent id is listed in
+// ~/.agent-peers-openclaw/wake/enabled. A failure here never affects the
+// passes above.
+try {
+  const openclaw = await runOpenClawWakePass();
+  const seenPath = join(openclawRoot(), "wake", "last-logged.json");
+  let seen: Record<string, string> = {};
+  try { seen = JSON.parse(readFileSync(seenPath, "utf8")); } catch { /* first run */ }
+  let changed = false;
+  for (const r of openclaw) {
+    if (json) { console.log(JSON.stringify({ openclaw: r })); continue; }
+    const mark = `${r.state}:${r.submission_id ?? ""}`;
+    if (quietNoop && seen[r.agent_id] === mark) continue;
+    if (seen[r.agent_id] !== mark) { seen[r.agent_id] = mark; changed = true; }
+    console.log(`${new Date().toISOString()} openclaw: ${r.state} ${r.agent_id} — ${r.detail}`);
+  }
+  if (changed) await atomicWriteJson(seenPath, seen);
+} catch (e) {
+  console.log(`${new Date().toISOString()} openclaw: wake pass failed: ${e instanceof Error ? e.message : String(e)}`);
 }

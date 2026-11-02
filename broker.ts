@@ -14,7 +14,7 @@ import type {
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
   LeasedMessage, AckMessagesRequest, AckMessagesResponse,
   RenamePeerRequest, RenamePeerResponse,
-  ListChatsRequest, ListChatsResponse, ChatInboxEntry, PeerType,
+  ListChatsRequest, ListChatsResponse, ChatInboxEntry, PeerInboxEntry, PeerType,
 } from "./shared/types.ts";
 import { appendSuffixWithinLimit, generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 import { findConversation, hasConversationSchema, withConversationFence, dormantMailboxNotice, type ConversationOwner } from "./shared/hermes-conversation-fence.ts";
@@ -151,7 +151,7 @@ export function initDb(path: string): Database {
     CREATE TABLE IF NOT EXISTS peers (
       id            TEXT PRIMARY KEY,
       name          TEXT NOT NULL UNIQUE,
-      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes', 'droid')),
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes', 'droid', 'openclaw')),
       pid           INTEGER,
       cwd           TEXT,
       git_root      TEXT,
@@ -205,9 +205,15 @@ export function initDb(path: string): Database {
   // constraint requires a table rebuild; this final migration preserves every
   // column in the current schema instead of resetting newer peer metadata.
   migrate_peers_add_droid_peer_type(db);
-  // v3 (2026-10-31). MUST stay last: additive columns and a new table only,
-  // so an older broker can still open this DB if we ever roll back.
+  // v3 (2026-10-31). Additive columns and a new table only, so an older
+  // broker can still open this DB if we ever roll back.
   migrate_v3_addressing(db);
+  // bd-b2in.17 (2026-11-01). MUST stay last. It rebuilds peers from the
+  // table's own stored definition, so every column any earlier migration
+  // added (v3 persona/capabilities/mailbox_owner included) survives. Older
+  // brokers can still open the result: their CHECK probes look for
+  // 'hermes' and 'droid', which the expanded constraint still contains.
+  migrate_peers_add_openclaw_peer_type(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -514,6 +520,54 @@ function migrate_v3_addressing(db: Database): void {
     )`);
     db.exec("CREATE INDEX IF NOT EXISTS idx_messages_to_chat ON messages(to_id, to_chat, acked)");
     db.exec("CREATE INDEX IF NOT EXISTS idx_chat_routes_owner ON chat_routes(peer_name, chat_key)");
+    db.exec("COMMIT");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
+  }
+}
+
+const PEERS_TYPE_CHECK = /CHECK\s*\(\s*peer_type\s+IN\s*\(([^)]*)\)\s*\)/i;
+const PEERS_CREATE_HEAD = /^CREATE TABLE\s+(?:"peers"|'peers'|`peers`|\[peers\]|peers)\s*\(/i;
+
+/** Expand the peer_type CHECK to admit 'openclaw' without naming columns.
+ *  The droid rebuild above lists its columns literally, which is safe only
+ *  because it runs before v3. This one runs after everything, so it copies
+ *  the stored CREATE TABLE text with just the CHECK list changed, copies rows
+ *  by the live column list, verifies the count, and recreates the indexes
+ *  that existed. Peer IDs, tokens, and every other table are untouched. */
+function migrate_peers_add_openclaw_peer_type(db: Database): void {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = db.query<{ sql: string | null }, []>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'peers'"
+    ).get();
+    const sql = row?.sql ?? "";
+    if (!sql.includes("'openclaw'")) {
+      const check = sql.match(PEERS_TYPE_CHECK);
+      if (!check || !PEERS_CREATE_HEAD.test(sql)) {
+        throw new Error("peers table definition not recognized; refusing to rebuild it for the openclaw peer type");
+      }
+      const types = check[1]!.split(",").map((t) => t.trim()).filter(Boolean);
+      types.push("'openclaw'");
+      const rebuilt = sql
+        .replace(PEERS_TYPE_CHECK, `CHECK(peer_type IN (${types.join(", ")}))`)
+        .replace(PEERS_CREATE_HEAD, "CREATE TABLE peers_openclaw_new (");
+      const columns = db.query<{ name: string }, []>("SELECT name FROM pragma_table_info('peers')").all()
+        .map((c) => `"${c.name.replace(/"/g, '""')}"`).join(", ");
+      const indexes = db.query<{ sql: string }, []>(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'peers' AND sql IS NOT NULL"
+      ).all();
+      const before = db.query<{ n: number }, []>("SELECT count(*) AS n FROM peers").get()!.n;
+      db.exec(rebuilt);
+      db.exec(`INSERT INTO peers_openclaw_new (${columns}) SELECT ${columns} FROM peers`);
+      const after = db.query<{ n: number }, []>("SELECT count(*) AS n FROM peers_openclaw_new").get()!.n;
+      if (after !== before) throw new Error(`openclaw peer-type rebuild copied ${after} of ${before} peers; rolled back`);
+      db.exec("DROP TABLE peers");
+      db.exec("ALTER TABLE peers_openclaw_new RENAME TO peers");
+      for (const index of indexes) db.exec(index.sql);
+      console.error("[broker] migration: expanded peer_type constraint to include openclaw");
+    }
     db.exec("COMMIT");
   } catch (e) {
     try { db.exec("ROLLBACK"); } catch { /* best effort */ }
@@ -1070,7 +1124,7 @@ export function listDirectoryPeers(db: Database, req: { query?: string } = {}): 
 
 export type { ListChatsRequest, ListChatsResponse, ChatInboxEntry } from "./shared/types.ts";
 
-export const BROKER_CAPABILITIES = ["persona-names", "chat-mail", "list-chats", "chat-inbox", "bounded-poll"];
+export const BROKER_CAPABILITIES = ["persona-names", "chat-mail", "list-chats", "chat-inbox", "bounded-poll", "peer-inbox"];
 
 
 /** Read-only chat lookup: titles and status, never transcript text. It does
@@ -1175,6 +1229,34 @@ export function chatInbox(db: Database): ChatInboxEntry[] {
       ? db.query<{ title: string | null }, [string, string]>("SELECT title FROM chat_routes WHERE peer_name = ? AND chat_key = ? ORDER BY created_at LIMIT 1").get(r.peer_name, r.to_chat)?.title ?? null
       : null,
   }));
+}
+
+/** Unread mail per OpenClaw peer, for the OpenClaw wake pass (bd-b2in.17).
+ *  An OpenClaw agent-peers child lives only while its Codex thread is
+ *  loaded, so the durable row can hold mail with no process writing an inbox
+ *  file. The exact unread ids let the pass wake at most once per unread set. */
+export function peerInbox(db: Database, peerType: string, peerIds: unknown = []): PeerInboxEntry[] {
+  if (peerType !== "openclaw") return [];
+  // Bound ids are matched on messages.to_id directly: an OpenClaw child only
+  // heartbeats while its thread is loaded, so the broker can delete a quiet
+  // durable row (7 days) while its unacked mail (30 days) still waits. The
+  // next registration's prev_id re-points that mail; the wake must still fire.
+  const ids = (Array.isArray(peerIds) ? peerIds : [])
+    .filter((v): v is string => typeof v === "string" && /^[0-9a-f-]{36}$/i.test(v)).slice(0, 32);
+  const rows = db.query<{ peer_id: string; peer_name: string | null; id: number }, string[]>(
+    `SELECT m.to_id AS peer_id, p.name AS peer_name, m.id AS id
+       FROM messages m LEFT JOIN peers p ON p.id = m.to_id
+      WHERE m.acked = 0
+        AND (p.peer_type = ?${ids.length ? ` OR m.to_id IN (${ids.map(() => "?").join(", ")})` : ""})
+      ORDER BY m.id`,
+  ).all(peerType, ...ids);
+  const byPeer = new Map<string, PeerInboxEntry>();
+  for (const r of rows) {
+    const entry = byPeer.get(r.peer_id) ?? { peer_id: r.peer_id, peer_name: r.peer_name, unread_ids: [] };
+    if (entry.unread_ids.length < 500) entry.unread_ids.push(r.id);
+    byPeer.set(r.peer_id, entry);
+  }
+  return [...byPeer.values()];
 }
 
 // ----- Poll (lease) -----
@@ -1569,7 +1651,7 @@ function isGuiApp(command: string | undefined): boolean {
 function findAgentMcpServers(table: ProcTable): number[] {
   const pids: number[] = [];
   for (const [pid, command] of table.commandOf) {
-    if (/agent-peers-mcp\/(claude|codex|hermes|droid)-server\.ts/.test(command)) pids.push(pid);
+    if (/agent-peers-mcp\/(claude|codex|hermes|droid|openclaw)-server\.ts/.test(command)) pids.push(pid);
   }
   return pids;
 }
@@ -2115,6 +2197,7 @@ export function startBroker(
           }
           case "/list-chats":    return json(await listChatsRouted(db, await readJson(req), federation));
           case "/chat-inbox":    return json({ entries: chatInbox(db) });
+          case "/peer-inbox":    { const b = await readJson<{ peer_type?: string; peer_ids?: unknown }>(req); return json({ entries: peerInbox(db, String(b.peer_type ?? ""), b.peer_ids) }); }
           case "/ack-messages":  return json(ackMessages(db, await readJson(req)));
           case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
           // No /admin/rename-peer over HTTP — arbitrary local processes could

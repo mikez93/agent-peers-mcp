@@ -541,3 +541,73 @@ test("remote chat lookup names each HTTP failure and checks input before sending
     await custom.stop();
   }
 });
+
+// bd-b2in.17 (Marco AP10809 #4). Mixed-version brokers during the openclaw
+// rollout: a new broker accepts an openclaw sender, and an old broker's
+// refusal (its PEER_TYPES lacks "openclaw", so envelopeFrom returns null and
+// it answers HTTP 400) reaches the sender as an explicit bounce, not an
+// endless "queued" retry.
+test("a broker that knows openclaw accepts mail from an openclaw sender", async () => {
+  const a = makeMachine("alpha", [peer("openclaw-hetzner", "openclaw")]);
+  const b = makeMachine("beta");
+  delete a.config.hosts.gamma; delete b.config.hosts.gamma;
+  expect(a.deps.sendLocal(request(a, "beta@beta"))).toMatchObject({ ok: true });
+  await a.service.tick();
+  expect(a.service.status()).toEqual({ pending: 0, delivered: 1, bounced: 0 });
+  expect(b.service.senderForMessage(rows(b)[0]!.id)).toMatchObject({ from_name: "openclaw-hetzner@alpha", from_peer_type: "openclaw" });
+});
+
+test("an older broker's refusal of an openclaw sender is an explicit bounce to that sender", async () => {
+  const OLD_TYPES = ["claude", "codex", "hermes", "droid"];
+  const oldBroker = (async (url: string | URL | Request, init?: RequestInit) => {
+    const req = url instanceof Request ? new Request(url, init) : new Request(String(url), init);
+    if (new URL(req.url).pathname === "/federation/relay") {
+      const body = await req.clone().json() as { sender?: { peer_type?: string } };
+      if (!OLD_TYPES.includes(body.sender?.peer_type ?? "")) {
+        return Response.json({ error: "invalid federation envelope" }, { status: 400 });
+      }
+    }
+    return fakeFetch(req);
+  }) as typeof fetch;
+  const a = makeMachine("alpha", [peer("openclaw-hetzner", "openclaw")], oldBroker);
+  const b = makeMachine("beta");
+  delete a.config.hosts.gamma; delete b.config.hosts.gamma;
+  expect(a.deps.sendLocal(request(a, "beta@beta"))).toMatchObject({ ok: true, notice: expect.stringContaining("queued") });
+  await a.service.tick();
+  expect(a.service.status()).toEqual({ pending: 0, delivered: 0, bounced: 1 });
+  expect(rows(b)).toHaveLength(0);
+  const notice = rows(a).find((m) => m.to_id === a.peers[0]!.id)!;
+  expect(notice.text).toContain("Delivery failed to beta@beta");
+  expect(notice.text).toContain("HTTP 400: invalid federation envelope");
+  expect(notice.text).toContain('"openclaw" peer type');
+  expect(notice.text).toContain("Nothing was delivered");
+  expect(outbox(a)[0]).toMatchObject({ status: "bounced" });
+  // Retrying is pointless: no further network attempt after the bounce.
+  const calls = networkCalls;
+  clock += 10_000;
+  await a.service.tick();
+  expect(networkCalls).toBe(calls);
+});
+
+test("a 400 for an unreadable payload (slow or cut upload) stays on the retry path", async () => {
+  let refusals = 1;
+  const flaky = (async (url: string | URL | Request, init?: RequestInit) => {
+    const req = url instanceof Request ? new Request(url, init) : new Request(String(url), init);
+    if (new URL(req.url).pathname === "/federation/relay" && refusals > 0) {
+      refusals -= 1;
+      return Response.json({ error: "invalid federation payload" }, { status: 400 });
+    }
+    return fakeFetch(req);
+  }) as typeof fetch;
+  const a = makeMachine("alpha", [peer("codex-a", "codex")], flaky);
+  const b = makeMachine("beta");
+  delete a.config.hosts.gamma; delete b.config.hosts.gamma;
+  expect(a.deps.sendLocal(request(a, "beta@beta"))).toMatchObject({ ok: true });
+  await a.service.tick();
+  expect(a.service.status()).toEqual({ pending: 1, delivered: 0, bounced: 0 });
+  expect(rows(a).filter((m) => m.to_id === a.peers[0]!.id)).toHaveLength(0); // no failure notice
+  clock += 60_000;
+  await a.service.tick();
+  expect(a.service.status()).toEqual({ pending: 0, delivered: 1, bounced: 0 });
+  expect(rows(b)).toHaveLength(1);
+});

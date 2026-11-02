@@ -13,6 +13,8 @@ import type { Peer } from "./shared/types.ts";
 import { peerStartedAt, sortPeersNewestFirst } from "./shared/peer-list.ts";
 import { resolveStateDir, type StateRuntime } from "./shared/state-dir.ts";
 import { isProcessAlive as processIsAlive } from "./shared/process-liveness.ts";
+import { enabledAgents, normalizeAgentId, openclawRoot, readBinding, readLedger } from "./shared/openclaw-state.ts";
+import { bindOpenClawAgent, clearOpenClawSubmission, rearmOpenClawWake } from "./shared/openclaw-wake-pass.ts";
 
 // True app-server thread status for a wakeable peer — the GROUND TRUTH the
 // operator can trust over the TUI's "working" spinner, which lingers after
@@ -620,7 +622,7 @@ async function cmdSuggestName(base: string) {
 // broker rows the strict orphan view misses, and archive dead inbox files
 // without ever deleting bodies.
 
-const INBOX_RUNTIMES: StateRuntime[] = ["codex", "hermes", "droid", "claude"];
+const INBOX_RUNTIMES: StateRuntime[] = ["codex", "hermes", "droid", "claude", "openclaw"];
 
 interface InboxFileInfo {
   runtime: string;
@@ -776,7 +778,52 @@ async function cmdGcInboxes(apply: boolean, minAgeDays: number) {
 }
 
 const [, , sub, ...rest] = process.argv;
+// OpenClaw main-session wiring (bd-b2in.17). `bind` submits one bodyless
+// message into agent:<agent>:main so its agent-peers child can prove its
+// thread; `clear` records an operator decision about an open submission (it
+// cancels nothing inside OpenClaw).
+async function cmdOpenClaw(args: string[]) {
+  const [action, rawAgent, target, ...noteParts] = args;
+  const root = openclawRoot();
+  const agent = normalizeAgentId(rawAgent);
+  if (action === "status") {
+    const enabled = enabledAgents(root);
+    const agents = agent ? [agent] : [...enabled];
+    if (agents.length === 0) console.log("no OpenClaw agents enabled for wakes (wake/enabled is empty or absent)");
+    for (const a of agents) {
+      const binding = await readBinding(root, a);
+      const ledger = await readLedger(root, a);
+      console.log(`${a}: wakes ${enabled.has(a) ? "ON" : "off"}; binding ${binding ? `thread ${binding.thread_id} (${binding.peer_name ?? "no peer yet"}, proved ${binding.proven_at})` : "none"}${ledger.halted ? `; HALTED: ${ledger.halted.reason}` : ""}`);
+      for (const s of ledger.submissions.slice(-10)) {
+        console.log(`  ${s.created_at} ${s.kind} ${s.id} ${s.state}${s.detail ? ` — ${s.detail}` : ""}`);
+      }
+    }
+    return;
+  }
+  if (!agent) throw new Error("usage: bun cli.ts openclaw <status|bind|clear|rearm> <agent> ...");
+  if (action === "bind") {
+    const r = await bindOpenClawAgent({ root, agentId: agent });
+    console.log(`${r.state}: ${r.detail}${r.submission_id ? ` (${r.submission_id})` : ""}`);
+    if (r.state !== "submitted") process.exit(1);
+    return;
+  }
+  if (action === "clear") {
+    if (!target) throw new Error("usage: bun cli.ts openclaw clear <agent> <submission-id|halt> [note]");
+    console.log(await clearOpenClawSubmission(root, agent, target, noteParts.join(" ")));
+    return;
+  }
+  if (action === "rearm") {
+    if (!target) throw new Error("usage: bun cli.ts openclaw rearm <agent> <submission-id> [note]");
+    console.log(await rearmOpenClawWake(root, agent, target, noteParts.join(" ")));
+    return;
+  }
+  throw new Error(`unknown openclaw action: ${action ?? "(none)"}`);
+}
+
 switch (sub) {
+  case "openclaw":
+    await cmdOpenClaw(rest);
+    break;
   case "status":
     await cmdStatus();
     break;
@@ -873,6 +920,10 @@ switch (sub) {
   bun cli.ts stranded-messages
   bun cli.ts gc-inboxes [--apply] [--min-age-days N]
   bun cli.ts hermes-desktop-clear <profile> <chat-key> [--handled]
+  bun cli.ts openclaw status [agent]
+  bun cli.ts openclaw bind <agent>
+  bun cli.ts openclaw clear <agent> <submission-id|halt> [note]
+  bun cli.ts openclaw rearm <agent> <submission-id> [note]
   bun cli.ts kill-broker`);
     process.exit(sub ? 2 : 0);
 }

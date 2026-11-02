@@ -4,7 +4,7 @@
 import type { ChatCandidate } from "./chat-directory.ts";
 
 export type PeerId = string; // UUID v4
-export type PeerType = "claude" | "codex" | "hermes" | "droid";
+export type PeerType = "claude" | "codex" | "hermes" | "droid" | "openclaw";
 export type PeerName = string; // Validated by shared/names.ts; UUID-shaped names are excluded.
 
 export interface Peer {
@@ -189,6 +189,15 @@ export interface ListChatsResponse {
   candidates?: string[];
   peer?: string;
   chats?: (ChatCandidate & { address: string })[];
+}
+
+/** Unread mail for one OpenClaw peer (broker /peer-inbox, bd-b2in.17). */
+export interface PeerInboxEntry {
+  peer_id: string;
+  /** Null when the broker has deleted the peer row but its mail remains. */
+  peer_name: string | null;
+  /** Unacked broker message ids, oldest first (capped at 500). */
+  unread_ids: number[];
 }
 
 export interface ChatInboxEntry {
