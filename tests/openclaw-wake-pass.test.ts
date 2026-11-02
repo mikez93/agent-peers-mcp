@@ -516,3 +516,21 @@ test("an idle send's custody is its own transcript user event, and nothing loose
   expect(transcriptReceipts([ev("user", id, `${id}:user`)], ["agent-peers-wake-other"])).toEqual([]);
   expect(transcriptReceipts(undefined, [id])).toEqual([]);
 });
+
+test("a followup drained after a busy run is consumed by its exact key, under OpenClaw's own run id", () => {
+  const id = "agent-peers-wake-019b";
+  // The shape OpenClaw 2026.10.5 wrote for Alex's busy wake on 2026-11-02: the
+  // queued input ran later as run 07dc066d, but kept the chat.send key.
+  const drained = { role: "user", idempotencyKey: `${id}:user`, __openclaw: { id: "ev-8f21", runId: "07dc066d-6a01-490a-9af6-84ee88760310" } };
+  expect(transcriptReceipts([drained], [id])).toEqual([{ runId: id, state: "consumed", consumedByEventId: "ev-8f21" }]);
+  // The drain run's assistant, tool and settled rows are not the input.
+  expect(transcriptReceipts([{ ...drained, role: "assistant" }], [id])).toEqual([]);
+  expect(transcriptReceipts([{ role: "assistant", idempotencyKey: "07dc066d-6a01-490a-9af6-84ee88760310:settled", __openclaw: { id: "ev-9" } }], [id])).toEqual([]);
+  // Nothing looser than the exact key: no suffix games, no bare key, no event
+  // that OpenClaw did not stamp with a run, no event id.
+  expect(transcriptReceipts([{ ...drained, idempotencyKey: `${id}:user:x` }], [id])).toEqual([]);
+  expect(transcriptReceipts([{ ...drained, idempotencyKey: id }], [id])).toEqual([]);
+  expect(transcriptReceipts([{ ...drained, idempotencyKey: `x${id}:user` }], [id])).toEqual([]);
+  expect(transcriptReceipts([{ ...drained, __openclaw: { id: "ev-8f21" } }], [id])).toEqual([]);
+  expect(transcriptReceipts([{ ...drained, __openclaw: { id: "", runId: "07dc066d" } }], [id])).toEqual([]);
+});

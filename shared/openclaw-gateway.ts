@@ -182,10 +182,15 @@ export class OpenClawCliGateway implements OpenClawGateway {
  *  input older than this window stays "unknown" (fail-closed, operator clear). */
 const TRANSCRIPT_WINDOW = 200;
 const TRANSCRIPT_MAX_BYTES = 2_000_000;
+const USER_SUFFIX = ":user";
 
 /** A consumed receipt for each runId that has its own user event in the
- *  transcript. Matches only the exact pair OpenClaw writes for chat.send:
- *  __openclaw.runId === key and idempotencyKey === "<key>:user". */
+ *  transcript. The proof is the exact idempotencyKey OpenClaw writes for a
+ *  chat.send input: "<key>:user". An input that started at once runs under
+ *  its own key (__openclaw.runId === key). A followup that queued behind an
+ *  active run is drained later under a run id OpenClaw generates itself, but
+ *  its user event keeps "<key>:user" (Alex busy wake, 2026-11-02). So the
+ *  run id only has to be present, not equal. Anything else stays unknown. */
 export function transcriptReceipts(messages: unknown, runIds: string[]): InputReceipt[] {
   if (!Array.isArray(messages) || runIds.length === 0) return [];
   const want = new Set(runIds);
@@ -193,10 +198,12 @@ export function transcriptReceipts(messages: unknown, runIds: string[]): InputRe
   for (const m of messages) {
     if (!m || typeof m !== "object") continue;
     const msg = m as { role?: unknown; idempotencyKey?: unknown; __openclaw?: { runId?: unknown; id?: unknown } };
-    const runId = msg.__openclaw?.runId;
+    const key = msg.idempotencyKey;
     const eventId = msg.__openclaw?.id;
-    if (msg.role !== "user" || typeof runId !== "string" || !want.has(runId)) continue;
-    if (msg.idempotencyKey !== `${runId}:user` || typeof eventId !== "string" || !eventId) continue;
+    const ranAs = msg.__openclaw?.runId;
+    if (msg.role !== "user" || typeof key !== "string" || !key.endsWith(USER_SUFFIX)) continue;
+    const runId = key.slice(0, -USER_SUFFIX.length);
+    if (!want.has(runId) || typeof eventId !== "string" || !eventId || typeof ranAs !== "string" || !ranAs) continue;
     want.delete(runId);
     out.push({ runId, state: "consumed", consumedByEventId: eventId });
   }
