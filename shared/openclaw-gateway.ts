@@ -15,7 +15,12 @@
 // chat.send uses idempotencyKey as the runId. inputReceipts are read from the
 // durable session_pending_inputs table for the session's CURRENT sessionId
 // only; the installed source labels them "durable correlations [that] never
-// authorize replay".
+// authorize replay". That table holds a row only while an input waits in the
+// queue: a chat.send that starts at once on an idle session never gets one
+// (observed for Alex's bind on 2026-11-02). Its custody is then the transcript
+// itself: one user event whose __openclaw.runId is our key and whose
+// idempotencyKey is "<key>:user". inputReceipts() reports that event as
+// consumed, so an idle wake does not end as "unknown".
 //
 // The CLI needs Node 24.16+ first on PATH: under the box's /usr/bin/node 22
 // every DB-backed command exits 1 (node:sqlite truncates TEXT at NUL).
@@ -160,12 +165,40 @@ export class OpenClawCliGateway implements OpenClawGateway {
 
   async inputReceipts(sessionKey: string, agentId: string, runIds: string[]): Promise<InputReceipt[]> {
     if (runIds.length === 0) return [];
+    const ids = runIds.slice(0, 50);
     const result = await this.call("chat.history", {
-      sessionKey, agentId, limit: 1, maxBytes: 4096, inputRunIds: runIds.slice(0, 50),
-    }) as { inputReceipts?: unknown };
+      sessionKey, agentId, limit: TRANSCRIPT_WINDOW, maxBytes: TRANSCRIPT_MAX_BYTES, inputRunIds: ids,
+    }) as { inputReceipts?: unknown; messages?: unknown };
     if (!Array.isArray(result?.inputReceipts)) {
       throw new Error("chat.history returned no inputReceipts (Gateway too old, or the session changed)");
     }
-    return result.inputReceipts as InputReceipt[];
+    const receipts = result.inputReceipts as InputReceipt[];
+    const missing = ids.filter((id) => !receipts.some((r) => r.runId === id));
+    return [...receipts, ...transcriptReceipts(result.messages, missing)];
   }
+}
+
+/** Recent transcript searched for inputs that ran without a queue row. An
+ *  input older than this window stays "unknown" (fail-closed, operator clear). */
+const TRANSCRIPT_WINDOW = 200;
+const TRANSCRIPT_MAX_BYTES = 2_000_000;
+
+/** A consumed receipt for each runId that has its own user event in the
+ *  transcript. Matches only the exact pair OpenClaw writes for chat.send:
+ *  __openclaw.runId === key and idempotencyKey === "<key>:user". */
+export function transcriptReceipts(messages: unknown, runIds: string[]): InputReceipt[] {
+  if (!Array.isArray(messages) || runIds.length === 0) return [];
+  const want = new Set(runIds);
+  const out: InputReceipt[] = [];
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const msg = m as { role?: unknown; idempotencyKey?: unknown; __openclaw?: { runId?: unknown; id?: unknown } };
+    const runId = msg.__openclaw?.runId;
+    const eventId = msg.__openclaw?.id;
+    if (msg.role !== "user" || typeof runId !== "string" || !want.has(runId)) continue;
+    if (msg.idempotencyKey !== `${runId}:user` || typeof eventId !== "string" || !eventId) continue;
+    want.delete(runId);
+    out.push({ runId, state: "consumed", consumedByEventId: eventId });
+  }
+  return out;
 }

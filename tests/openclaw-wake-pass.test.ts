@@ -15,7 +15,7 @@ import {
 } from "../shared/openclaw-wake-pass.ts";
 import { ledgerLockPath, ledgerPath, readLedger, tokenHash, writeBinding, writeLedger } from "../shared/openclaw-state.ts";
 import {
-  OpenClawCliGateway, resolveOpenClawRuntime,
+  OpenClawCliGateway, resolveOpenClawRuntime, transcriptReceipts,
   type ChatSendAck, type ChatSendParams, type InputReceipt, type OpenClawGateway, type OpenClawSessionRow,
 } from "../shared/openclaw-gateway.ts";
 import type { PeerInboxEntry } from "../shared/types.ts";
@@ -296,7 +296,7 @@ for a in "$@"; do printf '%s\\n' "$a"; done > "${log}"
 case "$3" in
   sessions.describe) echo '{"session":{"key":"agent:peers:main","sessionId":"s-9","hasActiveRun":true,"isMain":true}}' ;;
   chat.send) echo '{"runId":"agent-peers-wake-1","status":"started"}' ;;
-  chat.history) echo '{"messages":[],"inputReceipts":[{"runId":"agent-peers-wake-1","state":"pending","queued":true}]}' ;;
+  chat.history) echo '{"messages":[{"role":"user","idempotencyKey":"agent-peers-bind-2:user","__openclaw":{"id":"ev-7","runId":"agent-peers-bind-2"}}],"inputReceipts":[{"runId":"agent-peers-wake-1","state":"pending","queued":true}]}' ;;
   *) echo "unknown method" >&2; exit 3 ;;
 esac
 `, { mode: 0o755 });
@@ -312,8 +312,11 @@ esac
   expect(argv[4]).toBe("--params");
   expect(JSON.parse(argv[5]!)).toEqual({ sessionKey: KEY, agentId: AGENT, message: "m", queueMode: "followup", deliver: false, idempotencyKey: "agent-peers-wake-1" });
   expect(argv.slice(6)).toEqual(["--timeout", "4000"]);
-  expect(await gw.inputReceipts(KEY, AGENT, ["agent-peers-wake-1"])).toEqual([{ runId: "agent-peers-wake-1", state: "pending", queued: true }]);
-  expect(JSON.parse(readFileSync(log, "utf8").trim().split("\n")[5]!)).toEqual({ sessionKey: KEY, agentId: AGENT, limit: 1, maxBytes: 4096, inputRunIds: ["agent-peers-wake-1"] });
+  expect(await gw.inputReceipts(KEY, AGENT, ["agent-peers-wake-1", "agent-peers-bind-2"])).toEqual([
+    { runId: "agent-peers-wake-1", state: "pending", queued: true },
+    { runId: "agent-peers-bind-2", state: "consumed", consumedByEventId: "ev-7" },
+  ]);
+  expect(JSON.parse(readFileSync(log, "utf8").trim().split("\n")[5]!)).toEqual({ sessionKey: KEY, agentId: AGENT, limit: 200, maxBytes: 2_000_000, inputRunIds: ["agent-peers-wake-1", "agent-peers-bind-2"] });
   const broken = new OpenClawCliGateway({ runtime: { openclawBin: fake, nodeBinDir: nodeDir }, env: { PATH: "/usr/bin:/bin" } });
   await expect((broken as unknown as { call(m: string, p: object): Promise<unknown> }).call("nope", {})).rejects.toThrow(/exited 3: unknown method/);
 });
@@ -496,4 +499,20 @@ test("AP10842 non-blocking: with wakes off, operator status reconciles a consume
   gw.receipts = [{ runId: second.submission_id!, state: "consumed", consumedByEventId: "e2" }];
   expect((await bindOpenClawAgent({ root, agentId: AGENT, gateway: gw, now, newToken: () => "t3" })).state).toBe("submitted");
   expect(gw.sends).toHaveLength(3);
+});
+
+test("an idle send's custody is its own transcript user event, and nothing looser", () => {
+  const ev = (role: string, runId: string, key: string, id = "ev-1") => ({ role, idempotencyKey: key, __openclaw: { id, runId } });
+  const id = "agent-peers-wake-9";
+  // The shape OpenClaw 2026.10.5 wrote for Alex's bind on 2026-11-02.
+  expect(transcriptReceipts([ev("user", id, `${id}:user`, "ev-42")], [id])).toEqual([{ runId: id, state: "consumed", consumedByEventId: "ev-42" }]);
+  // The run's own assistant/tool rows carry the runId too; they are not the input.
+  expect(transcriptReceipts([ev("assistant", id, `${id}:user`)], [id])).toEqual([]);
+  // A user event of some other input, or one without an event id, proves nothing.
+  expect(transcriptReceipts([ev("user", id, "something-else:user")], [id])).toEqual([]);
+  expect(transcriptReceipts([ev("user", id, `${id}:user`, "")], [id])).toEqual([]);
+  // Only asked-for ids, once each.
+  expect(transcriptReceipts([ev("user", id, `${id}:user`), ev("user", id, `${id}:user`, "ev-2")], [id])).toHaveLength(1);
+  expect(transcriptReceipts([ev("user", id, `${id}:user`)], ["agent-peers-wake-other"])).toEqual([]);
+  expect(transcriptReceipts(undefined, [id])).toEqual([]);
 });

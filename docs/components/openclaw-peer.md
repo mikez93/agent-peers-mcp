@@ -194,7 +194,7 @@ Installed docs (mirror docs.openclaw.ai):
 | `mcp.servers` with `codex.agents` reaches the agent's Codex threads on this box | Documented, issue openclaw/openclaw#80814 fixed; **not proven live** |
 | One child per session thread; main's thread id stable across unload/compaction | Assumed from docs; the design tolerates a new thread only via a newer token |
 | A dead MCP child is relaunched for main's thread on its next turn (winner death, step-down, registration failure) | Assumed; tested only with a test harness spawning the new child; if OpenClaw does not, the expected recovery is `openclaw mcp reload` (also unverified) |
-| `session_pending_inputs` rows outlive consumption long enough to read | Assumed; if a row vanishes first the submission goes `unknown` (safe, needs a clear) |
+| `session_pending_inputs` rows outlive consumption long enough to read | **False for idle sends** (Hetzner, 2026-11-02): a `chat.send` that starts at once never gets a row. `inputReceipts()` therefore also accepts the transcript user event with `__openclaw.runId` = key and `idempotencyKey` = `<key>:user` (last 200 messages) as consumed. Older or missing evidence still goes `unknown` (safe, needs a clear) |
 
 ## Adoption blockers
 
