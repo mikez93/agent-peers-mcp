@@ -16,8 +16,8 @@
 // and an uncertain submission stays "unknown" until an operator clears it.
 
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { open, readFile, rename, unlink } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { link, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { ensurePrivateDir } from "./file-state.ts";
 import { isProcessAlive } from "./process-liveness.ts";
@@ -40,6 +40,12 @@ export function mainSessionKey(agentId: string): string {
 
 export function openclawRoot(env: NodeJS.ProcessEnv = process.env, rootDir?: string): string {
   return resolveStateDir({ runtime: "openclaw", kind: "coordination", env, rootDir });
+}
+
+/** The kill switch: <root>/disabled. While it exists no OpenClaw child serves
+ *  mail and no pass or bind submits anything (state and mail stay intact). */
+export function openclawDisabled(root: string): boolean {
+  return existsSync(join(root, "disabled"));
 }
 
 export function enabledAgents(root: string): Set<string> {
@@ -149,35 +155,61 @@ export async function writeLedger(root: string, ledger: WakeLedger): Promise<voi
   await writeJsonDurable(ledgerPath(root, ledger.agent_id), ledger);
 }
 
-/** Serialize ledger read-modify-write between the daemon and the CLI. */
+export function ledgerLockPath(root: string, agentId: string): string {
+  return join(root, "wake", `${agentId}.lock`);
+}
+
+export class LedgerLockedError extends Error {}
+
+/** Who holds the lock, for status and errors; null when it is free. Names a
+ *  dead holder so the manual clearance below is visible. */
+export async function ledgerLockDetail(root: string, agentId: string): Promise<string | null> {
+  let raw: string;
+  try { raw = await readFile(ledgerLockPath(root, agentId), "utf8"); } catch { return null; }
+  let pid = Number.NaN;
+  try { pid = Number((JSON.parse(raw) as { pid?: unknown }).pid); } catch { /* unreadable */ }
+  return Number.isInteger(pid) && pid > 0 && !isProcessAlive(pid)
+    ? `wake ledger lock for ${agentId} is held by dead pid ${pid}; see "Clearing a dead lock" in docs/components/openclaw-peer.md`
+    : `wake ledger lock for ${agentId} is held by ${Number.isInteger(pid) ? `pid ${pid}` : "an unreadable owner"}; next tick`;
+}
+
+/** Serialize ledger read-modify-write between the daemon and the CLI.
+ *  Same rule as the Hermes Desktop lock (2d47fe1, Marco AP10817/AP10842):
+ *  the lock only ever appears complete (a private temp file link()ed into
+ *  place, which fails if one exists); acquire fails closed whenever it
+ *  exists, whatever its content and whether its holder is alive. Nothing
+ *  reaps it, because a reaper racing a fresh owner can leave two owners and
+ *  two submissions. A crashed holder's lock blocks only its agent until an
+ *  operator clears it. Release removes the lock only while it still carries
+ *  this owner's token. */
 export async function withLedgerLock<T>(root: string, agentId: string, fn: () => Promise<T>, waitMs = 10_000): Promise<T> {
-  const lockPath = join(root, "wake", `${agentId}.lock`);
+  const lockPath = ledgerLockPath(root, agentId);
   await ensurePrivateDir(dirname(lockPath));
+  const body = JSON.stringify({ pid: process.pid, token: randomUUID(), at: new Date().toISOString() });
   const deadline = Date.now() + waitMs;
   for (;;) {
+    const tmp = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(tmp, body, { mode: 0o600, flag: "wx" });
+    let acquired = false;
     try {
-      const f = await open(lockPath, "wx", 0o600);
-      await f.writeFile(JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
-      await f.close();
-      break;
+      await link(tmp, lockPath);
+      acquired = true;
     } catch (e) {
       if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
-      let holder: number | undefined;
-      try { holder = (JSON.parse(await readFile(lockPath, "utf8")) as { pid?: number }).pid; } catch { /* half-written */ }
-      if (holder !== undefined && !isProcessAlive(holder)) {
-        // Atomic claim of the stale file; a racing reclaimer gets ENOENT.
-        const tomb = `${lockPath}.stale.${process.pid}.${Date.now()}`;
-        try { await rename(lockPath, tomb); await unlink(tomb).catch(() => {}); } catch { /* lost the race */ }
-        continue;
-      }
-      if (Date.now() > deadline) throw new Error(`OpenClaw wake ledger for ${agentId} is locked by pid ${holder ?? "unknown"}`);
-      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      await unlink(tmp).catch(() => {});
     }
+    if (acquired) break;
+    if (Date.now() >= deadline) {
+      throw new LedgerLockedError(await ledgerLockDetail(root, agentId) ?? `wake ledger lock for ${agentId} is busy; next tick`);
+    }
+    await new Promise((r) => setTimeout(r, 50));
   }
   try {
     return await fn();
   } finally {
-    await unlink(lockPath).catch(() => {});
+    const current = await readFile(lockPath, "utf8").catch(() => null);
+    if (current === body) await unlink(lockPath).catch(() => {});
   }
 }
 

@@ -13,8 +13,8 @@ import type { Peer } from "./shared/types.ts";
 import { peerStartedAt, sortPeersNewestFirst } from "./shared/peer-list.ts";
 import { resolveStateDir, type StateRuntime } from "./shared/state-dir.ts";
 import { isProcessAlive as processIsAlive } from "./shared/process-liveness.ts";
-import { enabledAgents, normalizeAgentId, openclawRoot, readBinding, readLedger } from "./shared/openclaw-state.ts";
-import { bindOpenClawAgent, clearOpenClawSubmission, rearmOpenClawWake } from "./shared/openclaw-wake-pass.ts";
+import { enabledAgents, ledgerLockDetail, normalizeAgentId, openclawDisabled, openclawRoot, readBinding, readLedger } from "./shared/openclaw-state.ts";
+import { bindOpenClawAgent, clearOpenClawSubmission, rearmOpenClawWake, reconcileOpenClawAgent } from "./shared/openclaw-wake-pass.ts";
 
 // True app-server thread status for a wakeable peer — the GROUND TRUTH the
 // operator can trust over the TUI's "working" spinner, which lingers after
@@ -790,7 +790,15 @@ async function cmdOpenClaw(args: string[]) {
     const enabled = enabledAgents(root);
     const agents = agent ? [agent] : [...enabled];
     if (agents.length === 0) console.log("no OpenClaw agents enabled for wakes (wake/enabled is empty or absent)");
+    if (openclawDisabled(root)) console.log(`KILL SWITCH ENGAGED: ${root}/disabled`);
     for (const a of agents) {
+      const lock = await ledgerLockDetail(root, a);
+      if (lock) console.log(`${a}: ${lock}`);
+      else {
+        // Reads custody for open submissions even while wakes are off.
+        const problem = await reconcileOpenClawAgent({ root, agentId: a }).catch((e) => String(e instanceof Error ? e.message : e));
+        if (problem) console.log(`${a}: ${problem}`);
+      }
       const binding = await readBinding(root, a);
       const ledger = await readLedger(root, a);
       console.log(`${a}: wakes ${enabled.has(a) ? "ON" : "off"}; binding ${binding ? `thread ${binding.thread_id} (${binding.peer_name ?? "no peer yet"}, proved ${binding.proven_at})` : "none"}${ledger.halted ? `; HALTED: ${ledger.halted.reason}` : ""}`);

@@ -7,13 +7,13 @@
 // Plus: shipping wakes nothing until the per-agent enable file exists.
 
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  bindOpenClawAgent, buildOpenClawWakeText, clearOpenClawSubmission, rearmOpenClawWake, runOpenClawWakePass, unreadSignature,
+  bindOpenClawAgent, buildOpenClawWakeText, clearOpenClawSubmission, rearmOpenClawWake, reconcileOpenClawAgent, runOpenClawWakePass, unreadSignature,
 } from "../shared/openclaw-wake-pass.ts";
-import { ledgerPath, readLedger, tokenHash, writeBinding, writeLedger } from "../shared/openclaw-state.ts";
+import { ledgerLockPath, ledgerPath, readLedger, tokenHash, writeBinding, writeLedger } from "../shared/openclaw-state.ts";
 import {
   OpenClawCliGateway, resolveOpenClawRuntime,
   type ChatSendAck, type ChatSendParams, type InputReceipt, type OpenClawGateway, type OpenClawSessionRow,
@@ -282,7 +282,7 @@ test("Node 24 is resolved from ~/.local/node and Node 22 is refused", () => {
   expect(resolveOpenClawRuntime({ HOME: home, AGENT_PEERS_OPENCLAW_NODE_DIR: "/opt/n/bin" }).nodeBinDir).toBe("/opt/n/bin");
 });
 
-test("the CLI gateway puts Node 24 first on PATH, drops OPENCLAW_SHELL, and passes closed-schema params", async () => {
+test("the CLI gateway puts Node 24 first on PATH and passes closed-schema params", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ap-openclaw-cli-"));
   dirs.push(dir);
   const nodeDir = join(dir, "node24", "bin");
@@ -301,7 +301,7 @@ case "$3" in
 esac
 `, { mode: 0o755 });
   const gw = new OpenClawCliGateway({ runtime: { openclawBin: fake, nodeBinDir: nodeDir },
-    env: { PATH: "/usr/bin:/bin", OPENCLAW_SHELL: "exec", HOME: dir }, timeoutMs: 4000 });
+    env: { PATH: "/usr/bin:/bin", HOME: dir }, timeoutMs: 4000 });
   expect(await gw.describe(KEY, AGENT)).toEqual({ key: KEY, sessionId: "s-9", hasActiveRun: true, isMain: true });
   expect(readFileSync(`${log}.path`, "utf8").trim()).toBe(`${nodeDir}:/usr/bin:/bin`);
   expect(readFileSync(`${log}.shell`, "utf8").trim()).toBe("unset");
@@ -376,4 +376,124 @@ test("an operator can re-arm one more wake for an unread set whose wake ran but 
   gw.receipts.push({ runId: gw.sends[1]!.idempotencyKey, state: "consumed", consumedByEventId: "e2" });
   expect((await runOpenClawWakePass({ root, gateway: gw, now, peerInbox: inboxOf([1]) }))[0]!.state).toBe("already_woken");
   expect(gw.sends).toHaveLength(2); // one re-arm buys exactly one wake
+});
+
+// Marco AP10842 (review of 3be6d86). Each test below is red on 3be6d86.
+
+async function deadPid(): Promise<number> {
+  const child = Bun.spawn([process.execPath, "-e", ""], { stdout: "ignore", stderr: "ignore" });
+  await child.exited;
+  return child.pid;
+}
+
+test("AP10842 #1: a dead holder's lock is never reaped; two concurrent passes both fail closed and send nothing", async () => {
+  const root = setup();
+  await bind(root);
+  const lock = ledgerLockPath(root, AGENT);
+  const body = JSON.stringify({ pid: await deadPid() });
+  writeFileSync(lock, body);
+  const gw = new FakeGateway();
+  const [a, b] = await Promise.all([
+    runOpenClawWakePass({ root, gateway: gw, now, peerInbox: inboxOf([1]) }),
+    runOpenClawWakePass({ root, gateway: gw, now, peerInbox: inboxOf([1]) }),
+  ]);
+  for (const r of [a![0]!, b![0]!]) {
+    expect(r.state).toBe("locked");
+    expect(r.detail).toContain("dead pid");
+    expect(r.detail).toContain("Clearing a dead lock");
+  }
+  expect(gw.calls).toEqual([]);
+  expect(readFileSync(lock, "utf8")).toBe(body); // nobody renamed or removed it
+  expect((await readLedger(root, AGENT)).submissions).toEqual([]);
+
+  // The documented quiescent clear: switch engaged, holder dead, remove, release.
+  writeFileSync(join(root, "disabled"), "");
+  rmSync(lock);
+  rmSync(join(root, "disabled"));
+  expect((await runOpenClawWakePass({ root, gateway: gw, now, peerInbox: inboxOf([1]) }))[0]!.state).toBe("submitted");
+  expect(gw.sends).toHaveLength(1);
+});
+
+test("AP10842 #1: while one pass holds the lock a second cannot enter, and release never removes another owner's lock", async () => {
+  const root = setup();
+  await bind(root);
+  let enter!: () => void;
+  const entered = new Promise<void>((r) => { enter = r; });
+  let resume!: () => void;
+  const hold = new Promise<void>((r) => { resume = r; });
+  const slow = new FakeGateway();
+  const describe = slow.describe.bind(slow);
+  slow.describe = async (k, a) => { enter(); await hold; return describe(k, a); };
+  const first = runOpenClawWakePass({ root, gateway: slow, now, peerInbox: inboxOf([1]) });
+  await entered; // first holds the lock and has read an empty ledger
+  const other = new FakeGateway();
+  const second = (await runOpenClawWakePass({ root, gateway: other, now, peerInbox: inboxOf([1]) }))[0]!;
+  expect(second.state).toBe("locked");
+  expect(other.calls).toEqual([]);
+  // An operator replaces the lock while the first still runs (it must not).
+  const lock = ledgerLockPath(root, AGENT);
+  const foreign = JSON.stringify({ pid: process.pid, token: "someone-else" });
+  writeFileSync(lock, foreign);
+  resume();
+  expect((await first)[0]!.state).toBe("submitted");
+  expect(readFileSync(lock, "utf8")).toBe(foreign); // owner-checked release
+  expect(slow.sends).toHaveLength(1);
+  expect((await readLedger(root, AGENT)).submissions).toHaveLength(1);
+}, 15_000);
+
+test("AP10842 #3: removing the opt-in or engaging the kill switch during an awaited read submits nothing", async () => {
+  for (const flip of ["inbox", "describe", "kill"] as const) {
+    const root = setup();
+    await bind(root);
+    const enable = join(root, "wake", "enabled");
+    const gw = new FakeGateway();
+    const describe = gw.describe.bind(gw);
+    if (flip === "describe") gw.describe = async (k, a) => { rmSync(enable); return describe(k, a); };
+    const [r] = await runOpenClawWakePass({ root, gateway: gw, now, peerInbox: async () => {
+      if (flip === "inbox") rmSync(enable);
+      if (flip === "kill") writeFileSync(join(root, "disabled"), "");
+      return inboxOf([1])();
+    } });
+    expect(r!.state).toBe("opted_out");
+    expect(gw.sends).toEqual([]);
+    expect((await readLedger(root, AGENT)).submissions).toEqual([]); // no intent either
+  }
+});
+
+test("AP10842 #4: inside an OpenClaw agent shell the gateway is refused, never bypassed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ap-openclaw-shell-"));
+  dirs.push(dir);
+  const ran = join(dir, "ran");
+  const fake = join(dir, "openclaw");
+  writeFileSync(fake, `#!/bin/sh\ntouch "${ran}"\necho '{}'\n`, { mode: 0o755 });
+  const env = { PATH: "/usr/bin:/bin", HOME: dir, OPENCLAW_SHELL: "exec", AGENT_PEERS_OPENCLAW_BIN: fake, AGENT_PEERS_OPENCLAW_NODE_DIR: dir };
+  const gw = new OpenClawCliGateway({ runtime: { openclawBin: fake, nodeBinDir: dir }, env, timeoutMs: 4000 });
+  await expect(gw.describe(KEY, AGENT)).rejects.toThrow(/OPENCLAW_SHELL=exec .*refuses message RPCs/);
+  await expect(gw.chatSend({ sessionKey: KEY, agentId: AGENT, message: "m", queueMode: "followup", deliver: false, idempotencyKey: "k" })).rejects.toThrow(/agent shell/);
+
+  const root = setup();
+  await bind(root);
+  const [pass] = await runOpenClawWakePass({ root, env, peerInbox: inboxOf([1]) });
+  expect(pass!.state).toBe("agent_shell");
+  expect((await bindOpenClawAgent({ root, agentId: AGENT, env, now })).state).toBe("refused");
+  expect(existsSync(ran)).toBe(false); // the openclaw CLI never ran
+  expect((await readLedger(root, AGENT)).submissions).toEqual([]);
+});
+
+test("AP10842 non-blocking: with wakes off, operator status reconciles a consumed bind and the next bind is not blocked", async () => {
+  const root = setup({ enabled: null });
+  const gw = new FakeGateway();
+  const first = await bindOpenClawAgent({ root, agentId: AGENT, gateway: gw, now, newToken: () => "t1" });
+  expect(first.state).toBe("submitted");
+  expect(await runOpenClawWakePass({ root, gateway: gw, now })).toEqual([]); // wakes off: no pass
+  gw.receipts = [{ runId: first.submission_id!, state: "consumed", consumedByEventId: "e1" }];
+  expect(await reconcileOpenClawAgent({ root, agentId: AGENT, gateway: gw, now })).toBeNull();
+  expect((await readLedger(root, AGENT)).submissions[0]!.state).toBe("consumed");
+  // bind also reconciles before refusing
+  gw.receipts = [];
+  const second = await bindOpenClawAgent({ root, agentId: AGENT, gateway: gw, now, newToken: () => "t2" });
+  expect(second.state).toBe("submitted");
+  gw.receipts = [{ runId: second.submission_id!, state: "consumed", consumedByEventId: "e2" }];
+  expect((await bindOpenClawAgent({ root, agentId: AGENT, gateway: gw, now, newToken: () => "t3" })).state).toBe("submitted");
+  expect(gw.sends).toHaveLength(3);
 });

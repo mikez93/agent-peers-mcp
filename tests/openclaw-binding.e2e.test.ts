@@ -9,7 +9,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pollMessages, registerPeer, sendMessage, startBroker } from "../broker.ts";
@@ -177,3 +177,26 @@ test("session reset while the old owner's row still looks live: the new main wai
   // The old thread is now secondary, and the unrelated thread stays off.
   expect((await call(children[0]!, "check_messages", {}, T_OTHER)).isError).toBe(true);
 }, 40_000);
+
+test("AP10842 #2: touching disabled makes a loaded, bound child inert at once; mail stays with the broker and is served after release", async () => {
+  const main = children[children.length - 1]!; // the T_NEW owner from the previous test
+  const flag = join(state, "disabled");
+  writeFileSync(flag, "");
+  try {
+    expect(sendMessage(broker.db, { from_id: marco.id, session_token: marco.session_token, to_id_or_name: "openclaw-hetzner", text: "sent while disabled" }).ok).toBe(true);
+    const r = await call(main, "check_messages", {}, T_NEW);
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("switched off");
+    expect(r.text).not.toContain("sent while disabled");
+    expect((await call(main, "send_message", { to_id: "marco-droid", message: "should not go" }, T_NEW)).isError).toBe(true);
+    await new Promise((res) => setTimeout(res, 2500)); // longer than a background poll
+    const row = broker.db.query<{ acked: number; lease_token: string | null }, [string]>(
+      "SELECT acked, lease_token FROM messages WHERE text = ?").get("sent while disabled");
+    expect(row).toEqual({ acked: 0, lease_token: null }); // not drawn by the background poll
+  } finally {
+    rmSync(flag, { force: true });
+  }
+  const back = await call(main, "check_messages", {}, T_NEW);
+  expect(back.isError).toBe(false);
+  expect(back.text).toContain("sent while disabled");
+}, 20_000);

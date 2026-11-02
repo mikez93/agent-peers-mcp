@@ -89,7 +89,7 @@ import { parentProcessWasLost } from "./shared/process-lifecycle.ts";
 import type { PeerId, LeasedMessage, PeerType } from "./shared/types.ts";
 import { paperclipAgentMarker, paperclipRefusalMessage } from "./shared/paperclip-guard.ts";
 import { OpenClawMailboxGate } from "./shared/openclaw-gate.ts";
-import { mainSessionKey, normalizeAgentId, openclawRoot, readBinding } from "./shared/openclaw-state.ts";
+import { mainSessionKey, normalizeAgentId, openclawDisabled, openclawRoot, readBinding } from "./shared/openclaw-state.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -126,6 +126,13 @@ const RUNTIME_IS_DROID = RUNTIME_PEER_TYPE === "droid";
 // shared/openclaw-gate.ts. Every other child answers with an explanation.
 const RUNTIME_IS_OPENCLAW = RUNTIME_PEER_TYPE === "openclaw";
 const OPENCLAW_AGENT = RUNTIME_IS_OPENCLAW ? normalizeAgentId(process.env.AGENT_PEERS_OPENCLAW_AGENT) : null;
+const OPENCLAW_ROOT = RUNTIME_IS_OPENCLAW ? openclawRoot() : null;
+/** The OpenClaw kill switch, read on every tool call and background tick so
+ *  a loaded child goes inert at once (Marco AP10842 #2). Mail and custody are
+ *  untouched: the broker keeps it unacked until the switch is released. */
+function openclawKilled(): boolean {
+  return OPENCLAW_ROOT !== null && openclawDisabled(OPENCLAW_ROOT);
+}
 // Longer than the broker's stale-reclaim cutoff (60 s) plus one heartbeat
 // interval (15 s): past that, a row whose process has exited is reclaimable
 // even when its pid lingers unreaped.
@@ -527,6 +534,7 @@ async function applyLeasedToQueue(leased: LeasedMessage[]): Promise<void> {
 // fetchBrokerLeases() + applyLeasedToQueue() directly instead.
 async function pollBrokerIntoQueue(): Promise<void> {
   if (!myId || !mySession || !inboxStore) return;
+  if (openclawKilled()) return; // leave mail unleased in the broker
   if (pollInFlight) {
     await pollInFlight;
     return;
@@ -837,6 +845,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   // A child that cannot prove it runs the agent's main session must not
   // touch the mailbox at all, not even to list peers.
   if (RUNTIME_IS_OPENCLAW) {
+    if (openclawKilled()) {
+      return { content: [{ type: "text" as const, text: `agent-peers is switched off for OpenClaw (kill switch ${OPENCLAW_ROOT}/disabled). Queued mail stays with the broker; nothing is served until the file is removed.` }], isError: true };
+    }
     const gate = openclawGate;
     const admitted = gate
       ? await gate.admit(req.params._meta, name === "check_messages" ? callArgs.wake : undefined)
@@ -1310,6 +1321,7 @@ async function main() {
   let rejoining = false;
   const hb = setInterval(async () => {
     if (!myId || !mySession || rejoining) return;
+    if (openclawKilled()) return;
     try {
       const res = await client.heartbeat({ id: myId, session_token: mySession });
       if (res?.known !== false) return;

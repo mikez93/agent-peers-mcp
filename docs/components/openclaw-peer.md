@@ -18,12 +18,12 @@ gateway's global settings, or the websites on the box.
 | Peer type | `shared/types.ts`, `shared/federation.ts`, `shared/state-dir.ts`, `codex-server.ts`, `claude-server.ts`, `cli.ts` | Adds `openclaw` everywhere a type is listed. State root `~/.agent-peers-openclaw` (or `AGENT_PEERS_STATE_DIR` / `AGENT_PEERS_OPENCLAW_STATE_DIR`), no fallback to the Codex inbox. |
 | Broker migration | `broker.ts` `migrate_peers_add_openclaw_peer_type` | Runs last. Rebuilds `peers` from its own stored `CREATE TABLE` text with only the CHECK list changed, copies rows by the live column list, verifies the row count, recreates the indexes that existed. Idempotent. |
 | Unread lookup | `broker.ts` `peerInbox`, `POST /peer-inbox` | Unacked message ids per openclaw peer and per bound peer id (even after the broker deleted a quiet row; unacked mail outlives it), so the wake pass sees mail while no child is alive. Capability `peer-inbox`. |
-| MCP server | `openclaw-server.ts` | Sets `AGENT_PEERS_RUNTIME=openclaw` and loads `codex-server.ts`. Kill switch: `~/.agent-peers-openclaw/disabled`. |
+| MCP server | `openclaw-server.ts` | Sets `AGENT_PEERS_RUNTIME=openclaw` and loads `codex-server.ts`. Kill switch: `~/.agent-peers-openclaw/disabled`, read at startup and again on every tool call and background poll or heartbeat tick of a loaded child, so a bound child stops serving at once. Mail stays unacked and unleased in the broker. |
 | Mailbox binding | `shared/openclaw-gate.ts` | Decides on every `tools/call` whether this child runs `agent:<id>:main`. See below. |
 | Custody ledger | `shared/openclaw-state.ts` | Fsynced JSON ledger of every submission, binding file, enable file, lock. |
-| Gateway calls | `shared/openclaw-gateway.ts` | `sessions.describe`, `chat.send`, `chat.history` through `openclaw gateway call`, Node 24 first on PATH. |
+| Gateway calls | `shared/openclaw-gateway.ts` | `sessions.describe`, `chat.send`, `chat.history` through `openclaw gateway call`, Node 24 first on PATH. Refused outright when `OPENCLAW_SHELL` is set: OpenClaw refuses message RPCs from an agent's exec shell to keep attribution (`cli/gateway/query.md:427-429`, `concepts/session-tool.md:296-303`). The daemon and CLI run as external supervisors; the marker is never stripped. |
 | Wake pass | `shared/openclaw-wake-pass.ts`, `wake-daemon.ts` | Runs inside the existing wake daemon after the Codex and Hermes passes. Off until the agent id is in `wake/enabled`. |
-| Operator CLI | `cli.ts openclaw status|bind|clear|rearm` | Bind the main session, inspect, record operator decisions. |
+| Operator CLI | `cli.ts openclaw status|bind|clear|rearm` | Bind the main session, inspect, record operator decisions. `status` reconciles open submissions from custody (read-only Gateway calls) and names a held or dead lock. `bind` reconciles before refusing. |
 | Federation | `shared/federation.ts` `relay` | An HTTP 400 `invalid federation envelope` (the destination parsed the envelope and refused it, as an old broker does for an unknown peer type) is now an explicit bounce notice to the sender instead of an endless retry. A 400 `invalid federation payload` (slow or cut upload) still retries. |
 
 ## Mailbox binding (Marco #3)
@@ -92,6 +92,31 @@ Per enabled agent, each daemon tick (every 5 s on Hetzner):
    timeout, is `unknown`.
 6. If OpenClaw ever reports `interruptedActiveRun` for a followup, the agent's
    wakes halt until `bun cli.ts openclaw clear <agent> halt`.
+7. The opt-in (`wake/enabled`) and the kill switch (`disabled`) are re-read
+   after every await: on taking the lock, after the inbox read, after
+   `sessions.describe` (before the intent is written), and once more after the
+   intent is fsynced (then the intent is withdrawn as `cancelled`, since
+   nothing was sent). Flipping either mid-pass submits nothing new. It never
+   cancels work OpenClaw already admitted.
+8. The ledger lock (`wake/<agent>.lock`) fails closed. It only ever appears
+   complete (a temp file `link()`ed into place), acquire never reaps it even
+   when its holder is dead, and release removes it only while it still carries
+   the owner's token. This is the same rule as the Hermes Desktop lock (2d47fe1,
+   Marco AP10817/AP10842): a reaper racing a fresh owner can leave two holders
+   and two submissions. A crashed holder blocks only its agent, and status names it.
+
+### Clearing a dead lock
+
+Do this only when `bun cli.ts openclaw status <agent>` reports `held by dead
+pid <pid>`. Nothing may take the lock while you remove it.
+
+1. Engage the kill switch: `touch ~/.agent-peers-openclaw/disabled` (or
+   `<AGENT_PEERS_STATE_DIR>/disabled`). Passes and `bind` then do nothing. Run
+   no `openclaw bind|clear|rearm` until step 4. Wait one daemon tick (5 s).
+2. Confirm the holder is dead: `ps -p <pid>` prints no process (or one whose
+   start time is after the lock's `at`).
+3. Remove `~/.agent-peers-openclaw/wake/<agent>.lock`.
+4. Release the kill switch: remove the `disabled` file.
 
 There is no idle check before sending. `followup` makes the Gateway admit the
 input atomically: an idle session starts a turn, a busy one keeps it queued
@@ -217,7 +242,8 @@ Run as `openclaw@hetzner-box-01`. Every `openclaw` command needs Node 24 first:
 4. Create main and see the tools: `openclaw agent --agent <id> --session-key agent:<id>:main --message "List your agent-peers tools. Do not call them." --json`
    (`--deliver` defaults to false).
 5. Bind: `bun ~/agent-peers-mcp/cli.ts openclaw bind <id>`, then
-   `bun cli.ts openclaw status <id>` until the submission is `consumed` and the
+   `bun cli.ts openclaw status <id>` until the submission is `consumed` (status
+   reads custody itself while wakes are off; it never enables them) and the
    binding shows a thread and a peer, and `bun cli.ts peers` shows exactly one
    `openclaw` peer `<name>`. **Blocker 1 is settled here**: if the bind is
    consumed but the binding never appears, check the child's stderr for the
@@ -255,6 +281,8 @@ openclaw rows must stay readable).
 1. Stop future wakes: remove `<id>` from `~/.agent-peers-openclaw/wake/enabled`.
    Admitted work still runs.
 2. Make every child inert at once: `touch ~/.agent-peers-openclaw/disabled`.
+   Loaded children stop serving on their next call or tick; passes and `bind`
+   submit nothing. Nothing is cancelled and no mail is acked.
 3. Remove the OpenClaw wiring: `openclaw mcp unset agent-peers-<id>` and
    `openclaw mcp reload`. The agent can stay.
 4. Leave the ledger, binding, broker row and mail in place; mail stays queued

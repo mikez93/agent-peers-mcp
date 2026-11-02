@@ -93,6 +93,19 @@ export function resolveOpenClawRuntime(env: NodeJS.ProcessEnv = process.env): Op
     problem: "no Node 24.16+ found under ~/.local/node; set AGENT_PEERS_OPENCLAW_NODE_DIR (the openclaw CLI fails under Node 22)" };
 }
 
+/** OpenClaw refuses message RPCs from an agent's exec shell
+ *  (OPENCLAW_SHELL=exec) so worker output never appears as fresh human input
+ *  (installed docs cli/gateway/query.md:427-429, concepts/session-tool.md:296-303).
+ *  We honor that instead of stripping the marker: the wake daemon and the
+ *  operator CLI are external supervisors and never run inside an agent shell. */
+export function agentShellRefusal(env: NodeJS.ProcessEnv = process.env): string | null {
+  const shell = env.OPENCLAW_SHELL;
+  return shell
+    ? `refusing to call the OpenClaw Gateway: OPENCLAW_SHELL=${shell} marks an OpenClaw agent shell, where OpenClaw refuses message RPCs to keep attribution. `
+      + "Run the wake daemon or this CLI from an ordinary login shell or its service instead."
+    : null;
+}
+
 export class OpenClawCliGateway implements OpenClawGateway {
   constructor(private readonly opts: { runtime: OpenClawRuntime; env?: NodeJS.ProcessEnv; timeoutMs?: number }) {}
 
@@ -100,10 +113,10 @@ export class OpenClawCliGateway implements OpenClawGateway {
     const { runtime } = this.opts;
     if (!runtime.nodeBinDir) throw new Error(runtime.problem ?? "Node 24 for the openclaw CLI is not configured");
     const base = this.opts.env ?? process.env;
+    const refusal = agentShellRefusal(base);
+    if (refusal) throw new Error(refusal);
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(base)) if (v !== undefined) env[k] = v;
-    // The Gateway refuses operator calls from an agent's own exec shell.
-    delete env.OPENCLAW_SHELL;
     env.PATH = `${runtime.nodeBinDir}:${base.PATH ?? "/usr/bin:/bin"}`;
     const timeoutMs = this.opts.timeoutMs ?? 15_000;
     const proc = Bun.spawn([runtime.openclawBin, "gateway", "call", method, "--json",
