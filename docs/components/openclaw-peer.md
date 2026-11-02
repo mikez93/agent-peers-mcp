@@ -1,15 +1,17 @@
 # OpenClaw peer (bd-b2in.17)
 
-Status, 2026-11-01: code and tests on branch `next-openclaw` only. Not merged,
-not deployed, no OpenClaw agent created, no `mcp.servers` entry, no wake enabled.
-Marco's GO (AP10809) covered isolated implementation and tests. **Adoption is
-blocked** on the live checks in "Adoption blockers" below; the runbook at the
-end is a draft and is **NOT AUTHORIZED** to run.
+Status, 2026-11-02: released and live on all four brokers (MacBook, Studio,
+Omarchy, Hetzner; accepted baseline dd1fb2e, Marco AP10949). Alexander's
+EXISTING OpenClaw agent `claude` on Hetzner is adopted as peer
+`alex-openclaw-hetzner` through the `mcp.servers` entry `agent-peers-claude`,
+with wake-on-mail ON for `claude` only (Marco AP10851/AP10944, accepted
+AP10947). No agent was created; his id, persona, workspace, main history and
+Telegram channels are unchanged. Still open: crash, lost-response and
+compaction recovery, and the outbound gap after an idle unload (below).
 
-Goal: one dedicated, channel-unbound OpenClaw agent on Hetzner as a real Agent
-Peers member, with its own `openclaw` peer type and wake-on-mail into its main
-session, without touching Alexander's Telegram-bound agent (`claude`), the
-gateway's global settings, or the websites on the box.
+Goal: Alexander's existing agent as a real Agent Peers member, with its own
+`openclaw` peer type and wake-on-mail into its main session, without changing
+his channels, the gateway's global settings, or the websites on the box.
 
 ## Pieces
 
@@ -66,6 +68,18 @@ sub-agent, which presents it first, would bind that sub-agent's thread. The
 wake text says to call `check_messages` yourself in this session; the default
 sub-agent posture is restricted and loads no MCP.
 
+### After an idle unload
+
+OpenClaw unloads an idle main thread's MCP runtime (observed about 30 minutes
+after the last turn on 2026-11-02; not a guaranteed TTL). The next turn in
+`agent:<id>:main` runs on a NEW Codex thread whose replayed history still holds
+the old token. The gate refuses that thread as secondary (step 5) until a newer
+token proves it: the next wake, since every wake carries one, or an operator
+`bind`. Until then **outbound Agent Peers from main is unavailable**: Alex
+cannot start a conversation on his own. Inbound mail heals it by itself,
+because the wake that delivers it re-proves the thread. Old tokens are never
+accepted, and nothing in OpenClaw is changed for this.
+
 ## Wake and custody (Marco #1, #2, #5)
 
 Per enabled agent, each daemon tick (every 5 s on Hetzner):
@@ -78,8 +92,22 @@ Per enabled agent, each daemon tick (every 5 s on Hetzner):
    `inputRunIds` returns receipts: `consumed` → consumed (terminal),
    `pending`+`cancelled` → cancelled (terminal), `pending` → accepted (waiting),
    absent → unknown for an acknowledged submission, unchanged for an unknown one.
+   Custody keys on the exact submission key, not on a run id. OpenClaw only
+   keeps a queue row while an input waits, and deletes it on completion. An
+   input that starts at once on an idle session never gets one. A followup that
+   queued behind an active run is drained later under a run id OpenClaw
+   generates itself. In both cases the transcript user event keeps
+   `idempotencyKey: "<key>:user"`, so receipts are merged with an exact match on
+   that key (last 200 messages, 2 MB; a run id must be present but need not
+   equal the key). Native pending and cancelled receipts take precedence.
 3. While anything is open, nothing new is submitted: not on timeout, not on new
-   mail. An `unknown` stays until `bun cli.ts openclaw clear <agent> <id>`.
+   mail. An `unknown` in the same session is re-read on every reconcile and
+   settles to consumed or cancelled as soon as custody evidence appears. An
+   idle-started input read too early (its user event is not written yet) shows
+   `unknown` once and then `consumed`; re-run `status`, do not clear it. Only a
+   submission that never shows evidence, or whose session changed, stays
+   `unknown` until an operator decides with `bun cli.ts openclaw clear <agent> <id>`.
+   Nothing clears or replays on its own.
 4. Otherwise, with a binding and unread mail: one wake per unread set
    (signature = sorted unread ids). If that wake ran but the turn never read
    the mail, `bun cli.ts openclaw rearm <agent> <id>` allows exactly one more
@@ -87,9 +115,9 @@ Per enabled agent, each daemon tick (every 5 s on Hetzner):
    does not exist; the session is never created.
 5. Submit: write the intent with its idempotencyKey and the observed sessionId,
    fsync, then `chat.send` with `queueMode: "followup"`, `deliver: false`. The
-   ack is accepted only if `runId` equals our key and `status` is `started`
-   (or a cached `accepted`/`in_flight`/`ok`). Anything else, including a
-   timeout, is `unknown`.
+   ack is accepted only if the ack's `runId` equals our key and `status` is
+   `started` (or a cached `accepted`/`in_flight`/`ok`). Anything else, including a
+   timeout, is `unknown`. The ack's run id is not the custody proof; step 2 is.
 6. If OpenClaw ever reports `interruptedActiveRun` for a followup, the agent's
    wakes halt until `bun cli.ts openclaw clear <agent> halt`.
 7. The opt-in (`wake/enabled`) and the kill switch (`disabled`) are re-read
@@ -110,9 +138,12 @@ Per enabled agent, each daemon tick (every 5 s on Hetzner):
 Do this only when `bun cli.ts openclaw status <agent>` reports `held by dead
 pid <pid>`. Nothing may take the lock while you remove it.
 
-1. Engage the kill switch: `touch ~/.agent-peers-openclaw/disabled` (or
-   `<AGENT_PEERS_STATE_DIR>/disabled`). Passes and `bind` then do nothing. Run
-   no `openclaw bind|clear|rearm` until step 4. Wait one daemon tick (5 s).
+1. Quiet every ledger writer. Engage the kill switch:
+   `touch ~/.agent-peers-openclaw/disabled` (or `<AGENT_PEERS_STATE_DIR>/disabled`).
+   Daemon passes and `bind` then do nothing. `status`, `clear` and `rearm` still
+   take the same lock and write the ledger, so no shell or agent session (yours
+   or another lane's) may run any `bun cli.ts openclaw` subcommand until step 4.
+   Wait one daemon tick (5 s).
 2. Confirm the holder is dead: `ps -p <pid>` prints no process (or one whose
    start time is after the lock's `at`).
 3. Remove `~/.agent-peers-openclaw/wake/<agent>.lock`.
@@ -196,36 +227,45 @@ Installed docs (mirror docs.openclaw.ai):
 | A dead MCP child is relaunched for main's thread on its next turn (winner death, step-down, registration failure) | **Verified for idle unload** (Hetzner, 2026-11-02): the next main turn started a new child (pid 1065526), which served once a newer token proved main. Winner death and step-down are still untested live. |
 | `session_pending_inputs` rows outlive consumption long enough to read | **False for idle sends** (Hetzner, 2026-11-02): a `chat.send` that starts at once never gets a row. `inputReceipts()` therefore also accepts the transcript user event with `__openclaw.runId` = key and `idempotencyKey` = `<key>:user` (last 200 messages) as consumed. Older or missing evidence still goes `unknown` (safe, needs a clear) A followup that queued behind an active run is drained later under a run id OpenClaw generates itself (07dc066d for Alex's busy wake), but its user event keeps the exact `<key>:user` idempotencyKey; the queue row is deleted on completion. So the transcript match keys on that exact idempotencyKey alone and only requires a run id to be present. |
 
-## Adoption blockers
+## Adoption record (2026-11-02)
 
-1. Live proof that a `tools/call` from the dedicated agent's main session
-   carries `_meta.threadId`. Without it every call is refused and nothing can
-   bind; that failure is loud and safe, but adoption cannot proceed. If Codex
-   0.160.0 does not stamp it, binding is unprovable with what OpenClaw exposes
-   (no session key reaches the child, `sessions.describe` has no thread id,
-   `/codex binding` is an in-conversation command) and adoption stays blocked.
-2. Live proof that the `mcp.servers` entry projects into that agent's Codex
-   threads, and how many children appear per session.
-3. All four brokers (MacBook, Studio, Omarchy, Hetzner) on this code before any
-   openclaw peer sends or appears: an old broker rejects an openclaw sender's
-   envelope (now an explicit bounce on new senders) and hides the peer from lists.
-4. Mike's decisions: agent id, peer name (default `openclaw-hetzner`), persona.
-5. A quiet window agreed with Marco for the Gateway-restart acceptance step,
-   since it also restarts Alexander's agent.
+The former blockers, as settled on Hetzner:
 
-## Runtime runbook (DRAFT, NOT AUTHORIZED)
+1. `_meta.threadId`: a `tools/call` from Alex's sessions carries it. A
+   throwaway explicit session proved it and registered no peer.
+2. Projection: `agent-peers-claude` (`codex.agents: ["claude"]`) reaches his
+   Codex threads, one child per thread. Children of other sessions refuse and
+   register nothing.
+3. All four brokers run this code (dd1fb2e at closeout).
+4. Mike's decisions: the existing agent `claude`, peer `alex-openclaw-hetzner`,
+   persona unchanged. No new agent.
+5. Code uptake needs no Gateway restart: wake passes are fresh processes, and a
+   child loads at thread start.
+
+Live acceptance under Marco AP10851/AP10944:
+- Bind custody: d6feefea; after an idle unload, re-bind f093a925 → event 44bc3433
+  on thread 01a19a43.
+- Kill switch on the same loaded child: refused and inert, then served again
+  on release.
+- Idle wake 07df4972 → 202fb5c4.
+- Busy wakes 019b1c56 → 8f211df1 (settled after 55a4293) and cfe0584e → ca353f12.
+  Each queued behind the active run without interrupting it, with one
+  submission, a substantive reply and no Telegram delivery.
+
+Not yet proven: lost response, daemon or Gateway restart mid-submission, and
+compaction.
+
+## Operating runbook
 
 Run as `openclaw@hetzner-box-01`. Every `openclaw` command needs Node 24 first:
 `export PATH=$HOME/.local/node/node-v24.22.1-linux-x64/bin:$HOME/.npm-global/bin:$PATH`.
-`<id>` is the new agent id; `<name>` the peer name.
+For Alex, `<id>` is `claude` and `<name>` is `alex-openclaw-hetzner`.
 
-0. Preconditions: Marco and Mike approve; this branch merged and released to
-   all four brokers; `bun ~/agent-peers-mcp/cli.ts status` on each shows the
-   new broker; `openclaw agents list` shows `claude` unchanged.
-1. Agent: `openclaw agents add <id> --workspace ~/.openclaw/workspace-<id> --non-interactive`
-   (no `--bind`). Confirm with `openclaw agents list` that it has no bindings
-   and `claude` still has its Telegram binding.
-2. MCP entry, scoped to that agent only:
+1. Inspect: `bun ~/agent-peers-mcp/cli.ts openclaw status <id>` (binding
+   thread, submissions, wakes on or off), `bun cli.ts peers`, and
+   `~/.agent-peers-openclaw/{wake/enabled,disabled}`.
+2. Wiring (already in place for Alex; change only this entry, and take a 0600
+   backup of the config first):
    ```
    openclaw mcp set agent-peers-<id> '{"command":"/home/openclaw/.bun/bin/bun",
      "args":["/home/openclaw/agent-peers-mcp/openclaw-server.ts"],
@@ -235,42 +275,25 @@ Run as `openclaw@hetzner-box-01`. Every `openclaw` command needs Node 24 first:
    openclaw mcp reload
    ```
    (`mcp add --no-probe` cannot set `codex.agents`; `mcp set` does not probe.)
-3. Static check, then probe: `openclaw mcp doctor agent-peers-<id>`, then
-   `openclaw mcp doctor agent-peers-<id> --probe`. A probe child takes no
-   identity (it never makes a thread-stamped `tools/call`); confirm with
-   `bun cli.ts peers` that no openclaw peer appeared.
-4. Create main and see the tools: `openclaw agent --agent <id> --session-key agent:<id>:main --message "List your agent-peers tools. Do not call them." --json`
-   (`--deliver` defaults to false).
-5. Bind: `bun ~/agent-peers-mcp/cli.ts openclaw bind <id>`, then
-   `bun cli.ts openclaw status <id>` until the submission is `consumed` (status
-   reads custody itself while wakes are off; it never enables them) and the
-   binding shows a thread and a peer, and `bun cli.ts peers` shows exactly one
-   `openclaw` peer `<name>`. **Blocker 1 is settled here**: if the bind is
-   consumed but the binding never appears, check the child's stderr for the
-   `_meta.threadId` refusal and stop.
-6. Acceptance, wakes still off:
-   - same exact agent/session: `sessions.describe` for `agent:<id>:main` shows the
-     sessionId recorded on the bind; the binding's thread did not change;
-   - from the MacBook and from Hetzner, send `<name>@hetzner` (the host in
-     `~/.agent-peers-host`) a question
-     that needs a substantive answer; prompt main with step 4's command
-     ("check your agent-peers messages"); both senders get substantive replies;
-   - Alexander's Telegram chats receive nothing (check `claude` sessions and
-     `sessions.describe` on `agent:<id>:main` shows no channel delivery context).
-7. Wakes on: `echo <id> >> ~/.agent-peers-openclaw/wake/enabled`. Then:
-   - idle: send mail, see `openclaw: submitted` then `consumed` in the wake log
-     and a reply;
-   - busy: start a long turn in main (step 4 with a long task), send mail while
-     `hasActiveRun` is true; the wake is `accepted` with "queued behind the
-     active run", the running turn is not interrupted or steered, and the wake
-     runs after it;
-   - lost response and restart (quiet window only): stop the wake daemon mid-
-     submission, or restart the Gateway after a submission; the ledger shows
-     `unknown` or reconciles from custody, and no second submission appears
-     until `openclaw clear`;
-   - later scoped confirmation: a second sender, a day later, still answered in
-     the same main session.
-8. Name, persona and standing instructions from Mike.
+3. Bind or re-bind: `bun cli.ts openclaw bind <id>`, then `status` until the
+   submission is `consumed` and the binding shows a thread and a peer. One early
+   `unknown` is normal for an idle start (see Wake and custody, step 3). Re-bind
+   when the gate refuses main as secondary after an idle unload and you need
+   outbound before the next wake.
+4. Wakes: on with `echo <id> >> ~/.agent-peers-openclaw/wake/enabled`; off with
+   `sed -i '/^<id>$/d' ~/.agent-peers-openclaw/wake/enabled`. Turn them off and
+   keep the evidence on any unknown, failed or halted custody.
+5. Control turns for tests: one `chat.send` to `agent:<id>:main` with
+   `queueMode: "followup"`, `deliver: false` and a recorded idempotencyKey.
+   Forbid external sends in the text. OpenClaw's Codex harness calls MCP tools
+   only through its `exec` code tool, so allow exec "only as the means of
+   invoking that one tool". Banning exec blocks the tool under test.
+6. Checks: idle wake (`submitted`, then `consumed`, then a reply); busy wake
+   (send while `hasActiveRun`; expect "queued behind the active run", the
+   running turn completes untouched, then the wake runs and its custody settles
+   to the drained user event); no Telegram delivery (the wake turn uses only
+   agent-peers tools and exec).
+7. Name, persona and standing instructions are Mike's and stay unchanged.
 
 ## Rollback
 
