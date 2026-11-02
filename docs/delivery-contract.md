@@ -228,14 +228,21 @@ conversation peers are also exempt.
   are election losers, not a bug. A Desktop or WebUI backend can instead set
   `AGENT_PEERS_HERMES_ROLE=member`, which skips the election and registers as a
   member of the profile's mailbox.
-- **Per-chat mail.** A loser or member can read a chat's mail from the owner's
-  mailbox, but general mail sent to the durable name is read only by the owner's
-  own child (the root gateway's), never by a Desktop child. See
+- **Per-chat mail.** A loser's or member's chat-scoped polls resolve the
+  durable owner's mailbox, so it reads its own chats' mail. Its general polls
+  read only its own ephemeral mailbox, so general mail sent to the durable name
+  is read only by the surface that won the name. The winner is whichever
+  surface claimed the name first; it is the gateway only where the Desktop and
+  WebUI backends run as `member`, as on the Studio, and there a Desktop child
+  never reads general mail. See
   [Addressing and chat mail](#addressing-and-chat-mail-v3).
 - Config contract per profile: `PEER_NAME`, `AGENT_PEERS_CWD`,
-  `AGENT_PEERS_ENABLED: '1'`. Kill switches: flag file
-  `~/.agent-peers-hermes/disabled` (all surfaces), or
-  `AGENT_PEERS_HERMES_ROLE: passive` per surface.
+  `AGENT_PEERS_ENABLED: '1'`. Kill switches: the flag file
+  `~/.agent-peers-hermes/disabled` is read by the Hermes MCP at startup or
+  reload (all surfaces), checked live by the Desktop plugin before every wake,
+  and ignored by the gateway driver (remove the profile from
+  `chat-wake/enabled` to stop it); `AGENT_PEERS_HERMES_ROLE: passive` makes
+  one surface start inert.
 
 **Chat wake: what "woken" means.** Chat mail is noticed by wake passes, not by
 the recipient's background loop. Neither executor below acks mail, carries a
@@ -244,11 +251,14 @@ message body, or proves the agent read anything. The woken agent must call
 
 - *Gateway driver* (`shared/hermes-chat-wake.ts`, run by the wake daemon). For
   each chat with unread mail it runs `hermes -p <profile> chat --resume
-  <session> -q "<wake text>"`; the general mailbox uses the profile's "Agent
-  Peers" chat. It runs only for profiles listed in
+  <session> -q "<wake text>"`; to process general-mailbox mail it resumes the
+  profile's "Agent Peers" chat (the general mailbox itself is not a chat). It
+  runs only for profiles listed in
   `~/.agent-peers-hermes/chat-wake/enabled`. **As of 2026-11-02 that file does
-  not exist on the Studio, so the driver is built but switched off; today only
-  chats open in Hermes Desktop are woken, by the plugin.** State is one JSON
+  not exist on the Studio, so the driver is built but switched off, and it stays
+  off by Mike's choice: he closes a chat only when he is done with it, so closed
+  chats are not woken. Only chats open in Hermes Desktop are woken, by the
+  plugin. Waking the general mailbox is a separate, unresolved gap.** State is one JSON
   ledger per chat under `chat-wake/<profile>/`. The `~/.agent-peers-hermes/disabled`
   flag stops the plugin but not this driver; removing a profile from `enabled`
   does. Ledger states: `launched`, `running`, `done`,
@@ -334,8 +344,10 @@ Full design, evidence and runbook: [components/openclaw-peer.md](components/open
 ## Receipts and recovery
 
 - `list_peers` + broker `messages` table answer "queued for whom"; the
-  recipient's inbox file answers "persisted"; typed ack outcomes answer
-  "confirmed". For a remote send, the sender's outbox (`federation_outbox`)
+  recipient's inbox file answers "persisted". A typed broker ack means
+  "confirmed on a later tool call" for Codex, Hermes, Droid and OpenClaw, but
+  only "persisted" for Claude, which acks in its poll loop; Claude's
+  confirmation is the later removal of the entry from its local store. For a remote send, the sender's outbox (`federation_outbox`)
   answers "queued here, not yet at the destination".
 - Observability CLI: `bun cli.ts inboxes [--stranded]` (unread mail matched to
   live/dead broker rows), `stranded-messages` (unacked to peers idle >24h),

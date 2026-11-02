@@ -124,8 +124,7 @@ wake by itself:
 A chat with no reachable parent socket (for example a remote-control relay chat)
 simply stays non-wakeable. After registration the daemon treats the row like any
 other, with the same validation, backoff and steering. `codex-peer live` lists these
-chats as wakeable. `repair-wake` does not apply to them; they re-register on their
-next tool call. The code only shows a socket owned by the parent process and the
+chats as wakeable. `repair-wake` does not apply to them. A desktop chat whose first registration write failed retries it on later tool calls. Once a registration has succeeded, the MCP child caches it and does not check the registry again (`persist` in `shared/codex-desktop-wake.ts` returns early for the same peer, name and token), so a row lost afterwards is not rewritten by that child: it needs an MCP or session restart followed by a tool call. The code only shows a socket owned by the parent process and the
 host's thread id; the "SSH" framing comes from the commit that added it (`12f6f2b`).
 
 ## Security model

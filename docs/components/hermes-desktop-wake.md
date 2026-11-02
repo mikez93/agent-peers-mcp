@@ -25,7 +25,9 @@ live Hermes wake: the gateway driver for closed chats is built but switched off.
     spawn.
 - **The gateway driver is off.** It runs only for profiles listed in
   `~/.agent-peers-hermes/chat-wake/enabled`, and that file does not exist on the
-  Studio (the v3 runbook's step D is staged and needs Marco's GO). Until it is
+  Studio. It stays off by Mike's choice (2026-11-02): he closes a chat only when
+  he is done with it, so closed chats are not woken. Waking the general mailbox
+  is a separate, unresolved gap. Until it is
   enabled, mail for a chat that is closed waits in the broker until that chat is
   opened and reads it.
 - **How it was activated.** The serving backend was notified to load the plugin

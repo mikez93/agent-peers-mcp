@@ -422,8 +422,7 @@ as `{"hermes": ...}` and `{"openclaw": ...}`) and `--quiet-noop` (daemon mode: p
 `repair-wake` is the recovery path when a live Codex peer shows `wakeable=no`. It matches launch claims by
 `cwd` + `tty` (narrowed by `requested_peer_name` when available) and **refuses** when two or more *live*
 candidates have distinct thread ids, rather than guessing and wiring the wake pointer to the wrong session.
-It does not repair desktop-chat registrations (those have no claim); they re-register on their next tool
-call.
+It does not repair desktop-chat registrations (those have no claim). A desktop chat whose first registration write failed retries it on later tool calls. Once a registration has succeeded, the MCP child caches it and does not check the registry again (`persist` in `shared/codex-desktop-wake.ts` returns early for the same peer, name and token), so a row lost afterwards is not rewritten by that child: it needs an MCP or session restart followed by a tool call.
 
 ---
 

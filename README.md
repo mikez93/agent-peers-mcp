@@ -191,7 +191,7 @@ hermes mcp test agent-peers
 
 To add the adapter to a conversation that is already running, reload MCP servers. In the Hermes CLI/TUI or a gateway chat, run `/reload-mcp`. **Hermes Desktop has no `/reload-mcp`.** In Desktop, toggle the Agent Peers connector off and on (Capabilities → Connectors). A reload is process-wide: it restarts the MCP for every chat that Desktop backend hosts.
 
-For a durable identity, set `PEER_NAME` (for example `ezra-hermes`) in the profile's MCP environment. A profile can have several Hermes surfaces (gateway, Desktop, CLI) and they share that name through a lock: one surface holds the durable name, and the others register under generated ephemeral names and read only their own mailbox. Mail to the durable name goes to the surface that holds it.
+For a durable identity, set `PEER_NAME` (for example `ezra-hermes`) in the profile's MCP environment. A profile can have several Hermes surfaces (gateway, Desktop, CLI) and they share that name through a lock: one surface holds the durable name, and the others register under generated ephemeral names. General mail sent to the durable name is read only by the surface that holds it; another surface's general polls read its own ephemeral mailbox. Chat mail is different: a surface reading a chat's mail resolves the durable owner's mailbox, so each chat sees its own mail wherever it runs. A Desktop or WebUI backend can set `AGENT_PEERS_HERMES_ROLE=member` to skip the election and never take the durable name.
 
 Hermes can join after launch because it supports MCP reload. Codex wakeability is different: an idle Codex thread can only be woken when it was hosted by the app-server-backed launcher or is a Codex desktop chat. An existing stock Codex thread must be resumed through `codex-peer resume <session-id>`; no MCP reload can retrofit that process.
 
@@ -320,10 +320,19 @@ Only a session launched with `--dangerously-load-development-channels server:age
 - **Inbox socket (terminal sessions).** A session with the MCP enabled (`AGENT_PEERS_ENABLED=1`) but no channel is woken through Claude Code's own per-session inbox socket, which Claude Code exposes to the MCP as `CLAUDE_CODE_MESSAGING_SOCKET`. A busy session reads the notice between tool calls, and an idle one starts a turn. Claude Code's cross-session messaging settings can restrict this. `AGENT_PEERS_SOCKET_WAKE=0` turns it off.
 - **Rewake hook (desktop app).** The Claude desktop app, including its remote-SSH sessions, starts Claude Code without the channel flag and has no setting that adds it. Desktop sessions join the network by default (`AGENT_PEERS_ENABLED=0` opts a session out) and skip the terminal tab title. They are woken by `bin/claude-peer-rewake`, which uses a documented hook feature: an `asyncRewake` command hook that exits with code 2 "wakes Claude immediately even when the session is idle" ([hooks reference](https://code.claude.com/docs/en/hooks), Run hooks in the background > Limitations). `AGENT_PEERS_SOCKET_WAKE=1` opts a desktop session in to socket wake instead.
 
-Install the hook as a user-level `Stop` and `StopFailure` hook in `~/.claude/settings.json`, substituting the absolute path of your checkout:
+Install the hook as a user-level `Stop` and `StopFailure` hook in `~/.claude/settings.json`, substituting the absolute path of your checkout. Merge these two entries into any existing `hooks` object rather than replacing it:
 
 ```json
-{ "hooks": [ { "type": "command", "command": "<AGENT_PEERS_DIR>/bin/claude-peer-rewake", "asyncRewake": true, "timeout": 86400 } ] }
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "<AGENT_PEERS_DIR>/bin/claude-peer-rewake", "asyncRewake": true, "timeout": 86400 } ] }
+    ],
+    "StopFailure": [
+      { "hooks": [ { "type": "command", "command": "<AGENT_PEERS_DIR>/bin/claude-peer-rewake", "asyncRewake": true, "timeout": 86400 } ] }
+    ]
+  }
+}
 ```
 
 - After each turn, it waits in the background, one waiter per session. It finds its own peer exactly: the hook's Claude process, then that process's `claude-server.ts` child, which is `peers.pid` in the broker. It then watches the bodyless `~/.agent-peers-claude/<peer>.metadata.json`.
@@ -426,7 +435,7 @@ The guarantee applies only to sessions launched through `droidpeer`. An arbitrar
 A Hermes agent can be addressed per chat, not just per profile.
 
 - **Address a chat:** `name/<chat title or chat ID>`, for example `valentina-hermes/Instagram ads`. A title matches exactly (any letter case); a near miss returns candidates and sends nothing. The `list_chats` tool lists an agent's chats (titles and status only, never transcripts) and never wakes the agent. It also works across machines: `list_chats` with peer `ezra-hermes@studio`.
-- **Replies and reading:** a Hermes chat passes `from_chat` to `send_message`, so replies come back to that chat, and passes `chat` to `check_messages`, so it reads and confirms only its own mail. Mail with no chat goes to the profile's general mailbox, which is its "Agent Peers" chat, created on first use. Chat mail is on for the Hermes adapter; `AGENT_PEERS_HERMES_CHAT_MAIL=0` turns it off.
+- **Replies and reading:** a Hermes chat passes `from_chat` to `send_message`, so replies come back to that chat, and passes `chat` to `check_messages`, so it reads and confirms only its own mail. Mail with no chat goes to the profile's general mailbox, which belongs to the agent rather than to any chat. Only the gateway driver (switched off, below) processes it in a chat: it resumes the profile's "Agent Peers" chat, created on first use. Chat mail is on for the Hermes adapter; `AGENT_PEERS_HERMES_CHAT_MAIL=0` turns it off.
 
 **Waking a chat.** Mail to a chat can wake only that chat, with a bodyless prompt telling the agent to call `check_messages` for it. Two wakers exist, and which one applies depends on where the chat is. Neither does anything until you enable it (below), so by default mail waits for the agent's next `check_messages`:
 
@@ -547,13 +556,13 @@ On Codex, it drains the durable on-disk queue. On Claude, it returns an in-memor
 Most terminals (iTerm2, Terminal.app, Ghostty, Warp) track the running foreground process and periodically overwrite the tab title with the binary name ("node" / "bun"). A one-shot OSC write at startup therefore decays. The MCP server runs a lightweight keepalive that writes OSC 0 (window+icon title), OSC 1 (icon/tab title — what iTerm2 uses for tabs), and OSC 2 (window title) every 1s so `peer:<name>` stays visible. If your terminal is configured with a hardcoded title source (e.g. iTerm2 "Profile → General → Title" overriding application writes), we can't win — set `AGENT_PEERS_DISABLE_TAB_TITLE=1` to opt out of the keepalive entirely.
 
 **Closed tabs disappear from discovery within ~60 seconds, but the backlog isn't stranded.**
-When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately — you won't see ghost peers there even in that window. If you restart with the same `PEER_NAME` within 60-90s, the broker reclaims the same UUID AND clears any stale leases for that peer, so the new session picks up undelivered backlog on its first poll instead of waiting up to 30s for leases to expire. Codex additionally persists its durable inbox on disk, so messages sitting on a reclaimed session are replayed even if they were drawn but not yet confirmed delivered.
+When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of this machine's results immediately — you won't see local ghost peers there even in that window. With federation on, another machine's `list_peers scope=machine` currently also shows that machine's durable peers after their sessions close, with their last heartbeat (the directory it reads keeps durable rows so exact-name sends to a durable mailbox work). Check `Heartbeat` before assuming a remote peer is running. If you restart with the same `PEER_NAME` within 60-90s, the broker reclaims the same UUID AND clears any stale leases for that peer, so the new session picks up undelivered backlog on its first poll instead of waiting up to 30s for leases to expire. Codex additionally persists its durable inbox on disk, so messages sitting on a reclaimed session are replayed even if they were drawn but not yet confirmed delivered.
 
 **Peer discovery distinguishes age from activity.**
 `Started` is when the current MCP-backed working session began; relaunching the MCP or resuming an older conversation resets it. `Heartbeat` only proves that the peer is still live. Hermes may launch a temporary MCP helper on each turn, so the broker preserves the durable Hermes peer's original `Started` value instead of making every helper look like a brand-new agent. Before messaging, the shared instructions make the agent pause, identify why it needs a collaborator, and compare every plausible peer's CWD and Current status with that need. It chooses the strongest task match rather than the first row, using `Started` as a tie-breaker unless the user explicitly asks for the latest instance. Exact user-supplied targets still win, and a missing status or unfamiliar harness does not exclude a candidate.
 
 **A Hermes surface that lost the name election reads only its own mailbox.**
-When several Hermes surfaces of one profile start (gateway, Desktop, CLI), one holds the durable name and the rest register under generated names such as `<workdir>-hermes-2`. A loser can send, but mail addressed to the durable name goes to the surface that holds it. See [Hermes chats](#hermes-chats-mail-and-wake).
+When several Hermes surfaces of one profile start (gateway, Desktop, CLI), one holds the durable name and the rest register under generated names such as `<workdir>-hermes-2`. A loser can send, but general mail addressed to the durable name goes to the surface that holds it. Which surface wins depends on start order, unless the Desktop and WebUI backends run as `member` (as on the Studio), which leaves the name to the gateway. A loser or member still reads its own chats' mail from the durable owner's mailbox. See [Hermes chats](#hermes-chats-mail-and-wake).
 
 **Paperclip agents stay off the network.**
 An agent running inside a Paperclip company is refused registration (`PAPERCLIP_AGENT_ID` or `PAPERCLIP_RUN_ID` in its environment, checked before `AGENT_PEERS_ENABLED`). It can't be listed, messaged, or woken, and it gets no peer tools. The two systems keep separate inboxes and chains of command on purpose.

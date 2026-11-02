@@ -116,10 +116,14 @@ This is the part most often misunderstood, so it is stated explicitly.
   *addressing* is forgiving (next subsection).
 - **Hermes runs one durable peer per profile.** The surfaces of a profile load the MCP with the
   same `PEER_NAME` and race a file-lock election (`shared/hermes-claims.ts`). The winner registers
-  durable; losers register ephemeral under generated names and read only their own mailbox, so
-  mail to the durable name reaches the root gateway's child. Duplicate ephemeral rows beside a
-  durable one are election losers, not a bug. `AGENT_PEERS_HERMES_ROLE=passive` makes one surface
-  inert; `member` keeps every tool but never takes the durable name.
+  durable; losers register ephemeral under generated names. General mail to the durable name is
+  read only by the winner; a loser's general polls read its own ephemeral mailbox, while its
+  chat-scoped polls resolve the durable owner's mailbox (`resolvePollScope` in
+  `shared/broker-addressing.ts`). The winner is whichever surface claims the name first; it is the
+  gateway only in a deployment where the Desktop and WebUI backends run with
+  `AGENT_PEERS_HERMES_ROLE=member`, which keeps every tool but never takes the durable name (the
+  Studio is configured this way). Duplicate ephemeral rows beside a durable one are election
+  losers, not a bug. `AGENT_PEERS_HERMES_ROLE=passive` makes one surface inert.
 
 ### Addressing
 
@@ -171,7 +175,13 @@ moves through four states:
 | `draw(callId, ids)` | dealt into a response under construction; blocks re-deal; **not** ack- or confirm-eligible |
 | `promote(callId)` | that exact response was fully built and un-aborted → its draws become confirm-eligible, stamped with a new arrival generation |
 | `rollback(callId)` | the request was aborted before the response could reach the model → draws return to re-dealable, nothing acked, nothing pruned |
-| `markConfirmed(ids)` | a later call proved delivery → durable entry pruned and the broker ack enqueued |
+| `markConfirmed(ids)` | a later call proved delivery → durable entry pruned and (Codex, Hermes, Droid, OpenClaw) the broker ack enqueued |
+
+Claude differs at the broker: `claude-server.ts` persists each message to its inbox file and
+acks the broker in the same poll, before the model sees it. A Claude broker ack therefore proves
+persistence, not model confirmation; Claude's confirmation is the later removal of the entry from
+its local store after a fully built `check_messages`. The invariants below describe the Codex-family
+path.
 
 Two invariants make this correct under concurrency, both of which were violated by earlier
 implementations and are now regression-tested:
@@ -268,8 +278,10 @@ through the normal MCP path, so a wake that fails or repeats loses and duplicate
 
 The machine-wide **wake daemon** (`wake-daemon.ts`, looped by `bin/codex-peer daemon`) runs three
 independent passes per tick: Codex, Hermes chats, OpenClaw. A failure in one never affects the
-others. On macOS, any `bin/codex-peer` launch auto-starts the daemon (there is no launchd job for
-it); on Linux, `agent-peers-wake.service` runs it. `droidpeer` hosts its own wake loop and does
+others. The repository starts it on demand: any `bin/codex-peer` launch auto-starts the daemon if it is
+not running. A fleet can also run it as a service: Mike's Macs have the LaunchAgent
+`com.mike.agent-peers-wake` (`codex-peer daemon 5`, installed by the fleet, not by this repo; see
+[wake-daemon.md](wake-daemon.md)), and on Linux `agent-peers-wake.service` runs it. `droidpeer` hosts its own wake loop and does
 not use the daemon.
 
 | Peer type | How an idle session is woken | Gate or opt-in |
@@ -280,14 +292,18 @@ not use the daemon.
 | Claude Code, inbox socket | `claude-server.ts` posts a bodyless notice to the session's own inbox socket (`CLAUDE_CODE_MESSAGING_SOCKET`). Mail is persisted and acked at the broker before the notice goes out. | Chosen by `chooseWakeMode`; `AGENT_PEERS_SOCKET_WAKE=0` turns it off |
 | Claude desktop app | Desktop sessions (including remote-SSH ones) join by default and have no channel. `bin/claude-peer-rewake` runs as an async-rewake Stop hook and exits 2 naming only new senders, which wakes the idle session. Socket wake is off for the desktop app unless `AGENT_PEERS_SOCKET_WAKE=1`. | The hook must be installed in Claude settings (see the top-level README) |
 | Factory Droid | `droidpeer` hosts the session (native TUI relay, or a headless ACP host) and watches the peer's unread metadata. An idle session gets a fixed bodyless prompt. | Wakeable only when launched through `droidpeer` ([wakeable-droid.md](wakeable-droid.md)) |
-| Hermes, chat in the gateway | The Hermes pass asks the broker's `/chat-inbox` which chats have unread mail and hands each to `shared/hermes-chat-wake.ts`, which runs `hermes -p <profile> chat --resume <session> -q`. The general mailbox uses the profile's "Agent Peers" chat. A chat open in Desktop is not touched: the driver waits. | Built but off until a profile is listed in `~/.agent-peers-hermes/chat-wake/enabled` (no profile is listed on any machine today) |
+| Hermes, chat in the gateway | The Hermes pass asks the broker's `/chat-inbox` which chats have unread mail and hands each to `shared/hermes-chat-wake.ts`, which runs `hermes -p <profile> chat --resume <session> -q`. To process general-mailbox mail it resumes the profile's "Agent Peers" chat. A chat open in Desktop is not touched: the driver waits. | Built but off until a profile is listed in `~/.agent-peers-hermes/chat-wake/enabled`; none is, by Mike's choice (2026-11-02) |
 | Hermes, chat open in Desktop | A plugin inside the Desktop backend calls Hermes's `ctx.inject_message`. An idle chat starts a turn; a busy one only queues. It shares the driver's per-chat ledgers and settles only on correlated turn evidence. Unknown evidence blocks re-wakes of that chat until `bun cli.ts hermes-desktop-clear <profile> <chat-key> [--handled]`. | A `chat-wake/desktop-enabled` line per profile and chat, plus the profile's `allow_gateway_injection` ([components/hermes-desktop-wake.md](components/hermes-desktop-wake.md)) |
 | OpenClaw | The OpenClaw pass submits a followup `chat.send` turn (`deliver:false`) into `agent:<id>:main` through the OpenClaw Gateway CLI. Every submission is recorded in a fail-closed custody ledger, and the wake pauses on any state it cannot prove. | Agent id listed in `~/.agent-peers-openclaw/wake/enabled` ([components/openclaw-peer.md](components/openclaw-peer.md)) |
 
-Kill switches: `~/.agent-peers-hermes/disabled` makes every Hermes surface inert,
-`AGENT_PEERS_HERMES_ROLE=passive` does it for one surface, and `~/.agent-peers-openclaw/disabled`
-does it for OpenClaw. Removing a profile or agent from its enable file stops wakes; mail stays
-queued.
+Kill switches, and what each one reaches:
+- `~/.agent-peers-hermes/disabled`: the Hermes MCP reads it at startup or reload (a running
+  surface keeps serving until then); the Desktop plugin checks it live, before every wake; the
+  gateway driver ignores it. To stop the driver, remove the profile from `chat-wake/enabled`.
+- `AGENT_PEERS_HERMES_ROLE=passive`: one Hermes surface starts inert.
+- `~/.agent-peers-openclaw/disabled`: loaded OpenClaw children refuse on their next call, and
+  passes and binds stop.
+Removing a profile or agent from its enable file stops wakes; mail stays queued.
 
 **Live state (2026-11-02).** The gateway driver for closed Hermes chats is built but switched off: no `chat-wake/enabled` file exists on the Studio, so mail to a closed chat waits in its partition until the chat reads it. Only chats open in Hermes Desktop are woken today, by the plugin, which is on by default for the `default`, `ezra`,
 `marco` and `valentina` profiles in the Studio Desktop backend, through one `<profile> *` line
