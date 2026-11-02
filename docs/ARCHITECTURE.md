@@ -156,8 +156,9 @@ route UUID. The chat directory reads each profile's Hermes `state.db` read-only
 ## 5. Delivery pipeline (the load-bearing design)
 
 Delivery is **honest at-least-once**, never "exactly-once" — exactly-once is unattainable
-at the model/UI boundary. The guarantee is that a message is never dropped silently and
-never acked without evidence it reached the model.
+at the model/UI boundary. The guarantee is that a message is never dropped silently. A broker
+ack marks durable local custody for Claude and later-call confirmation for the Codex-family
+clients; neither proves the agent acted on the message.
 
 Two independent mechanisms compose:
 
