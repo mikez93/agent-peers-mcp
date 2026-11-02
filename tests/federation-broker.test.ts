@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import {
   initDb, registerPeer, renamePeer, configureAddressing, sendMessage, pollMessages,
-  listDirectoryPeers, snapshotSender, deliverRelayed, deliverNotice,
+  listDirectoryPeers, snapshotSender, deliverRelayed, deliverNotice, listChatsFor, listChatsRouted,
 } from "../broker.ts";
 import { FederationService, type FederationDeps } from "../shared/federation.ts";
 import type { ChatDirectory } from "../shared/chat-directory.ts";
@@ -53,6 +53,7 @@ function makeMachine(host: string): Machine {
     db, config: { enabled: true, host, hosts: { alpha: "https://alpha.test", beta: "https://beta.test" },
       secretPath, localSecretPath, retryBaseMs: 1 },
     listLocalPeers: req => listDirectoryPeers(db, req),
+    listLocalChats: (peer, req) => { bind(machine); return listChatsFor(db, peer, req); },
     sendLocal: req => { bind(machine); return sendMessage(db, req); },
     snapshotSender: req => { bind(machine); return snapshotSender(db, req); },
     deliverLocal: msg => { bind(machine); return deliverRelayed(db, msg); },
@@ -81,6 +82,53 @@ function poll(m: Machine, who: RegisterResponse, chat?: string) {
   bind(m);
   return pollMessages(m.db, who.id, who.session_token, undefined, chat);
 }
+
+test("real remote directory hides stale peers without breaking named durable delivery", async () => {
+  const a = makeMachine("alpha"), b = makeMachine("beta");
+  const from = register(a, "author");
+  register(b, "live-peer", { durable: false });
+  const durable = register(b, "valentina-hermes", { peer_type: "hermes", summary: "Waiting" });
+  const ephemeral = register(b, "stale-peer", { durable: false });
+  b.db.run("UPDATE peers SET last_seen = '2000-01-01T00:00:00.000Z' WHERE id IN (?, ?)", [durable.id, ephemeral.id]);
+
+  for (const query of [undefined, "   "]) {
+    const directory = await a.service.directory(query);
+    expect(directory.unreachable_hosts).toEqual([]);
+    expect(directory.peers.filter(p => p.host === "beta").map(p => p.name)).toEqual(["live-peer@beta"]);
+  }
+  const named = await a.service.directory("valentina-hermes");
+  expect(named.peers).toMatchObject([{ name: "valentina-hermes@beta", summary: "Valentina: Waiting" }]);
+  // Bare names resolve through the queried directory; qualified sends validate
+  // the exact durable name at the destination. Neither needs a live session.
+  for (const target of ["valentina-hermes", "valentina-hermes@beta"]) {
+    expect((await a.service.send({ from_id: from.id, session_token: from.session_token,
+      to_id_or_name: target, text: "offline durable delivery" })).ok).toBe(true);
+  }
+  await a.service.tick();
+  expect(a.service.status().delivered).toBe(2);
+  expect(a.service.status().bounced).toBe(0);
+  expect(b.db.query("SELECT to_id, acked FROM messages ORDER BY id").all()).toEqual([
+    { to_id: durable.id, acked: 0 }, { to_id: durable.id, acked: 0 },
+  ]);
+  expect(b.db.query("SELECT last_seen FROM peers WHERE id = ?").get(durable.id))
+    .toEqual({ last_seen: "2000-01-01T00:00:00.000Z" });
+});
+
+test("real remote chat discovery still resolves an offline durable owner by bare and qualified name", async () => {
+  const a = makeMachine("alpha"), b = makeMachine("beta");
+  const from = register(a, "author");
+  const owner = register(b, "valentina-hermes", { peer_type: "hermes", capabilities: ["chat-mail"] });
+  b.db.run("UPDATE peers SET last_seen = '2000-01-01T00:00:00.000Z' WHERE id = ?", [owner.id]);
+  expect((await a.service.directory()).peers.filter(p => p.host === "beta")).toEqual([]);
+  for (const peer of ["valentina-hermes", "valentina-hermes@beta"]) {
+    bind(a);
+    const result = await listChatsRouted(a.db, { id: from.id, session_token: from.session_token, peer },
+      { service: a.service, config: a.deps.config });
+    expect(result).toMatchObject({ ok: true, peer: "valentina-hermes@beta",
+      chats: [{ title: "Email", address: "valentina-hermes@beta/stable/email-chat" }] });
+  }
+  expect(b.db.query("SELECT count(*) AS n FROM messages").get()).toEqual({ n: 0 });
+});
 
 test("real old-adapter chat fallback returns a durable warning, exactly once across notice-write recovery", async () => {
   const a = makeMachine("alpha"), b = makeMachine("beta");

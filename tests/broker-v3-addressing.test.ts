@@ -265,17 +265,22 @@ test("remote UUID routes go to the federation hook before name parsing", () => {
   expect(seen).toEqual(["ezra-hermes@studio"]);
 });
 
-test("directory lists live and retained durable agents with persona statuses", () => {
+test("ordinary directory lists only live agents; named lookups retain durable agents and persona statuses", () => {
   reg({ name: "marco-imekka-director-ops-droid", peer_type: "droid", git_root: "/w/imekka-director-ops", summary: "x" });
-  reg({ name: "marco-hermes", peer_type: "hermes", cwd: "/h/marco" });
+  const durable = reg({ name: "marco-hermes", peer_type: "hermes", cwd: "/h/marco", persona: "Marco", summary: "Waiting" });
   reg({ name: "eph-claude", durable: false });
-  // Make the durable Hermes row stale: it must still be listed.
-  db.query("UPDATE peers SET last_seen = '2000-01-01T00:00:00.000Z' WHERE name = 'marco-hermes'").run();
-  const all = listDirectoryPeers(db).map((p) => p.name).sort();
-  expect(all).toEqual(["eph-claude", "marco-hermes", "marco-imekka-director-ops-droid"]);
+  const ephemeral = reg({ name: "stale-claude", durable: false });
+  db.query("UPDATE peers SET last_seen = '2000-01-01T00:00:00.000Z' WHERE id IN (?, ?)").run(durable.id, ephemeral.id);
+  for (const query of [undefined, "", "   "]) {
+    const peers = listDirectoryPeers(db, { query });
+    expect(peers.map((p) => p.name).sort()).toEqual(["eph-claude", "marco-imekka-director-ops-droid"]);
+    expect(peers.find((p) => p.name.endsWith("droid"))!.summary).toBe("Marco: x");
+    expect(JSON.stringify(peers)).not.toContain("session_token");
+  }
   expect(listDirectoryPeers(db, { query: "marco" }).map((p) => p.name).sort()).toEqual(["marco-hermes", "marco-imekka-director-ops-droid"]);
-  expect(listDirectoryPeers(db, { query: "marco" }).find((p) => p.name.endsWith("droid"))!.summary).toBe("Marco: x");
-  expect(JSON.stringify(listDirectoryPeers(db))).not.toContain("session_token");
+  expect(listDirectoryPeers(db, { query: " marco-hermes " })).toMatchObject([{ id: durable.id, summary: "Marco: Waiting" }]);
+  // Hiding stale peers is not retirement or mailbox deletion.
+  expect(db.query<{ n: number }, []>("SELECT count(*) AS n FROM peers").get()!.n).toBe(4);
 });
 
 test("unknown names carry a machine-readable code for the federation fallback", () => {

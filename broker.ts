@@ -1110,13 +1110,14 @@ export function deliverNotice(db: Database, n: {
   return { message_id: db.query<{ id: number }, [string]>("SELECT id FROM messages WHERE message_uid = ?").get(n.message_uid)!.id };
 }
 
-/** Local directory for other machines: live plus retained durable agents,
- *  persona statuses, never tokens, never a fan-out of its own. */
+/** Local directory for other machines: ordinary listings are live-only, but
+ *  named lookups retain durable mailboxes for sends and chat discovery.
+ *  Persona statuses, never tokens, never a fan-out of its own. */
 export function listDirectoryPeers(db: Database, req: { query?: string } = {}): Peer[] {
   const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
   const ids = req.query && req.query.trim()
     ? findPeers(db, req.query.trim(), staleCutoff).map((r) => r.id)
-    : db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE last_seen >= ? OR durable = 1").all(staleCutoff).map((r) => r.id);
+    : db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE last_seen >= ?").all(staleCutoff).map((r) => r.id);
   return ids.map((id) => getPeer(db, id)).filter((p): p is Peer => p !== null).map(withPersonaSummary);
 }
 
