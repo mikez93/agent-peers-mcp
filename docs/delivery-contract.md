@@ -193,8 +193,10 @@ conversation peers are also exempt.
   opened over SSH, after its first agent-peers tool call) is registered with the
   wake daemon. The daemon starts a turn on an idle thread, or appends the wake
   to a running turn with `turn/steer`. It leaves a thread parked on an approval
-  or a question alone, and re-wakes the same unread set on a 5 min / 30 min /
-  2 h schedule. A session that is not registered sees nothing until its next
+  or a question alone, and wakes once per unread set: after a successful wake
+  the same set is never re-woken (it surfaces on the next AP call or user turn),
+  and only a failed wake retries on a 5 min / 30 min / 2 h schedule (Mike,
+  2026-11-04). A session that is not registered sees nothing until its next
   tool call. Operations: [wake-daemon.md](wake-daemon.md).
 - `wait_for_peer_messages` blocks up to 300s (default), optionally filtered by
   `from` — a non-matching message ends nothing and is never consumed by the

@@ -139,10 +139,10 @@ test("a recovered systemError peer is woken and its observation state resets", a
   expect(woke.action).toBe("wake");
   expect(client.startCalls).toBe(1);
 
-  // Observation state was reset on the nudge; the wake ledger now governs the
-  // same unread set on the normal cooldown.
+  // Observation state was reset on the nudge; the wake ledger now holds the
+  // same unread set as already woken.
   nowMs += 1_000;
-  expect((await runWakePass(opts))[0]?.reason).toBe("duplicate_or_cooldown");
+  expect((await runWakePass(opts))[0]?.reason).toBe("already_nudged");
 });
 
 test("repeated active skips are coalesced but the peer keeps being polled", async () => {

@@ -63,18 +63,20 @@ async function writeMetadata(rootDir: string): Promise<void> {
 
 class MockClient implements AppServerClient {
   startCalls = 0;
+  fail = false;
   async listLoadedThreads(): Promise<string[]> { return ["thread-1"]; }
   async readThread(): Promise<AppServerThread> {
     return { id: "thread-1", cwd: "/repo", path: "/rollout.jsonl", status: { type: "idle" } };
   }
   async startWakeTurn(): Promise<{ turnId: string | null }> {
     this.startCalls += 1;
+    if (this.fail) throw new Error("app-server refused the turn");
     return { turnId: "turn" };
   }
   close(): void {}
 }
 
-test("runWakePass backs off, re-wakes the same unread set on schedule, then abandons at the cap", async () => {
+test("runWakePass retries a failed wake on the backoff schedule, then abandons at the cap", async () => {
   const rootDir = await makeDir();
   await writeMetadata(rootDir);
   const client = new MockClient();
@@ -86,9 +88,10 @@ test("runWakePass backs off, re-wakes the same unread set on schedule, then aban
     backoffScheduleMs: [1_000, 2_000], // => 3 total attempts (initial + 2 retries)
     now: () => new Date(nowMs),
   };
+  client.fail = true;
 
   // Attempt 1 fires immediately.
-  expect((await runWakePass(opts))[0]?.action).toBe("wake");
+  expect((await runWakePass(opts))[0]?.reason).toBe("wake_failed");
 
   // Same unread set, still inside the first backoff window -> no wake.
   nowMs += 500;
@@ -96,7 +99,7 @@ test("runWakePass backs off, re-wakes the same unread set on schedule, then aban
 
   // First backoff (1s) elapsed -> attempt 2.
   nowMs += 600;
-  expect((await runWakePass(opts))[0]?.action).toBe("wake");
+  expect((await runWakePass(opts))[0]?.reason).toBe("wake_failed");
 
   // Inside the second, longer backoff window (2s) -> no wake.
   nowMs += 1_000;
@@ -104,7 +107,7 @@ test("runWakePass backs off, re-wakes the same unread set on schedule, then aban
 
   // Second backoff elapsed -> attempt 3 (the last one).
   nowMs += 1_500;
-  expect((await runWakePass(opts))[0]?.action).toBe("wake");
+  expect((await runWakePass(opts))[0]?.reason).toBe("wake_failed");
 
   // Cap reached: even after a long wait the same set is abandoned, never
   // re-woken. The message is NOT lost — it still surfaces on the session's
@@ -115,4 +118,27 @@ test("runWakePass backs off, re-wakes the same unread set on schedule, then aban
   expect((await runWakePass(opts))[0]?.reason).toBe("max_attempts");
 
   expect(client.startCalls).toBe(3);
+});
+
+test("runWakePass wakes a peer once per unread set; only a new message wakes it again", async () => {
+  // Mike, 2026-11-04: wake only for a new inbox message. A turn that handled an
+  // FYI and ended without another AP call must not be re-woken for an empty check.
+  const rootDir = await makeDir();
+  await writeMetadata(rootDir);
+  const client = new MockClient();
+  let nowMs = Date.parse("2026-06-18T00:00:00.000Z");
+  const opts = { rootDir, registry: { list: async () => [entry()] }, appServerClientFactory: () => client, now: () => new Date(nowMs) };
+
+  expect((await runWakePass(opts))[0]?.action).toBe("wake");
+  for (const wait of [5 * 60_000, 30 * 60_000, 2 * 60 * 60_000]) {
+    nowMs += wait + 1_000;
+    expect((await runWakePass(opts))[0]?.reason).toBe("already_nudged");
+  }
+  expect(client.startCalls).toBe(1);
+
+  const value = JSON.parse(await Bun.file(join(rootDir, `${encodeURIComponent("peer-1")}.metadata.json`)).text()) as CodexInboxMetadataState;
+  value.unread.push({ ...value.unread[0]!, id: 11 });
+  await writeFile(join(rootDir, `${encodeURIComponent("peer-1")}.metadata.json`), JSON.stringify(value), "utf8");
+  expect((await runWakePass(opts))[0]?.action).toBe("wake");
+  expect(client.startCalls).toBe(2);
 });

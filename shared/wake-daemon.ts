@@ -375,6 +375,16 @@ class WakeLedger {
       return { claimed: true, previous: null };
     }
 
+    // One successful wake per unread set (Mike, 2026-11-04: wake an agent only
+    // for a new inbox message). A turn that handled an FYI and ended without a
+    // further AP call leaves the set unread until its next call, so re-waking it
+    // only buys an empty check_messages turn. The message stays durable and
+    // surfaces on the next AP call or user turn; a new message changes the
+    // signature and wakes at once. Only failed wakes retry on the schedule.
+    if (existing.status === "nudged") {
+      return { claimed: false, reason: "already_nudged" };
+    }
+
     const attempts = Number.isFinite(existing.attempts) && existing.attempts > 0 ? existing.attempts : 1;
     if (attempts >= this.maxAttempts) {
       // Permanently stop proactive nudges for this exact unread set. The

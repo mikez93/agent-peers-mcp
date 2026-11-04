@@ -295,6 +295,8 @@ The key is `pendingSignature(peerId, metadata)` = `sha256(peerId + ":" + sorted 
 message changes the signature and always wakes immediately; only a repeat of the identical unread set is
 throttled. The same rule governs steering a busy thread.
 
+A successful wake marks the record `nudged`, and a `nudged` set is never claimed again (`already_nudged`; Mike, 2026-11-04: wake only for a new inbox message). The schedule below applies only to failed wakes.
+
 `DEFAULT_BACKOFF_SCHEDULE_MS = [5m, 30m, 2h]`. The schedule entries are the waits *before* attempts 2, 3, 4;
 `maxAttempts = schedule.length + 1 = 4`. On the 4th observation the record is flipped to `abandoned` and no
 further proactive nudge is sent for that unread set. The message is **not** dropped: it stays in the durable

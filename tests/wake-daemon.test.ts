@@ -77,7 +77,7 @@ class MockClient implements AppServerClient {
   constructor(
     private readonly thread: AppServerThread,
     private readonly loaded: string[] = [thread.id],
-    private readonly failStart = false,
+    public failStart = false,
   ) {}
 
   async listLoadedThreads(): Promise<string[]> {
@@ -304,7 +304,7 @@ test("runWakePass duplicate signatures produce at most one nudge", async () => {
   const second = await runWakePass(opts);
 
   expect(first[0]?.action).toBe("wake");
-  expect(second[0]?.reason).toBe("duplicate_or_cooldown");
+  expect(second[0]?.reason).toBe("already_nudged");
   expect(client.startCalls).toHaveLength(1);
 });
 
@@ -392,7 +392,10 @@ test("an unsent retry restores the exact previous ledger, including attempts and
   let now = Date.parse("2026-06-18T00:00:00.000Z");
   const opts = { rootDir, registry: { list: async () => [entry()] }, appServerClientFactory: () => client,
     backoffScheduleMs: [1_000], now: () => new Date(now) };
-  expect((await runWakePass(opts))[0]?.action).toBe("wake");
+  // A failed first wake is the only kind that retries on the schedule.
+  client.failStart = true;
+  expect((await runWakePass(opts))[0]?.reason).toBe("wake_failed");
+  client.failStart = false;
   const ledgerPath = join(rootDir, "wake-ledger", (await readdir(join(rootDir, "wake-ledger")))[0]!);
   const before = await readFile(ledgerPath, "utf8");
   now += 1_001;
@@ -403,7 +406,7 @@ test("an unsent retry restores the exact previous ledger, including attempts and
   expect(await readFile(ledgerPath, "utf8")).toBe(before);
   expect((await runWakePass(opts))[0]?.action).toBe("wake");
   expect(client.startCalls).toHaveLength(2);
-  expect((await runWakePass(opts))[0]?.reason).toBe("max_attempts");
+  expect((await runWakePass(opts))[0]?.reason).toBe("already_nudged");
 });
 
 test("a busy thread is steered once per new unread batch, not on every poll", async () => {
@@ -416,7 +419,7 @@ test("a busy thread is steered once per new unread batch, not on every poll", as
   // Polls every 5 s with the same unread set do not re-steer.
   for (let i = 0; i < 12; i++) {
     now += 5_000;
-    expect((await runWakePass(opts))[0]?.reason).toBe("duplicate_or_cooldown");
+    expect((await runWakePass(opts))[0]?.reason).toBe("already_nudged");
   }
   expect(client.steerCalls).toHaveLength(1);
   // A new message changes the batch and is steered in at once.
