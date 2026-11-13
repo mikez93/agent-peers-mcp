@@ -1775,6 +1775,63 @@ export interface OrphanMessage {
   sent_at: string;
 }
 
+// Undeliverable-mail bounce (Mike, 2026-11-13). Before this, mail to a peer
+// that vanished with it unread sat in the orphan pool with no signal to the
+// sender: the send had returned ok, and nothing ever said otherwise (2,091
+// dead inboxes held unread mail on the Studio alone). Now, once a recipient
+// row has been gone long enough that `repointOrphanedMail` had its chance
+// (a re-registering incarnation reclaims its mail at register time), each
+// unread message is acked as handled and a bounce notice is queued to the
+// sender, if the sender is still here to read it. The grace period matters:
+// an ephemeral Claude peer is evicted 60s after its MCP child stops
+// heartbeating even while its terminal is alive, and such a peer usually
+// comes back within a minute or two; bouncing at eviction would lie.
+export const BOUNCE_GRACE_MS = 15 * 60 * 1000;
+export const BOUNCE_PREFIX = "[agent-peers] Undeliverable:";
+
+export function bounceOrphanedMail(db: Database, now: number = Date.now()): number {
+  const graceCutoff = new Date(now - BOUNCE_GRACE_MS).toISOString();
+  const liveCutoff = new Date(now - STALE_THRESHOLD_MS).toISOString();
+  const nowStr = new Date(now).toISOString();
+  const chatExemption = columnExists(db, "messages", "to_chat") ? " AND m.to_chat IS NULL" : "";
+  const tx = db.transaction((): number => {
+    const rows = db.query<OrphanMessage, [string, string]>(
+      `SELECT m.id, m.from_id, m.to_id, m.text, m.sent_at
+       FROM messages m
+       LEFT JOIN peers p ON p.id = m.to_id
+       WHERE p.id IS NULL AND m.acked = 0 AND m.sent_at < ? AND m.text NOT LIKE ?${chatExemption}
+       ORDER BY m.id ASC`
+    ).all(graceCutoff, BOUNCE_PREFIX + "%");
+    let bounced = 0;
+    for (const m of rows) {
+      // Hermes conversation mailboxes keep their own lifecycle (suspend/dispose);
+      // a missing peer row is not death for them.
+      if (findConversation(db, m.to_id)) continue;
+      // The recipient is gone and the grace period has passed: this message is
+      // settled either way. Acking it keeps it out of the orphan pool and out
+      // of a later incarnation's re-point, which would deliver it after the
+      // sender was told it failed.
+      db.query("UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL WHERE id = ?").run(m.id);
+      const sender = db.query<{ id: string }, [string, string]>(
+        "SELECT id FROM peers WHERE id = ? AND (last_seen >= ? OR durable = 1)"
+      ).get(m.from_id, liveCutoff);
+      if (!sender) continue; // nobody left to tell
+      const excerpt = m.text.length > 160 ? m.text.slice(0, 157) + "..." : m.text;
+      const text =
+        `${BOUNCE_PREFIX} your message #${m.id} (sent ${m.sent_at}) to peer ${m.to_id} was never read. ` +
+        `That peer left the network and did not come back within ${Math.round(BOUNCE_GRACE_MS / 60_000)} minutes. ` +
+        `Call list_peers and resend to a live peer. It began: ${JSON.stringify(excerpt)}`;
+      db.query("INSERT INTO messages (from_id, to_id, text, sent_at, message_uid) VALUES (?, ?, ?, ?, ?)")
+        .run(m.to_id, m.from_id, text, nowStr, randomUUID());
+      bounced++;
+    }
+    return bounced;
+  });
+  const n = tx();
+  if (n > 0) console.error(`[broker] bounced ${n} undeliverable message(s) back to their senders`);
+  return n;
+}
+
 export function listOrphanedMessages(db: Database): OrphanMessage[] {
   return db.query<OrphanMessage, []>(
     `SELECT m.id, m.from_id, m.to_id, m.text, m.sent_at
@@ -2083,6 +2140,7 @@ export function startBroker(
     } else {
       try { gcStalePeers(db); } catch (e) { console.error("[broker] GC error:", e); }
       try { gcOldMessages(db); } catch (e) { console.error("[broker] message GC error:", e); }
+      try { bounceOrphanedMail(db); } catch (e) { console.error("[broker] bounce error:", e); }
     }
     // Re-enforce 0600 on WAL/SHM sidecars — SQLite may recreate them on
     // checkpoint, and they'd come back with default umask-controlled perms.

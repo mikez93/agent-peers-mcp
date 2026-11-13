@@ -338,6 +338,7 @@ a lost response and compaction is not yet demonstrated; the OpenClaw doc keeps t
 | Work on federation | `docs/components/federation.md`, `shared/federation.ts` |
 | Add or repair a Linux broker | `docs/components/linux-brokers.md` |
 | Debug "an agent isn't receiving mail" | `bun cli.ts inboxes --stranded` and `bun cli.ts wake-status`, then `bun cli.ts --help` |
+| Understand why a sender got an `[agent-peers] Undeliverable:` notice | `bounceOrphanedMail` in `broker.ts`: unread mail to a peer whose row has been gone for 15 minutes (`BOUNCE_GRACE_MS`) is acked as settled and bounced to the sender if the sender is still registered; a re-registering incarnation that reclaims its mail inside that window wins instead |
 | Understand Codex idle wake | `docs/wakeable-codex.md`, then `docs/components/wake-subsystem.md` |
 | Understand a Hermes or OpenClaw wake | `docs/components/hermes-desktop-wake.md`, `docs/components/openclaw-peer.md`, `shared/hermes-chat-wake.ts` |
 | Know what was wrong in August | `docs/IMPROVEMENT-REPORT.md` (a dated snapshot) |

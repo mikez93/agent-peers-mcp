@@ -230,6 +230,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   // only responses promoted BEFORE this request was issued are confirmable.
   const arrivalGen = delivery.newArrival();
   const confirmable = delivery.confirmable(arrivalGen);
+  // Keep the bodies we are about to confirm. "This call arrived" proves the
+  // previous response was BUILT, not that the model read it: Claude Code drops
+  // a tool result when the user interrupts the call (Esc mid-flight), and the
+  // next check_messages then confirmed and hid the mail (Valentina 39373 to
+  // Vector, 2026-11-13). If this call would otherwise come back empty, the
+  // just-confirmed mail is shown one more time so an interrupted read cannot
+  // lose it; an uninterrupted read pays one short duplicate, once.
+  let justConfirmed: Array<{ id: number; from_name?: string | null; text: string; sent_at?: string }> = [];
+  if (confirmable.length > 0 && inboxStore) {
+    try {
+      const want = new Set(confirmable);
+      justConfirmed = (await inboxStore.getUnreadMessages()).filter((m) => want.has(m.id));
+    } catch { /* best effort: the ring buffer below may still hold them */ }
+    if (justConfirmed.length === 0) {
+      const want = new Set(confirmable);
+      justConfirmed = getRecentDelivered().filter((m) => want.has(m.id));
+    }
+  }
   if (confirmable.length > 0 && inboxStore) {
     try {
       await inboxStore.removeByIds(confirmable);
@@ -319,6 +337,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         log(`durable-inbox read failed; serving ring buffer only: ${e instanceof Error ? e.message : String(e)}`);
       }
       if (recent.length === 0) {
+        if (justConfirmed.length > 0) {
+          const lines = justConfirmed
+            .sort((a, b) => a.id - b.id)
+            .map((m) => `--- #${m.id} from ${(m as { from_name?: string | null }).from_name ?? "?"}${m.sent_at ? ` at ${m.sent_at}` : ""} ---\n${m.text}`);
+          return {
+            content: [{
+              type: "text" as const,
+              text: `No new peer messages. Your previous check_messages response carried ${justConfirmed.length} message(s), now marked read; here they are once more in case that response was interrupted. Act on any you have not handled yet.\n\n${lines.join("\n\n")}`,
+            }],
+          };
+        }
         return {
           content: [{
             type: "text" as const,
