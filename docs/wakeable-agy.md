@@ -67,6 +67,12 @@ options (`model` and `thought_level`). Its model ids are base names such as
 `agy models` lists the combined names (`gemini-4-neon-high`). Those belong to
 the older model list and are not what `agypeer` sets.
 
+The launcher resolves symlinks in the working directory, because the MCP child
+reports its cwd from `getcwd()` and the launch claim binds only on an exact
+match. Before that fix, `agypeer start name /tmp/x` on a Mac (where `/tmp` is
+`/private/tmp`) waited out its claim timeout with "MCP did not bind launch
+claim", and omarchy's `~/www` symlink would have done the same.
+
 `resume` uses ACP `session/resume` on the exact session id. It restores the
 saved peer name, peer UUID and working directory, and drains mail that queued
 while the host was down. A resumed session keeps its own model unless you pass
@@ -108,8 +114,11 @@ answer, so the host answers permission requests itself:
   `-valentina`, `-ccr`, `-human-design`), which the fleet adds to agy's
   `mcp_config.json`. agy asks the host before every MCP call even when
   `settings.json` allows the server. GBrain calls arrive through agy's proxy
-  tool `call_mcp_tool`, with the server in `rawInput.ServerName`. When the host refused a GBrain `whoami`
-  on 2026-11-20, agy cancelled the whole turn and the peer never replied.
+  tool `call_mcp_tool`, with the server in `rawInput.ServerName`. When the
+  host refused a GBrain `whoami` on 2026-11-20, agy cancelled the whole turn
+  and the peer never replied. The host now writes every refusal to stderr
+  (`agent-peers: refused Antigravity permission: {...}`), so a silent turn
+  leaves a trace in the agypeer output.
 - It refuses every other request by selecting Antigravity's own `reject_once`
   option. The agent is told "user denied permission" and carries on, so it can
   still reply to the sender. The host never answers `cancelled` when a
@@ -194,6 +203,8 @@ ACP (verified 2026-11-20), so fleet instructions and personas apply.
 | Kill the host, queue mail, `resume` from another directory | Same name, UUID and session id; restored cwd; replied `RESUMED-OK` in 17 s |
 | Signed-out `agy` | Clear error before launch (unit-tested with the Studio's exact output) |
 | Droid regression | `droidpeer --headless` still started and reported `wakeable=yes` |
+| Fleet config on all three machines (five GBrains, hooks, skills), later on 2026-11-20 | `agypeer` and interactive `agy` on the MacBook, the Studio and omarchy each woke on mail from the MacBook, called GBrain `whoami` (`<machine>-antigravity-portfolio`) and replied |
+| `agypeer` started over SSH on omarchy | Signed in, bound and replied once the launchers dropped the SSH variables |
 
 A wake turn on Gemini 4 Neon (High) costs about 20,000 input tokens, mostly
 cached, for a trivial message.
