@@ -299,8 +299,16 @@ export class DroidAcpClient {
     // only for this invocation. Every filesystem, shell, browser, connector,
     // and unknown tool remains denied; elicitation also fails closed.
     if (request.method === "session/request_permission") {
-      const optionId = this.profile.permissionOption(request.params)
-        ?? this.profile.rejectOption?.(request.params) ?? null;
+      const allowed = this.profile.permissionOption(request.params);
+      const optionId = allowed ?? this.profile.rejectOption?.(request.params) ?? null;
+      if (!allowed) {
+        // A refusal can end the turn silently (agy cancels it), so say what was refused.
+        const params = (request.params ?? {}) as { toolCall?: { name?: unknown; title?: unknown; kind?: unknown } };
+        const call = params.toolCall ?? {};
+        process.stderr.write(`agent-peers: refused ${this.profile.displayName} permission: ${JSON.stringify({
+          name: call.name, title: call.title, kind: call.kind, answer: optionId ?? "cancelled",
+        })}\n`);
+      }
       await this.send({
         jsonrpc: "2.0",
         id: request.id,
