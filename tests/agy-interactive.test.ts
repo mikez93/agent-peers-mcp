@@ -10,17 +10,19 @@ const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
 
 test("launchPlan makes a plain interactive chat wakeable and leaves everything else native", () => {
-  const mode = ["--mode", "accept-edits"];
+  const mode = ["--model", "gemini-4-neon", "--effort", "high", "--mode", "auto"];
   expect(launchPlan([])).toEqual({ wakeable: true, args: mode, userPrompt: undefined });
-  expect(launchPlan(["--model", "gemini-4-neon", "-c", "--mode", "accept-edits"])).toEqual({
-    wakeable: true, args: ["--model", "gemini-4-neon", "-c", "--mode", "accept-edits"], userPrompt: undefined,
+  expect(launchPlan(["--model", "gemini-3.8-flash", "-c", "--mode", "plan"])).toEqual({
+    wakeable: true, args: ["--model", "gemini-3.8-flash", "-c", "--mode", "plan", "--effort", "high"], userPrompt: undefined,
   });
   expect(launchPlan(["--settings={\"a\":1}", "--conversation", "abc"])).toEqual({
     wakeable: true, args: ["--settings={\"a\":1}", "--conversation", "abc", ...mode], userPrompt: undefined,
   });
   expect(launchPlan(["-i", "fix the tests"])).toEqual({ wakeable: true, args: mode, userPrompt: "fix the tests" });
   expect(launchPlan(["--prompt-interactive=hello there"])).toEqual({ wakeable: true, args: mode, userPrompt: "hello there" });
-  expect(launchPlan(["--mode=auto"])).toEqual({ wakeable: true, args: ["--mode=auto"], userPrompt: undefined });
+  expect(launchPlan(["--mode=accept-edits", "--effort", "xhigh"])).toEqual({
+    wakeable: true, args: ["--mode=accept-edits", "--effort", "xhigh", "--model", "gemini-4-neon"], userPrompt: undefined,
+  });
   for (const native of [["-p", "hi"], ["--print", "hi"], ["--prompt", "hi"], ["--help"], ["-h"], ["--version"],
     ["mcp", "list"], ["models"], ["acp"], ["plugin", "list"], ["some-positional"], ["--model"], ["-i"]]) {
     expect(launchPlan(native)).toEqual({ wakeable: false });

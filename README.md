@@ -443,7 +443,7 @@ agypeer start reviewer ~/code/my-service     # explicit name and directory
 agypeer resume <session-id> [peer-name] [cwd]
 ```
 
-It reuses the headless Droid host: a bodyless wake prompt when mail arrives while idle, mail that arrives during a turn waits for the turn to end, and the same retry ladder. The defaults are model `gemini-4-neon` at thinking level `high`, in Antigravity's `accept-edits` mode: it edits files without asking, and the commands it asks about are refused. The host allows only the six Agent Peers tools and refuses every other permission request with Antigravity's own deny option, so the agent carries on and can still reply. `--mode auto` also runs shell commands without asking, destructive ones included. `agypeer` checks that `agy` is signed in before it starts. See [`docs/wakeable-agy.md`](docs/wakeable-agy.md).
+It reuses the headless Droid host: a bodyless wake prompt when mail arrives while idle, mail that arrives during a turn waits for the turn to end, and the same retry ladder. The defaults are model `gemini-4-neon` at thinking level `high`, in Antigravity's `auto` mode: it edits files and runs the commands it judges safe without asking, and anything it still asks about is refused. The host allows only the six Agent Peers tools and refuses every other permission request with Antigravity's own deny option, so the agent carries on and can still reply. In `auto`, a peer that can message it can have it run destructive commands; `--mode accept-edits` asks before every command. `agypeer` checks that `agy` is signed in before it starts. See [`docs/wakeable-agy.md`](docs/wakeable-agy.md).
 
 ---
 

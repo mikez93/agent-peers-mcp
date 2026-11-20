@@ -27,7 +27,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DroidLaunchClaimStore } from "./shared/droid-launch-claims.ts";
 import { FileDroidWakeMetadataSource } from "./shared/droid-launcher.ts";
-import { AGY_DEFAULT_MODE } from "./shared/agy-profile.ts";
+import { AGY_DEFAULT_MODE, AGY_DEFAULT_MODEL, AGY_DEFAULT_THINKING } from "./shared/agy-profile.ts";
 import { atomicWriteJson } from "./shared/file-state.ts";
 import { resolveStateDir } from "./shared/state-dir.ts";
 
@@ -144,8 +144,12 @@ export function launchPlan(argv: string[]): LaunchPlan {
     if (!arg.startsWith("-")) return { wakeable: false }; // subcommand or unknown positional
     args.push(arg);
   }
-  // Mike wants agy to default to accept-edits (2026-11-20); an explicit --mode wins.
-  if (!args.some((arg) => arg === "--mode" || arg.startsWith("--mode="))) args.push("--mode", AGY_DEFAULT_MODE);
+  // Mike's defaults (2026-11-20): Gemini 4 Neon, high effort, auto mode.
+  // Each applies only when the user didn't choose that setting.
+  const given = (flag: string) => args.some((arg) => arg === flag || arg.startsWith(`${flag}=`));
+  if (!given("--model")) args.push("--model", AGY_DEFAULT_MODEL);
+  if (!given("--effort")) args.push("--effort", AGY_DEFAULT_THINKING);
+  if (!given("--mode")) args.push("--mode", AGY_DEFAULT_MODE);
   return { wakeable: true, args, userPrompt };
 }
 

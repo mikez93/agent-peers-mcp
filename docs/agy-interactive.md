@@ -34,7 +34,7 @@ The user-level entry loads in every agy process, so it must stay quiet where it 
 
 These go straight to native `agy`: a subcommand (`mcp`, `models`, `acp` and the rest), `-p`, `--print`, `--prompt`, `--help` or `--version`; redirected input or output; and `command agy`. `agy -i "prompt"` stays wakeable, and your prompt runs after the waiter starts. Model, `-c` and `--conversation` pass through.
 
-The launcher starts agy in `accept-edits` mode, Mike's default: Antigravity edits files without asking and asks before running commands. Pass `--mode auto` or `--mode plan` to choose otherwise, or cycle modes with Shift+Tab inside the chat. While Mike is away, a command the agent asks about waits for an answer, so a woken chat may pause on a prompt.
+The launcher starts agy with Mike's defaults: Gemini 4 Neon at high effort, in `auto` mode, where Antigravity edits files and runs the commands it judges safe without asking. Each default applies only when you didn't pass that flag (`--model`, `--effort`, `--mode`), and Shift+Tab cycles modes inside the chat. In `auto`, any agent that can message the chat can ask it to run commands while Mike is away; a command Antigravity still asks about waits for an answer, so a woken chat can pause on that prompt.
 
 ## Limits
 
@@ -54,6 +54,6 @@ The launcher starts agy in `accept-edits` mode, Mike's default: Antigravity edit
 | Idle for 11 minutes | Woke and replied |
 | Through the real `agy` shell function after `setup` | Waiter started on the first try, no permission prompts, replied to mail |
 | agypeer with the user-level entry present | Started, registered and replied |
-| Accept-edits mode (the default), idle wake | Replied with no permission prompts and restarted the waiter |
+| Accept-edits and plan modes, idle wake | Replied with no permission prompts and restarted the waiter |
 | Mail sent while the chat was closed and reopened | Picked up and answered in the new chat's first turn |
 | Studio and omarchy over SSH, agy at its sign-in screen | Shell function, launch claim, MCP binding and the waiter's wake note all worked, and closing the window removed the claim; the agent's own turn needs a signed-in agy |

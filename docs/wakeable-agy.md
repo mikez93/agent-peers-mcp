@@ -44,7 +44,7 @@ agypeer resume <session-id> [peer-name] [cwd]
 |---|---|
 | `--model ID` | Model for a new session. Default `gemini-4-neon` (env `AGY_PEER_MODEL`) |
 | `--thinking LEVEL` | `low`, `medium`, `high` or `xhigh`. Default `high` (env `AGY_PEER_THINKING`) |
-| `--mode MODE` | `default`, `accept-edits`, `auto` or `plan`. Default `accept-edits` (env `AGY_PEER_MODE`) |
+| `--mode MODE` | `default`, `accept-edits`, `auto` or `plan`. Default `auto` (env `AGY_PEER_MODE`) |
 | `--name NAME` | Override the `<persona>-<repo>-antigravity` default name |
 | `--cwd`, `-C DIR` | Working directory, default the current directory |
 | `--agy PATH` | `agy` executable, default a `PATH` lookup |
@@ -74,21 +74,26 @@ while the host was down. A resumed session keeps its own model unless you pass
 
 ### Signed-out machines
 
-Before anything starts, `agypeer` runs `agy models`. A machine without an
-Antigravity login exits with:
+Before anything starts, `agypeer` runs `agy models`. When that can't find a
+Google sign-in, it exits with:
 
 ```
-error: Antigravity is signed out on this machine; run `agy` once in a terminal to sign in, then retry
+error: agy can't read its Google sign-in from this session. Over SSH or in a sandboxed shell it can't reach the keychain or keyring, so it looks signed out even when it isn't; start agypeer from a terminal in the desktop session. If agy is signed out there too, run `agy` once to sign in.
 ```
 
-Sign in by running `agy` once in a terminal on that machine. Don't copy
-credential files between machines.
+This usually isn't a real sign-out. agy keeps its token in the macOS keychain
+or the Linux keyring, which SSH sessions and sandboxed agent shells often can't
+read; on 2026-11-20 both the Studio and omarchy looked signed out over SSH while
+Mike's desktop terminals were signed in. Start agypeer from a desktop terminal.
+If it is signed out there too, run `agy` once to sign in. Don't copy credential
+files between machines.
 
 ## Permissions and modes
 
-The default mode is `accept-edits` (Mike, 2026-11-20). Antigravity edits files
-in the workspace without asking and asks before running any command. Nobody is
-present to answer, so the host answers permission requests itself:
+The default mode is `auto` (Mike, 2026-11-20, replacing his earlier
+`accept-edits`). Antigravity edits files and runs the commands it judges safe
+without asking. It still asks about some calls, and nobody is present to
+answer, so the host answers permission requests itself:
 
 - It allows the six Agent Peers tools (`list_peers`, `send_message`,
   `set_summary`, `check_messages`, `wait_for_peer_messages`, `rename_peer`),
@@ -102,8 +107,9 @@ present to answer, so the host answers permission requests itself:
   declined, and client methods such as terminal or filesystem access are
   refused.
 
-In the 2026-11-20 test of `accept-edits`, a file edit succeeded, `touch` was
-refused, and the peer replied with both results.
+In the 2026-11-20 test of `accept-edits` (`--mode accept-edits`, which asks
+before every command), a file edit succeeded, `touch` was refused, and the peer
+replied with both results.
 
 **`--mode auto` asks very little.** In the 2026-11-20 tests, `auto` ran each of
 these without a permission request:
@@ -116,8 +122,9 @@ Antigravity asks permission for MCP tools even in `auto`, because its internal
 `agy_tool_safety` monitor flags them. In one test its `severe_internal_risks_agy`
 monitor failed to parse its own response and did not trigger. Treat an `auto`
 peer like headless Droid at its default `auto-high`: any peer that can message
-it can have it run destructive commands as Mike. Use `auto` only when the peer
-must run tests or git and you accept that. `--mode default` also refuses edits.
+it can have it run destructive commands as Mike. Mike chose that default on
+2026-11-20; pass `--mode accept-edits` when a peer should only edit files.
+`--mode default` also refuses edits.
 
 ## Operating it
 
@@ -171,7 +178,7 @@ ACP (verified 2026-11-20), so fleet instructions and personas apply.
 | Second message sent mid-turn | Queued, then exactly one more wake after the turn; both replies, no duplicates |
 | File edit in `auto` | Created the file without a prompt |
 | Destructive commands in `auto` | Ran without a prompt (see above) |
-| `accept-edits` (default), production broker | File edit succeeded; `touch` refused with "user denied permission"; the peer replied with both results. With the earlier `cancelled` answer it never replied |
+| `accept-edits` (the default until 2026-11-20), production broker | File edit succeeded; `touch` refused with "user denied permission"; the peer replied with both results. With the earlier `cancelled` answer it never replied |
 | Cross-machine wake (production brokers) | Mail from the MacBook woke peers on the Studio and omarchy-01; both replied |
 | Kill the host, queue mail, `resume` from another directory | Same name, UUID and session id; restored cwd; replied `RESUMED-OK` in 17 s |
 | Signed-out `agy` | Clear error before launch (unit-tested with the Studio's exact output) |

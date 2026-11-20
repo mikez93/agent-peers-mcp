@@ -18,9 +18,10 @@ import { isValidName, NAME_MAX_LEN } from "./names.ts";
 /** `session/new` configOptions: model ids are base names, effort is separate. */
 export const AGY_DEFAULT_MODEL = "gemini-4-neon";
 export const AGY_DEFAULT_THINKING = "high";
-/** Approves edits and the commands Antigravity classifies as safe; asks first
- * for what it classifies as irreversible, and headless asks are cancelled. */
-export const AGY_DEFAULT_MODE = "accept-edits";
+/** Mike's default (2026-11-20): edits and the commands Antigravity classifies
+ * as safe run without asking; anything it still asks about is refused when no
+ * one is there to answer. */
+export const AGY_DEFAULT_MODE = "auto";
 export const AGY_MODES = ["default", "accept-edits", "auto", "plan"] as const;
 
 const AGENT_PEERS_TOOLS = [
@@ -129,7 +130,7 @@ export async function checkAgySignedIn(
   }
   if (result.code === 0) return;
   if (/sign in/i.test(result.output)) {
-    throw new AgySignedOutError("Antigravity is signed out on this machine; run `agy` once in a terminal to sign in, then retry");
+    throw new AgySignedOutError("agy can't read its Google sign-in from this session. Over SSH or in a sandboxed shell it can't reach the keychain or keyring, so it looks signed out even when it isn't; start agypeer from a terminal in the desktop session. If agy is signed out there too, run `agy` once to sign in.");
   }
   const line = result.output.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? `exit ${result.code}`;
   throw new Error(`agy models failed before launch: ${line}`);

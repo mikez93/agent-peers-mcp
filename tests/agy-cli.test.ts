@@ -31,8 +31,8 @@ test("help names the command, its defaults, the auto-mode caveat and complete ex
   expect(result.stdout).toContain("usage: agypeer [start [peer-name] [cwd]]");
   expect(result.stdout).toContain("agypeer resume <session-id>");
   expect(result.stdout).toContain("default: gemini-4-neon");
-  expect(result.stdout).toContain("default: accept-edits");
-  expect(result.stdout).toContain("asks before running commands");
+  expect(result.stdout).toContain("default: auto");
+  expect(result.stdout).toContain("--mode accept-edits asks before every command");
   expect(result.stdout).toContain("agypeer start reviewer ~/code/service --thinking medium");
 });
 
@@ -54,6 +54,6 @@ test("a signed-out agy stops before launch with the sign-in instruction and no u
   await writeFile(fake, "#!/bin/sh\necho 'Fetching available models...'\necho 'Error: Please sign in to view available models. Launch the CLI without arguments to sign in.' >&2\nexit 1\n", { mode: 0o755 });
   const result = await run(["start", "probe", dir, "--agy", fake], { HOME: dir });
   expect(result.exitCode).toBe(1);
-  expect(result.stdout).toContain("error: Antigravity is signed out on this machine; run `agy` once in a terminal to sign in, then retry");
+  expect(result.stdout).toContain("error: agy can't read its Google sign-in from this session.");
   expect(result.stdout).not.toContain("help:");
 });
