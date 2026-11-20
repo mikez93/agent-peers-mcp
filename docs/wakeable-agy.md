@@ -107,7 +107,8 @@ answer, so the host answers permission requests itself:
 - It allows the five shared GBrains (`mcp_gbrain-portfolio_*`, `-imekka`,
   `-valentina`, `-ccr`, `-human-design`), which the fleet adds to agy's
   `mcp_config.json`. agy asks the host before every MCP call even when
-  `settings.json` allows the server. When the host refused a GBrain `whoami`
+  `settings.json` allows the server. GBrain calls arrive through agy's proxy
+  tool `call_mcp_tool`, with the server in `rawInput.ServerName`. When the host refused a GBrain `whoami`
   on 2026-11-20, agy cancelled the whole turn and the peer never replied.
 - It refuses every other request by selecting Antigravity's own `reject_once`
   option. The agent is told "user denied permission" and carries on, so it can

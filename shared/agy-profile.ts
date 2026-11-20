@@ -45,10 +45,23 @@ const AGY_AGENT_PEERS_TOOL_NAMES = new Set(AGENT_PEERS_TOOLS.map((tool) => `mcp_
  * them to agy's mcp_config.json). agy asks the ACP host before every MCP call
  * even when settings.json allows the server, so the host approves them, as
  * Codex does with default_tools_approval_mode = "approve" (Mike, 2026-11-20). */
+const AGY_GBRAIN_SERVERS = new Set(["portfolio", "imekka", "valentina", "ccr", "human-design"].map((brain) => `gbrain-${brain}`));
 const AGY_GBRAIN_TOOL = /^mcp_gbrain-(portfolio|imekka|valentina|ccr|human-design)_[A-Za-z0-9_]+$/;
 
 function isAllowedAgyTool(name: string): boolean {
   return AGY_AGENT_PEERS_TOOL_NAMES.has(name) || AGY_GBRAIN_TOOL.test(name);
+}
+
+/** Large MCP servers reach the host through agy's generic proxy tool. Observed
+ * with GBrain (agy 1.5.13): toolCall { name: "call_mcp_tool", title: "MCP Tool
+ * whoami", kind: "execute", rawInput: { ServerName: "gbrain-portfolio",
+ * ToolName: "whoami", Arguments: {} } }. The server decides. */
+function isAllowedAgyProxyCall(rawInput: unknown): boolean {
+  if (!rawInput || typeof rawInput !== "object") return false;
+  const { ServerName: server, ToolName: tool } = rawInput as { ServerName?: unknown; ToolName?: unknown };
+  if (typeof server !== "string" || typeof tool !== "string" || !/^[A-Za-z0-9_]+$/.test(tool)) return false;
+  return AGY_GBRAIN_SERVERS.has(server)
+    || (server === "agent-peers" && AGY_AGENT_PEERS_TOOL_NAMES.has(`mcp_agent-peers_${tool}`));
 }
 
 /** Allow the Agent Peers tools and the shared GBrain tools, once. Everything
@@ -57,13 +70,15 @@ function isAllowedAgyTool(name: string): boolean {
 export function allowedAgyPermissionOption(params: unknown): string | null {
   if (!params || typeof params !== "object") return null;
   const value = params as {
-    toolCall?: { name?: unknown; title?: unknown };
+    toolCall?: { name?: unknown; title?: unknown; rawInput?: unknown };
     options?: Array<{ optionId?: unknown; kind?: unknown }>;
   };
   const name = value.toolCall?.name;
   const title = value.toolCall?.title;
   let recognized = false;
-  if (typeof name === "string") {
+  if (name === "call_mcp_tool") {
+    recognized = isAllowedAgyProxyCall(value.toolCall?.rawInput);
+  } else if (typeof name === "string") {
     recognized = isAllowedAgyTool(name);
   } else if (typeof title === "string") {
     const bare = title.startsWith("Run ") ? title.slice(4) : title;

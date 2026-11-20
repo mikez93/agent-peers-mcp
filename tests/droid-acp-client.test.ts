@@ -371,6 +371,28 @@ test("agy matcher allows the five shared GBrains and nothing that only resembles
   }
 });
 
+test("agy matcher reads the server from the call_mcp_tool proxy that large MCP servers use", () => {
+  // The exact shape captured from agy 1.5.13 for a GBrain call.
+  const proxy = (rawInput: unknown) => agyPermission({
+    sessionUpdate: "tool_call", toolCallId: "call_1", name: "call_mcp_tool", kind: "execute",
+    title: "MCP Tool whoami", status: "pending", args: rawInput, rawInput,
+  });
+  expect(allowedAgyPermissionOption(proxy({ Arguments: {}, ServerName: "gbrain-portfolio", ToolName: "whoami" }))).toBe("allow");
+  expect(allowedAgyPermissionOption(proxy({ Arguments: { query: "x" }, ServerName: "gbrain-human-design", ToolName: "search" }))).toBe("allow");
+  expect(allowedAgyPermissionOption(proxy({ ServerName: "agent-peers", ToolName: "send_message" }))).toBe("allow");
+  for (const rawInput of [
+    { ServerName: "gbrain-quinn", ToolName: "whoami" },
+    { ServerName: "github", ToolName: "create_issue" },
+    { ServerName: "agent-peers", ToolName: "delete_everything" },
+    { ServerName: "gbrain-portfolio", ToolName: "" },
+    { ServerName: "gbrain-portfolio", ToolName: "who ami; rm" },
+    { ToolName: "whoami" },
+    undefined,
+  ]) {
+    expect(allowedAgyPermissionOption(proxy(rawInput))).toBeNull();
+  }
+});
+
 test("agy matcher cancels shell, edits, other servers, lookalikes and missing allow_once", () => {
   const cancelled: Array<[Record<string, unknown>, unknown?]> = [
     [{ name: "run_command", title: "rm -rf doomed-dir", kind: "execute" }],
