@@ -274,7 +274,7 @@ test("failed child spawn deterministically settles closed and rejects ACP initia
 // ---- Antigravity (`agy acp`) profile, 2026-11-20 -------------------------
 // Payload shapes are the ones captured from agy 1.5.13 on 2026-11-20.
 
-import { AGY_ACP_PROFILE, allowedAgyPermissionOption } from "../shared/agy-profile.ts";
+import { AGY_ACP_PROFILE, allowedAgyPermissionOption, rejectAgyPermissionOption } from "../shared/agy-profile.ts";
 
 const AGY_OPTIONS = [
   { optionId: "allow", name: "Allow", kind: "allow_once" },
@@ -394,10 +394,24 @@ test("headless agy client answers permission requests through the agy matcher an
   // Droid's title form is not an Antigravity tool name.
   transport.push({ jsonrpc: "2.0", id: 72, method: "session/request_permission",
     params: agyPermission({ title: "agent-peers___check_messages" }) });
+  // No reject_once offered: fall back to cancelled.
+  transport.push({ jsonrpc: "2.0", id: 73, method: "session/request_permission",
+    params: agyPermission({ name: "run_command", title: "touch x" }, [{ optionId: "allow", kind: "allow_once" }]) });
   await Bun.sleep(0);
-  expect(transport.written.slice(-3)).toEqual([
+  // Refusals select Antigravity's reject_once ("deny"), because a cancelled
+  // answer makes agy cancel the whole turn and the peer never replies.
+  expect(transport.written.slice(-4)).toEqual([
     { jsonrpc: "2.0", id: 70, result: { outcome: { outcome: "selected", optionId: "allow" } } },
-    { jsonrpc: "2.0", id: 71, result: { outcome: { outcome: "cancelled" } } },
-    { jsonrpc: "2.0", id: 72, result: { outcome: { outcome: "cancelled" } } },
+    { jsonrpc: "2.0", id: 71, result: { outcome: { outcome: "selected", optionId: "deny" } } },
+    { jsonrpc: "2.0", id: 72, result: { outcome: { outcome: "selected", optionId: "deny" } } },
+    { jsonrpc: "2.0", id: 73, result: { outcome: { outcome: "cancelled" } } },
   ]);
+});
+
+test("agy reject option picks reject_once only, never reject_always", () => {
+  expect(rejectAgyPermissionOption(agyPermission({ name: "run_command" }))).toBe("deny");
+  expect(rejectAgyPermissionOption(agyPermission({ name: "run_command" },
+    [{ optionId: "never", kind: "reject_always" }, { optionId: "allow", kind: "allow_once" }]))).toBeNull();
+  expect(rejectAgyPermissionOption(agyPermission({ name: "run_command" }, [{ optionId: "", kind: "reject_once" }]))).toBeNull();
+  expect(rejectAgyPermissionOption(null)).toBeNull();
 });

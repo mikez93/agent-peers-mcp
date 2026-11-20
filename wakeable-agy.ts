@@ -19,14 +19,14 @@ if (argv.includes("--help") || argv.includes("-h")) {
   console.log("options:");
   console.log("  --model ID                 Model for a new session (default: gemini-4-neon; env: AGY_PEER_MODEL)");
   console.log("  --thinking LEVEL           low|medium|high|xhigh (default: high; env: AGY_PEER_THINKING)");
-  console.log("  --mode MODE                default|accept-edits|auto|plan (default: auto; env: AGY_PEER_MODE)");
+  console.log("  --mode MODE                default|accept-edits|auto|plan (default: accept-edits; env: AGY_PEER_MODE)");
   console.log("  --name NAME                Override AGENTS.md persona-repo-antigravity default");
   console.log("  --cwd, -C DIR              Working directory (default: current directory)");
   console.log("  --agy PATH                 agy executable (default: PATH lookup)");
   console.log("  --poll-ms MS               Inbox metadata poll interval (default: 1000)");
   console.log("  --claim-timeout-ms MS      MCP binding deadline (default: 15000)");
-  console.log("mode auto: Antigravity approves edits and commands it judges safe, including deletions inside the workspace;");
-  console.log("  anything it asks about is cancelled, because nobody is there to answer.");
+  console.log("mode accept-edits: Antigravity edits files without asking and asks before running commands;");
+  console.log("  anything it asks about is cancelled, because nobody is there to answer. --mode auto also runs commands, destructive ones included.");
   console.log("resume: keeps the session's model unless --model or --thinking is given.");
   console.log("examples[3]:");
   console.log("  - agypeer");

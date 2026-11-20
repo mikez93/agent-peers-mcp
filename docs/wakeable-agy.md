@@ -16,6 +16,11 @@ tool, and replies with `send_message`.
 launcher, so you talk to an `agypeer` session through Agent Peers. Your own
 interactive `agy` is untouched and stays non-wakeable.
 
+Use it only when you want a background Antigravity worker that other agents can
+hand work to while nobody is watching. It has no chat window: after it prints
+its name and session id it waits for mail, and Ctrl-C stops it. For normal
+work, type `agy`.
+
 ## Account and policy
 
 Mike chose to run `agypeer` on his Google AI Pro login on 2026-11-20 and
@@ -38,7 +43,7 @@ agypeer resume <session-id> [peer-name] [cwd]
 |---|---|
 | `--model ID` | Model for a new session. Default `gemini-4-neon` (env `AGY_PEER_MODEL`) |
 | `--thinking LEVEL` | `low`, `medium`, `high` or `xhigh`. Default `high` (env `AGY_PEER_THINKING`) |
-| `--mode MODE` | `default`, `accept-edits`, `auto` or `plan`. Default `auto` (env `AGY_PEER_MODE`) |
+| `--mode MODE` | `default`, `accept-edits`, `auto` or `plan`. Default `accept-edits` (env `AGY_PEER_MODE`) |
 | `--name NAME` | Override the `<persona>-<repo>-antigravity` default name |
 | `--cwd`, `-C DIR` | Working directory, default the current directory |
 | `--agy PATH` | `agy` executable, default a `PATH` lookup |
@@ -78,21 +83,29 @@ error: Antigravity is signed out on this machine; run `agy` once in a terminal t
 Sign in by running `agy` once in a terminal on that machine. Don't copy
 credential files between machines.
 
-## Permissions, and what `auto` allows
+## Permissions and modes
 
-Nobody is present to answer a permission request, so the host answers them
-itself:
+The default mode is `accept-edits` (Mike, 2026-11-20). Antigravity edits files
+in the workspace without asking and asks before running any command. Nobody is
+present to answer, so the host answers permission requests itself:
 
 - It allows the six Agent Peers tools (`list_peers`, `send_message`,
   `set_summary`, `check_messages`, `wait_for_peer_messages`, `rename_peer`),
   one call at a time. Antigravity names MCP tools `mcp_<server>_<tool>`, so the
   host matches `mcp_agent-peers_<tool>` on the request's `toolCall.name`.
-- It cancels every other permission request. Elicitation is declined, and
-  client methods such as terminal or filesystem access are refused.
+- It refuses every other request by selecting Antigravity's own `reject_once`
+  option. The agent is told "user denied permission" and carries on, so it can
+  still reply to the sender. The host never answers `cancelled` when a
+  `reject_once` option exists: Antigravity takes that as cancelling the whole
+  turn, and the peer stops without replying (seen 2026-11-20). Elicitation is
+  declined, and client methods such as terminal or filesystem access are
+  refused.
 
-What Antigravity asks about depends on the mode. **`auto` (the default) asks
-very little.** In the 2026-11-20 tests, `auto` ran each of these without a
-permission request:
+In the 2026-11-20 test of `accept-edits`, a file edit succeeded, `touch` was
+refused, and the peer replied with both results.
+
+**`--mode auto` asks very little.** In the 2026-11-20 tests, `auto` ran each of
+these without a permission request:
 
 - `rm -rf` on a directory inside the workspace;
 - `rm -rf` on a directory outside the workspace, under `/tmp`;
@@ -102,11 +115,8 @@ Antigravity asks permission for MCP tools even in `auto`, because its internal
 `agy_tool_safety` monitor flags them. In one test its `severe_internal_risks_agy`
 monitor failed to parse its own response and did not trigger. Treat an `auto`
 peer like headless Droid at its default `auto-high`: any peer that can message
-it can have it run destructive commands as Mike.
-
-For a tighter peer, use `--mode accept-edits`. Antigravity then edits files in
-the workspace without asking but asks before commands, and the host cancels
-those requests. `--mode default` also cancels edits.
+it can have it run destructive commands as Mike. Use `auto` only when the peer
+must run tests or git and you accept that. `--mode default` also refuses edits.
 
 ## Operating it
 
@@ -160,6 +170,8 @@ ACP (verified 2026-11-20), so fleet instructions and personas apply.
 | Second message sent mid-turn | Queued, then exactly one more wake after the turn; both replies, no duplicates |
 | File edit in `auto` | Created the file without a prompt |
 | Destructive commands in `auto` | Ran without a prompt (see above) |
+| `accept-edits` (default), production broker | File edit succeeded; `touch` refused with "user denied permission"; the peer replied with both results. With the earlier `cancelled` answer it never replied |
+| Cross-machine wake (production brokers) | Mail from the MacBook woke peers on the Studio and omarchy-01; both replied |
 | Kill the host, queue mail, `resume` from another directory | Same name, UUID and session id; restored cwd; replied `RESUMED-OK` in 17 s |
 | Signed-out `agy` | Clear error before launch (unit-tested with the Studio's exact output) |
 | Droid regression | `droidpeer --headless` still started and reported `wakeable=yes` |

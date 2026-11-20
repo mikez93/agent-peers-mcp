@@ -31,8 +31,8 @@ test("help names the command, its defaults, the auto-mode caveat and complete ex
   expect(result.stdout).toContain("usage: agypeer [start [peer-name] [cwd]]");
   expect(result.stdout).toContain("agypeer resume <session-id>");
   expect(result.stdout).toContain("default: gemini-4-neon");
-  expect(result.stdout).toContain("default: auto");
-  expect(result.stdout).toContain("deletions inside the workspace");
+  expect(result.stdout).toContain("default: accept-edits");
+  expect(result.stdout).toContain("asks before running commands");
   expect(result.stdout).toContain("agypeer start reviewer ~/code/service --thinking medium");
 });
 

@@ -607,7 +607,7 @@ test("agy launcher names the peer <persona>-<repo>-antigravity and configures mo
   expect(calls).toEqual([
     ["config", "agy-session", "model", "gemini-4-neon"],
     ["config", "agy-session", "thought_level", "high"],
-    ["mode", "agy-session", "auto"],
+    ["mode", "agy-session", "accept-edits"],
   ]);
   expect(await claims.readSession("agy-session")).toEqual(expect.objectContaining({ session_id: "agy-session", peer_id: "agy-peer" }));
   expect(await claims.listClaims()).toEqual([]);
@@ -618,11 +618,11 @@ test("agy resume keeps the session's model unless one is chosen, and always sets
   roots.push(root);
   const claims = new DroidLaunchClaimStore({ rootDir: root, runtime: "antigravity" });
   for (const [argv, expected] of [
-    [["resume", "sess-1", "--cwd", "/repo"], [["mode", "sess-1", "auto"]]],
-    [["resume", "sess-1", "--cwd", "/repo", "--thinking", "low", "--mode", "accept-edits"], [
+    [["resume", "sess-1", "--cwd", "/repo"], [["mode", "sess-1", "accept-edits"]]],
+    [["resume", "sess-1", "--cwd", "/repo", "--thinking", "low", "--mode", "auto"], [
       ["config", "sess-1", "model", "gemini-4-neon"],
       ["config", "sess-1", "thought_level", "low"],
-      ["mode", "sess-1", "accept-edits"],
+      ["mode", "sess-1", "auto"],
     ]],
   ] as Array<[string[], string[][]]>) {
     const abort = new AbortController();
@@ -670,7 +670,7 @@ test("agy argument parser: start/resume forms, env defaults, flags, and strict v
     headless: true, cwd: process.cwd(), model: "gemini-4-argon", thinkingLevel: "medium", mode: "plan", pollMs: 1000, claimTimeoutMs: 15000,
   }));
   expect(parseAgyLauncherArgs(["start", "reviewer", "/tmp"], {})).toEqual(expect.objectContaining({
-    peerName: "reviewer", cwd: "/tmp", cwdExplicit: true, mode: "auto",
+    peerName: "reviewer", cwd: "/tmp", cwdExplicit: true, mode: "accept-edits",
   }));
   const resumed = parseAgyLauncherArgs(["resume", "sess-9", "reviewer", "--agy", "/opt/agy", "--model", "claude-opus-5-5", "--poll-ms", "250"], {});
   expect(resumed).toEqual(expect.objectContaining({

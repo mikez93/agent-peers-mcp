@@ -65,6 +65,12 @@ export interface AcpHostProfile {
   /** Returns the optionId to select for a headless permission request, or
    * null to cancel it. Must fail closed for anything it does not recognize. */
   permissionOption(params: unknown): string | null;
+  /** Optional: the optionId that refuses a request permissionOption did not
+   * allow. Antigravity treats a `cancelled` answer as cancelling the whole
+   * turn, so its peer would stop without replying; selecting its own
+   * reject_once option refuses only that call. Without this, refusal is
+   * `cancelled` (Droid's behavior). */
+  rejectOption?(params: unknown): string | null;
 }
 
 export const DROID_ACP_PROFILE: AcpHostProfile = {
@@ -293,7 +299,8 @@ export class DroidAcpClient {
     // only for this invocation. Every filesystem, shell, browser, connector,
     // and unknown tool remains denied; elicitation also fails closed.
     if (request.method === "session/request_permission") {
-      const optionId = this.profile.permissionOption(request.params);
+      const optionId = this.profile.permissionOption(request.params)
+        ?? this.profile.rejectOption?.(request.params) ?? null;
       await this.send({
         jsonrpc: "2.0",
         id: request.id,

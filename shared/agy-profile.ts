@@ -20,7 +20,7 @@ export const AGY_DEFAULT_MODEL = "gemini-4-neon";
 export const AGY_DEFAULT_THINKING = "high";
 /** Approves edits and the commands Antigravity classifies as safe; asks first
  * for what it classifies as irreversible, and headless asks are cancelled. */
-export const AGY_DEFAULT_MODE = "auto";
+export const AGY_DEFAULT_MODE = "accept-edits";
 export const AGY_MODES = ["default", "accept-edits", "auto", "plan"] as const;
 
 const AGENT_PEERS_TOOLS = [
@@ -65,12 +65,27 @@ export function allowedAgyPermissionOption(params: unknown): string | null {
   return typeof allowOnce?.optionId === "string" ? allowOnce.optionId : null;
 }
 
+/** Refuse one call with Antigravity's own reject_once option, so the agent is
+ * told "no" and carries on (and can still reply to the sender). Answering
+ * `cancelled` instead makes agy cancel the whole turn (observed 2026-11-20:
+ * CancelCascadeInvocation after a refused `touch`). Never picks reject_always,
+ * which would save a lasting rule. No reject_once option: null, so cancelled. */
+export function rejectAgyPermissionOption(params: unknown): string | null {
+  if (!params || typeof params !== "object") return null;
+  const options = (params as { options?: Array<{ optionId?: unknown; kind?: unknown }> }).options;
+  const rejectOnce = options?.find((option) =>
+    option.kind === "reject_once" && typeof option.optionId === "string" && option.optionId.length > 0
+  );
+  return typeof rejectOnce?.optionId === "string" ? rejectOnce.optionId : null;
+}
+
 export const AGY_ACP_PROFILE: AcpHostProfile = {
   displayName: "Antigravity",
   clientInfo: { name: "agent-peers-antigravity", title: "Agent Peers Antigravity", version: "0.1.0" },
   command: "agy",
   args: ["acp"],
   permissionOption: allowedAgyPermissionOption,
+  rejectOption: rejectAgyPermissionOption,
 };
 
 export async function configureAgySession(
