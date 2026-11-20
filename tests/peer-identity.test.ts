@@ -86,3 +86,10 @@ test("linked worktrees retain repository name and their own AGENTS.md", () => {
   writeFileSync(join(worktree, "AGENTS.md"), "You are **Luca Moretti**, the librarian.");
   expect(defaultPeerName(worktree, "droid")).toBe("luca-named-repository-droid");
 });
+
+test("antigravity peers default to <persona>-<repo>-antigravity and 'Antigravity' is not a persona", () => {
+  const path = repo("agentic-coding-resources");
+  writeFileSync(join(path, "AGENTS.md"), "You are **Vector**, the architect.");
+  expect(defaultPeerName(path, "antigravity")).toBe("vector-agentic-coding-resources-antigravity");
+  expect(extractPersona("You are Antigravity, Google's agent.")).toBeNull();
+});

@@ -79,8 +79,10 @@ export class DroidLaunchClaimStore {
   private readonly claimsDir: string;
   private readonly sessionsDir: string;
 
-  constructor(opts: { rootDir?: string } = {}) {
-    const root = resolveStateDir({ runtime: "droid", kind: "coordination", rootDir: opts.rootDir });
+  /** `runtime` selects the default state root; Antigravity ACP peers reuse
+   * this store under ~/.agent-peers-antigravity. */
+  constructor(opts: { rootDir?: string; runtime?: "droid" | "antigravity" } = {}) {
+    const root = resolveStateDir({ runtime: opts.runtime ?? "droid", kind: "coordination", rootDir: opts.rootDir });
     this.rootDir = root;
     this.claimsDir = join(root, "claims");
     this.sessionsDir = join(root, "sessions");

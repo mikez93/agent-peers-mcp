@@ -396,33 +396,55 @@ async function cmdWakeStatus() {
 
   console.log("");
   console.log("Wakeable Factory Droid sessions:");
-  if (droidPeers.length === 0 && boundDroidClaims.length === 0) {
+  printAcpWakeRows(droidPeers, boundDroidClaims, droidUnreadCounts, "Droid", "unknown-droid");
+
+  // Antigravity peers are hosted by the same ACP launcher (agypeer) and keep
+  // their launch claims under their own state root.
+  const agyPeers = peers.filter((peer) => peer.peer_type === "antigravity");
+  const agyRoot = process.env.AGENT_PEERS_ANTIGRAVITY_STATE_DIR ?? join(homedir(), ".agent-peers-antigravity");
+  const agyClaims = (await new DroidLaunchClaimStore({ rootDir: agyRoot, runtime: "antigravity" }).listClaims())
+    .filter((claim): claim is BoundDroidLaunchClaim =>
+      claim.status === "bound" && !!claim.peer_id && !!claim.peer_name && !!claim.mcp_pid
+    );
+  console.log("");
+  console.log("Wakeable Antigravity sessions:");
+  printAcpWakeRows(agyPeers, agyClaims, await readUnreadCountsByPeer(agyRoot), "Antigravity", "unknown-antigravity");
+}
+
+function printAcpWakeRows(
+  livePeers: Peer[],
+  boundClaims: BoundDroidLaunchClaim[],
+  unreadCounts: Map<string, number>,
+  label: string,
+  unknownName: string,
+): void {
+  if (livePeers.length === 0 && boundClaims.length === 0) {
     console.log("  (none)");
-  } else {
-    for (const peer of droidPeers.sort(comparePeers)) {
-      const claim = selectDroidClaim(boundDroidClaims, peer, processIsAlive);
-      printDroidWakePeer(peer, claim, droidUnreadCounts.get(peer.id) ?? 0, "registered");
-    }
-    // Claims for peers the broker no longer knows: show only those whose launcher or
-    // MCP process is still alive, newest claim per peer. Dead leftovers used to print
-    // once per stale claim file, burying the live rows.
-    const liveDroidIds = new Set(droidPeers.map((peer) => peer.id));
-    const missingByPeer = new Map<string, (typeof boundDroidClaims)[number]>();
-    let hiddenDead = 0;
-    for (const claim of boundDroidClaims.filter((item) => !liveDroidIds.has(item.peer_id))) {
-      if (!processIsAlive(claim.launcher_pid) && !processIsAlive(claim.mcp_pid)) {
-        hiddenDead += 1;
-        continue;
-      }
-      const prior = missingByPeer.get(claim.peer_id);
-      if (!prior || claim.updated_at > prior.updated_at) missingByPeer.set(claim.peer_id, claim);
-    }
-    for (const claim of missingByPeer.values()) {
-      printDroidWakePeer(undefined, claim, droidUnreadCounts.get(claim.peer_id) ?? 0, "missing");
-    }
-    if (droidPeers.length === 0 && missingByPeer.size === 0) console.log("  (none)");
-    if (hiddenDead > 0) console.log(`  (${hiddenDead} claim(s) for exited Droid sessions hidden)`);
+    return;
   }
+  for (const peer of livePeers.sort(comparePeers)) {
+    const claim = selectDroidClaim(boundClaims, peer, processIsAlive);
+    printDroidWakePeer(peer, claim, unreadCounts.get(peer.id) ?? 0, "registered", unknownName);
+  }
+  // Claims for peers the broker no longer knows: show only those whose launcher or
+  // MCP process is still alive, newest claim per peer. Dead leftovers used to print
+  // once per stale claim file, burying the live rows.
+  const liveIds = new Set(livePeers.map((peer) => peer.id));
+  const missingByPeer = new Map<string, BoundDroidLaunchClaim>();
+  let hiddenDead = 0;
+  for (const claim of boundClaims.filter((item) => !liveIds.has(item.peer_id))) {
+    if (!processIsAlive(claim.launcher_pid) && !processIsAlive(claim.mcp_pid)) {
+      hiddenDead += 1;
+      continue;
+    }
+    const prior = missingByPeer.get(claim.peer_id);
+    if (!prior || claim.updated_at > prior.updated_at) missingByPeer.set(claim.peer_id, claim);
+  }
+  for (const claim of missingByPeer.values()) {
+    printDroidWakePeer(undefined, claim, unreadCounts.get(claim.peer_id) ?? 0, "missing", unknownName);
+  }
+  if (livePeers.length === 0 && missingByPeer.size === 0) console.log("  (none)");
+  if (hiddenDead > 0) console.log(`  (${hiddenDead} claim(s) for exited ${label} sessions hidden)`);
 }
 
 function printDroidWakePeer(
@@ -430,12 +452,13 @@ function printDroidWakePeer(
   claim: BoundDroidLaunchClaim | undefined,
   pending: number,
   broker: "registered" | "missing",
+  unknownName = "unknown-droid",
 ): void {
   const launcherLive = processIsAlive(claim?.launcher_pid);
   const mcpLive = processIsAlive(claim?.mcp_pid);
   const wakeable = broker === "registered" && launcherLive && mcpLive
     && !!claim?.session_id && claim.mcp_pid === peer?.pid ? "yes" : "no";
-  const name = peer?.name ?? claim?.peer_name ?? "unknown-droid";
+  const name = peer?.name ?? claim?.peer_name ?? unknownName;
   const peerId = peer?.id ?? claim?.peer_id ?? "unknown";
   console.log(`  ${name}  broker=${broker}  session=${launcherLive ? "live" : "dead"}  mcp=${mcpLive ? "live" : "dead"}  wakeable=${wakeable}  unread=${pending}  id=${peerId}`);
   console.log(`    cwd=${peer?.cwd ?? claim?.cwd ?? "unknown"}  session_id=${claim?.session_id ?? "unknown"}`);
@@ -622,7 +645,7 @@ async function cmdSuggestName(base: string) {
 // broker rows the strict orphan view misses, and archive dead inbox files
 // without ever deleting bodies.
 
-const INBOX_RUNTIMES: StateRuntime[] = ["codex", "hermes", "droid", "claude", "openclaw"];
+const INBOX_RUNTIMES: StateRuntime[] = ["codex", "hermes", "droid", "claude", "openclaw", "antigravity"];
 
 interface InboxFileInfo {
   runtime: string;

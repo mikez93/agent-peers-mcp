@@ -41,3 +41,10 @@ test("harness and model words are never inferred as personas", () => {
   expect(personaOf({ name: "marco-imekka-director-ops-droid", cwd: "/w/imekka-director-ops" })).toBe("marco");
   expect(personaOf({ name: "re-amaze-codex", cwd: "/w/re-amaze" })).toBeNull();
 });
+
+test("antigravity and agy are harness words, never personas", () => {
+  expect(personaOf({ name: "antigravity-reviewer", cwd: "/w/x" })).toBeNull();
+  expect(personaOf({ name: "agy-helper" })).toBeNull();
+  expect(personaOf({ name: "orion-agentic-coding-resources-antigravity", git_root: "/w/agentic-coding-resources" })).toBe("orion");
+  expect(matchesPersonaQuery("orion-agentic-coding-resources-antigravity", "orion")).toBe(true);
+});

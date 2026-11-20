@@ -447,3 +447,56 @@ test("initDb expands the current peer_type constraint to Droid without losing br
     reopened.close();
   }
 });
+
+// 2026-11-20: the antigravity peer type. The "previous release" is the schema
+// the openclaw rebuild leaves (every v3 column, CHECK list ending 'openclaw'),
+// produced here by rebuilding a current DB with 'antigravity' removed.
+test("antigravity migration preserves peers, v3 columns and mail from the openclaw-era schema", () => {
+  TEST_DB = `/tmp/agent-peers-migration-antigravity-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  const seed = initDb(TEST_DB);
+  const sql = seed.query<{ sql: string }, []>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'peers'").get()!.sql;
+  const oldSql = sql.replace(", 'antigravity'", "").replace(/^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?peers\s*\(/i, "CREATE TABLE peers_old (");
+  expect(oldSql).not.toContain("'antigravity'");
+  expect(oldSql).toContain("CREATE TABLE peers_old (");
+  seed.exec(oldSql);
+  seed.exec("DROP TABLE peers");
+  seed.exec("ALTER TABLE peers_old RENAME TO peers");
+  seed.exec("CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen)");
+  const ts = "2026-11-19T10:00:00.000Z";
+  seed.query(
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token,
+       registered_at, started_at, last_seen, durable, host, persona, capabilities, mailbox_owner)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run("droid-id", "kepler-repo-droid", "droid", 4242, "/repo", "/repo", null, "keeps", "droid-token",
+    ts, ts, ts, 1, "studio.example", "kepler", "wake", null);
+  seed.query(
+    `INSERT INTO messages (from_id, to_id, text, sent_at, acked, message_uid) VALUES (?, ?, ?, ?, 0, ?)`
+  ).run("someone", "droid-id", "queued before antigravity", ts, "uid-agy-1");
+  const before = seed.query("SELECT * FROM peers ORDER BY id").all();
+  seed.close();
+
+  const db = initDb(TEST_DB);
+  try {
+    const migrated = db.query<{ sql: string }, []>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'peers'").get()!.sql;
+    for (const t of ["'claude'", "'codex'", "'hermes'", "'droid'", "'openclaw'"]) expect(migrated).toContain(t);
+    expect(migrated.match(/'antigravity'/g)?.length).toBe(1);
+    expect(db.query("SELECT * FROM peers ORDER BY id").all()).toEqual(before);
+    expect(pollMessages(db, "droid-id", "droid-token").map((m) => m.text)).toEqual(["queued before antigravity"]);
+    const agy = registerPeer(db, {
+      name: "vector-repo-antigravity", peer_type: "antigravity", pid: 9002, cwd: "/repo",
+      git_root: "/repo", tty: null, summary: "",
+    });
+    expect(db.query<{ peer_type: string }, [string]>("SELECT peer_type FROM peers WHERE id = ?").get(agy.id)?.peer_type)
+      .toBe("antigravity");
+  } finally {
+    db.close();
+  }
+
+  const again = initDb(TEST_DB);
+  try {
+    expect(again.query<{ sql: string }, []>("SELECT sql FROM sqlite_master WHERE name = 'peers'").get()!.sql
+      .match(/'antigravity'/g)?.length).toBe(1);
+  } finally {
+    again.close();
+  }
+});

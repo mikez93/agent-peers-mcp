@@ -151,7 +151,7 @@ export function initDb(path: string): Database {
     CREATE TABLE IF NOT EXISTS peers (
       id            TEXT PRIMARY KEY,
       name          TEXT NOT NULL UNIQUE,
-      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes', 'droid', 'openclaw')),
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex', 'hermes', 'droid', 'openclaw', 'antigravity')),
       pid           INTEGER,
       cwd           TEXT,
       git_root      TEXT,
@@ -214,6 +214,9 @@ export function initDb(path: string): Database {
   // brokers can still open the result: their CHECK probes look for
   // 'hermes' and 'droid', which the expanded constraint still contains.
   migrate_peers_add_openclaw_peer_type(db);
+  // 2026-11-20. MUST stay after the openclaw rebuild, for the same reason:
+  // it rebuilds peers from its own stored definition.
+  migrate_peers_add_antigravity_peer_type(db);
 
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
@@ -537,22 +540,32 @@ const PEERS_CREATE_HEAD = /^CREATE TABLE\s+(?:"peers"|'peers'|`peers`|\[peers\]|
  *  by the live column list, verifies the count, and recreates the indexes
  *  that existed. Peer IDs, tokens, and every other table are untouched. */
 function migrate_peers_add_openclaw_peer_type(db: Database): void {
+  migrate_peers_add_peer_type(db, "openclaw");
+}
+
+/** 2026-11-20. Antigravity ACP peers, through the same lossless rebuild. */
+function migrate_peers_add_antigravity_peer_type(db: Database): void {
+  migrate_peers_add_peer_type(db, "antigravity");
+}
+
+function migrate_peers_add_peer_type(db: Database, peerType: "openclaw" | "antigravity"): void {
   db.exec("BEGIN IMMEDIATE");
   try {
     const row = db.query<{ sql: string | null }, []>(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'peers'"
     ).get();
     const sql = row?.sql ?? "";
-    if (!sql.includes("'openclaw'")) {
+    if (!sql.includes(`'${peerType}'`)) {
       const check = sql.match(PEERS_TYPE_CHECK);
       if (!check || !PEERS_CREATE_HEAD.test(sql)) {
-        throw new Error("peers table definition not recognized; refusing to rebuild it for the openclaw peer type");
+        throw new Error(`peers table definition not recognized; refusing to rebuild it for the ${peerType} peer type`);
       }
       const types = check[1]!.split(",").map((t) => t.trim()).filter(Boolean);
-      types.push("'openclaw'");
+      types.push(`'${peerType}'`);
+      const shadow = `peers_${peerType}_new`;
       const rebuilt = sql
         .replace(PEERS_TYPE_CHECK, `CHECK(peer_type IN (${types.join(", ")}))`)
-        .replace(PEERS_CREATE_HEAD, "CREATE TABLE peers_openclaw_new (");
+        .replace(PEERS_CREATE_HEAD, `CREATE TABLE ${shadow} (`);
       const columns = db.query<{ name: string }, []>("SELECT name FROM pragma_table_info('peers')").all()
         .map((c) => `"${c.name.replace(/"/g, '""')}"`).join(", ");
       const indexes = db.query<{ sql: string }, []>(
@@ -560,13 +573,13 @@ function migrate_peers_add_openclaw_peer_type(db: Database): void {
       ).all();
       const before = db.query<{ n: number }, []>("SELECT count(*) AS n FROM peers").get()!.n;
       db.exec(rebuilt);
-      db.exec(`INSERT INTO peers_openclaw_new (${columns}) SELECT ${columns} FROM peers`);
-      const after = db.query<{ n: number }, []>("SELECT count(*) AS n FROM peers_openclaw_new").get()!.n;
-      if (after !== before) throw new Error(`openclaw peer-type rebuild copied ${after} of ${before} peers; rolled back`);
+      db.exec(`INSERT INTO ${shadow} (${columns}) SELECT ${columns} FROM peers`);
+      const after = db.query<{ n: number }, []>(`SELECT count(*) AS n FROM ${shadow}`).get()!.n;
+      if (after !== before) throw new Error(`${peerType} peer-type rebuild copied ${after} of ${before} peers; rolled back`);
       db.exec("DROP TABLE peers");
-      db.exec("ALTER TABLE peers_openclaw_new RENAME TO peers");
+      db.exec(`ALTER TABLE ${shadow} RENAME TO peers`);
       for (const index of indexes) db.exec(index.sql);
-      console.error("[broker] migration: expanded peer_type constraint to include openclaw");
+      console.error(`[broker] migration: expanded peer_type constraint to include ${peerType}`);
     }
     db.exec("COMMIT");
   } catch (e) {
@@ -1652,7 +1665,7 @@ function isGuiApp(command: string | undefined): boolean {
 function findAgentMcpServers(table: ProcTable): number[] {
   const pids: number[] = [];
   for (const [pid, command] of table.commandOf) {
-    if (/agent-peers-mcp\/(claude|codex|hermes|droid|openclaw)-server\.ts/.test(command)) pids.push(pid);
+    if (/agent-peers-mcp\/(claude|codex|hermes|droid|openclaw|agy)-server\.ts/.test(command)) pids.push(pid);
   }
   return pids;
 }

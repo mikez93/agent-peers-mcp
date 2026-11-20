@@ -516,3 +516,170 @@ async function writeMetadata(root: string, peerId: string, ids: number[]): Promi
   }), { mode: 0o600 });
   await chmod(path, 0o600);
 }
+
+// ---- Antigravity profile (agypeer), 2026-11-20 ---------------------------
+
+import {
+  AGY_LAUNCHER_PROFILE,
+  AgySignedOutError,
+  checkAgySignedIn,
+  parseAgyLauncherArgs,
+} from "../shared/agy-profile.ts";
+
+const AGY_TEST_PROFILE = { ...AGY_LAUNCHER_PROFILE, preflight: undefined };
+
+function agyClient(opts: {
+  claims: DroidLaunchClaimStore;
+  cwd: string;
+  calls: string[][];
+  onSession?: (mcp: { env: Array<{ name: string; value: string }> }) => void;
+}): DroidLauncherClient {
+  let finish!: (code: number) => void;
+  const bind = async (mcpServers: Array<{ env: Array<{ name: string; value: string }> }>) => {
+    opts.onSession?.(mcpServers[0]!);
+    const claimId = mcpServers[0]!.env.find((item) => item.name === "AGENT_PEERS_LAUNCH_CLAIM_ID")!.value;
+    await opts.claims.bindClaim(claimId, { peerId: "agy-peer", peerName: "agy-name", mcpPid: process.pid, cwd: opts.cwd });
+  };
+  return {
+    isBusy: false,
+    closed: new Promise<number>((resolve) => { finish = resolve; }),
+    async initialize() {
+      return { protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } };
+    },
+    async newSession({ mcpServers }) { await bind(mcpServers); return "agy-session"; },
+    async resumeSession({ sessionId, mcpServers }) { await bind(mcpServers); return sessionId; },
+    async setConfigOption(sessionId, configId, value) { opts.calls.push(["config", sessionId, configId, value]); },
+    async setMode(sessionId, modeId) { opts.calls.push(["mode", sessionId, modeId]); },
+    async prompt() {},
+    async cancel() {},
+    close() { finish(0); },
+  };
+}
+
+test("Antigravity MCP config runs agy-server with the generic launch-claim env", () => {
+  const server = buildDroidMcpServer({
+    claimId: "claim-agy",
+    stateRoot: "/private/agy-state",
+    peerName: "vector-repo-antigravity",
+    bunCommand: "/bin/bun",
+    profile: AGY_LAUNCHER_PROFILE,
+  });
+  expect(server).toEqual({
+    name: "agent-peers",
+    command: "/bin/bun",
+    args: [expect.stringMatching(/\/agy-server\.ts$/)],
+    env: [
+      { name: "AGENT_PEERS_RUNTIME", value: "antigravity" },
+      { name: "AGENT_PEERS_LAUNCH_CLAIM_ID", value: "claim-agy" },
+      { name: "AGENT_PEERS_ANTIGRAVITY_STATE_DIR", value: "/private/agy-state" },
+      { name: "AGENT_PEERS_STATE_DIR", value: "/private/agy-state" },
+      { name: "AGENT_PEERS_DISABLE_TAB_TITLE", value: "1" },
+      { name: "PEER_NAME", value: "vector-repo-antigravity" },
+    ],
+  });
+});
+
+test("agy launcher names the peer <persona>-<repo>-antigravity and configures model, thinking and auto mode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agy-launcher-"));
+  const cwd = await mkdtemp(join(tmpdir(), "agyrepo-"));
+  roots.push(root, cwd);
+  await writeFile(join(cwd, "AGENTS.md"), "You are **Orion**, the test persona.\n");
+  const claims = new DroidLaunchClaimStore({ rootDir: root, runtime: "antigravity" });
+  const abort = new AbortController();
+  const calls: string[][] = [];
+  let peerNameEnv: string | undefined;
+  let ready: { peerName: string; sessionId: string } | undefined;
+  const code = await runDroidLauncher(parseAgyLauncherArgs(["start", "--cwd", cwd], {}), {
+    profile: AGY_TEST_PROFILE,
+    stateRoot: root,
+    claimStore: claims,
+    clientFactory: () => agyClient({
+      claims, cwd, calls,
+      onSession: (mcp) => { peerNameEnv = mcp.env.find((item) => item.name === "PEER_NAME")?.value; },
+    }),
+    metadataSourceFactory: () => ({ async read() { return { pendingCount: 0, lastMessageId: null }; } }),
+    onReady: (state) => { ready = state; abort.abort(); },
+  }, abort.signal);
+  expect(code).toBe(0);
+  const repo = cwd.split("/").at(-1)!.toLowerCase();
+  expect(peerNameEnv).toBe(`orion-${repo}-antigravity`);
+  expect(ready?.sessionId).toBe("agy-session");
+  expect(calls).toEqual([
+    ["config", "agy-session", "model", "gemini-4-neon"],
+    ["config", "agy-session", "thought_level", "high"],
+    ["mode", "agy-session", "auto"],
+  ]);
+  expect(await claims.readSession("agy-session")).toEqual(expect.objectContaining({ session_id: "agy-session", peer_id: "agy-peer" }));
+  expect(await claims.listClaims()).toEqual([]);
+});
+
+test("agy resume keeps the session's model unless one is chosen, and always sets the mode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agy-resume-"));
+  roots.push(root);
+  const claims = new DroidLaunchClaimStore({ rootDir: root, runtime: "antigravity" });
+  for (const [argv, expected] of [
+    [["resume", "sess-1", "--cwd", "/repo"], [["mode", "sess-1", "auto"]]],
+    [["resume", "sess-1", "--cwd", "/repo", "--thinking", "low", "--mode", "accept-edits"], [
+      ["config", "sess-1", "model", "gemini-4-neon"],
+      ["config", "sess-1", "thought_level", "low"],
+      ["mode", "sess-1", "accept-edits"],
+    ]],
+  ] as Array<[string[], string[][]]>) {
+    const abort = new AbortController();
+    const calls: string[][] = [];
+    await runDroidLauncher(parseAgyLauncherArgs(argv, {}), {
+      profile: AGY_TEST_PROFILE,
+      stateRoot: root,
+      claimStore: claims,
+      clientFactory: () => agyClient({ claims, cwd: "/repo", calls }),
+      metadataSourceFactory: () => ({ async read() { return { pendingCount: 0, lastMessageId: null }; } }),
+      onReady: () => abort.abort(),
+    }, abort.signal);
+    expect(calls).toEqual(expected);
+  }
+});
+
+test("a signed-out agy fails before any claim or child exists", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agy-signed-out-"));
+  roots.push(root);
+  const claims = new DroidLaunchClaimStore({ rootDir: root, runtime: "antigravity" });
+  let spawned = false;
+  await expect(runDroidLauncher(parseAgyLauncherArgs(["--cwd", "/repo"], {}), {
+    profile: { ...AGY_LAUNCHER_PROFILE, preflight: () => checkAgySignedIn("agy", async () => ({
+      code: 1, output: "Fetching available models...\nError: Please sign in to view available models.",
+    })) },
+    stateRoot: root,
+    claimStore: claims,
+    clientFactory: () => { spawned = true; throw new Error("must not spawn"); },
+  })).rejects.toThrow("run `agy` once in a terminal to sign in");
+  expect(spawned).toBe(false);
+  expect(await claims.listClaims()).toEqual([]);
+});
+
+test("agy sign-in preflight passes when models list, and explains a missing binary or other failure", async () => {
+  await checkAgySignedIn("agy", async () => ({ code: 0, output: "gemini-4-neon-high\tGemini 4 Neon (High)" }));
+  await expect(checkAgySignedIn("/nope/agy", async () => { throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }); }))
+    .rejects.toBeInstanceOf(AgySignedOutError);
+  await expect(checkAgySignedIn("agy", async () => ({ code: 2, output: "boom\nquota exhausted\n" })))
+    .rejects.toThrow("agy models failed before launch: quota exhausted");
+});
+
+test("agy argument parser: start/resume forms, env defaults, flags, and strict validation", () => {
+  const env = { AGY_PEER_MODEL: "gemini-4-argon", AGY_PEER_THINKING: "medium", AGY_PEER_MODE: "plan" };
+  expect(parseAgyLauncherArgs([], env)).toEqual(expect.objectContaining({
+    headless: true, cwd: process.cwd(), model: "gemini-4-argon", thinkingLevel: "medium", mode: "plan", pollMs: 1000, claimTimeoutMs: 15000,
+  }));
+  expect(parseAgyLauncherArgs(["start", "reviewer", "/tmp"], {})).toEqual(expect.objectContaining({
+    peerName: "reviewer", cwd: "/tmp", cwdExplicit: true, mode: "auto",
+  }));
+  const resumed = parseAgyLauncherArgs(["resume", "sess-9", "reviewer", "--agy", "/opt/agy", "--model", "claude-opus-5-5", "--poll-ms", "250"], {});
+  expect(resumed).toEqual(expect.objectContaining({
+    sessionId: "sess-9", peerName: "reviewer", agyCommand: "/opt/agy", model: "claude-opus-5-5", settingsExplicit: true, pollMs: 250, cwdExplicit: false,
+  }));
+  expect(() => parseAgyLauncherArgs(["resume"], {})).toThrow("resume requires an Antigravity session id");
+  expect(() => parseAgyLauncherArgs(["--mode", "yolo"], {})).toThrow("--mode must be one of");
+  expect(() => parseAgyLauncherArgs(["--headless"], {})).toThrow("unknown option: --headless");
+  expect(() => parseAgyLauncherArgs(["--poll-ms", "0"], {})).toThrow("--poll-ms must be a positive integer");
+  expect(() => parseAgyLauncherArgs(["--name", "bad name"], {})).toThrow("peer name must be");
+  expect(() => parseAgyLauncherArgs(["launch"], {})).toThrow("expected start or resume");
+});

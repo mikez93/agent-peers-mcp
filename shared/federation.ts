@@ -15,7 +15,7 @@ export const FEDERATION_HOST_HEADER = "x-agent-peers-federation-host";
 export const UNREACHABLE_HOSTS_HEADER = "x-agent-peers-unreachable-hosts";
 const BODY_LIMIT = 2 * 1024 * 1024;
 const MAX_TEXT = 100_000;
-const PEER_TYPES: PeerType[] = ["claude", "codex", "hermes", "droid", "openclaw"];
+const PEER_TYPES: PeerType[] = ["claude", "codex", "hermes", "droid", "openclaw", "antigravity"];
 // /federation/chats input limits, checked by both sides.
 const CHAT_PEER_MAX = 200;
 const CHAT_QUERY_MAX = 4096;

@@ -4,7 +4,7 @@
 import type { ChatCandidate } from "./chat-directory.ts";
 
 export type PeerId = string; // UUID v4
-export type PeerType = "claude" | "codex" | "hermes" | "droid" | "openclaw";
+export type PeerType = "claude" | "codex" | "hermes" | "droid" | "openclaw" | "antigravity";
 export type PeerName = string; // Validated by shared/names.ts; UUID-shaped names are excluded.
 
 export interface Peer {

@@ -611,3 +611,14 @@ test("a 400 for an unreadable payload (slow or cut upload) stays on the retry pa
   expect(a.service.status()).toEqual({ pending: 0, delivered: 1, bounced: 0 });
   expect(rows(b)).toHaveLength(1);
 });
+
+test("a broker that knows antigravity accepts mail from an antigravity sender", async () => {
+  const a = makeMachine("alpha", [peer("vector-repo-antigravity", "antigravity")]);
+  const b = makeMachine("beta");
+  delete a.config.hosts.gamma; delete b.config.hosts.gamma;
+  expect(a.deps.sendLocal(request(a, "beta@beta"))).toMatchObject({ ok: true });
+  await a.service.tick();
+  expect(a.service.status()).toEqual({ pending: 0, delivered: 1, bounced: 0 });
+  expect(b.service.senderForMessage(rows(b)[0]!.id))
+    .toMatchObject({ from_name: "vector-repo-antigravity@alpha", from_peer_type: "antigravity" });
+});

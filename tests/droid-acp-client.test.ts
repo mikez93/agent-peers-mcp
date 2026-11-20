@@ -270,3 +270,134 @@ test("failed child spawn deterministically settles closed and rejects ACP initia
   client.close();
   client.close();
 }, 5_000);
+
+// ---- Antigravity (`agy acp`) profile, 2026-11-20 -------------------------
+// Payload shapes are the ones captured from agy 1.5.13 on 2026-11-20.
+
+import { AGY_ACP_PROFILE, allowedAgyPermissionOption } from "../shared/agy-profile.ts";
+
+const AGY_OPTIONS = [
+  { optionId: "allow", name: "Allow", kind: "allow_once" },
+  { optionId: "deny", name: "Deny", kind: "reject_once" },
+];
+
+function agyPermission(toolCall: Record<string, unknown>, options: unknown = AGY_OPTIONS) {
+  return { sessionId: "s", toolCall, options };
+}
+
+test("agy profile spawns `agy acp` and labels errors as Antigravity", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "agy-acp-spawn-"));
+  const command = join(dir, "agy-fixture");
+  writeFileSync(command, `#!${process.execPath}
+process.stderr.write(JSON.stringify(process.argv.slice(2)) + "\\n");
+process.stdout.write("not json\\n");
+setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+  let argv!: (value: string) => void;
+  const seen = new Promise<string>((resolve) => { argv = resolve; });
+  const transport = spawnDroidAcpTransport({
+    cwd: dir,
+    droidCommand: command,
+    profile: AGY_ACP_PROFILE,
+    shutdownGraceMs: 50,
+    onStderr: (chunk) => argv(chunk.trim()),
+  });
+  const client = new DroidAcpClient(transport, { profile: AGY_ACP_PROFILE });
+  try {
+    expect(JSON.parse(await seen)).toEqual(["acp"]);
+    await expect(client.initialize()).rejects.toThrow("Antigravity emitted a non-JSON ACP stdout line");
+  } finally {
+    client.close();
+    await client.closed;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 5_000);
+
+test("agy initialize sends the Antigravity clientInfo and set_mode uses standard ACP", async () => {
+  const transport = new FakeTransport((message, fake) => {
+    if (message.method === "initialize") fake.push(responseFor(message, { protocolVersion: 1, agentCapabilities: {} }));
+    if (message.method === "session/set_mode") fake.push(responseFor(message, {}));
+  });
+  const client = new DroidAcpClient(transport, { profile: AGY_ACP_PROFILE });
+  await client.initialize();
+  await client.setMode("agy-session", "auto");
+  expect(transport.written).toEqual([
+    expect.objectContaining({
+      method: "initialize",
+      params: expect.objectContaining({ clientCapabilities: {}, clientInfo: AGY_ACP_PROFILE.clientInfo }),
+    }),
+    expect.objectContaining({ method: "session/set_mode", params: { sessionId: "agy-session", modeId: "auto" } }),
+  ]);
+});
+
+test("agy resume targets the exact session and names Antigravity when resume is missing", async () => {
+  const transport = new FakeTransport((message, fake) => {
+    if (message.method === "initialize") fake.push(responseFor(message, {
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, load: {} } },
+    }));
+    if (message.method === "session/resume") fake.push(responseFor(message, {}));
+  });
+  const client = new DroidAcpClient(transport, { profile: AGY_ACP_PROFILE });
+  const init = await client.initialize();
+  expect(await client.resumeSession({ sessionId: "e82fc8c9", cwd: "/repo", mcpServers: [], capabilities: init.agentCapabilities }))
+    .toBe("e82fc8c9");
+  expect(transport.written.at(-1)).toEqual(expect.objectContaining({
+    method: "session/resume", params: { sessionId: "e82fc8c9", cwd: "/repo", mcpServers: [] },
+  }));
+  await expect(client.resumeSession({ sessionId: "x", cwd: "/repo", mcpServers: [], capabilities: { loadSession: true } }))
+    .rejects.toThrow("Antigravity does not advertise ACP session/resume");
+});
+
+test("agy matcher allows the six Agent Peers tools once, matched on Antigravity's mcp_<server>_<tool> name", () => {
+  for (const tool of ["list_peers", "send_message", "set_summary", "check_messages", "wait_for_peer_messages", "rename_peer"]) {
+    const name = `mcp_agent-peers_${tool}`;
+    // The exact shape captured from agy 1.5.13.
+    expect(allowedAgyPermissionOption(agyPermission({
+      sessionUpdate: "tool_call", name, title: `Run ${name}`, kind: "other", status: "pending",
+    }))).toBe("allow");
+  }
+  // Title-only fallback when a build omits `name`.
+  expect(allowedAgyPermissionOption(agyPermission({ title: "Run mcp_agent-peers_send_message" }))).toBe("allow");
+});
+
+test("agy matcher cancels shell, edits, other servers, lookalikes and missing allow_once", () => {
+  const cancelled: Array<[Record<string, unknown>, unknown?]> = [
+    [{ name: "run_command", title: "rm -rf doomed-dir", kind: "execute" }],
+    [{ name: "write_file", title: "File scratch.txt", kind: "edit" }],
+    [{ name: "mcp_other_check_messages", title: "Run mcp_other_check_messages" }],
+    [{ name: "mcp_agent_peers_check_messages" }],
+    [{ name: "mcp_agent-peers_delete_everything" }],
+    // `name` decides when present; a matching title cannot rescue it.
+    [{ name: "run_command", title: "Run mcp_agent-peers_check_messages" }],
+    [{ name: "mcp_agent-peers_check_messages" }, [{ optionId: "always", kind: "allow_always" }]],
+    [{ name: "mcp_agent-peers_check_messages" }, [{ optionId: "", kind: "allow_once" }]],
+    [{}],
+  ];
+  for (const [toolCall, options] of cancelled) {
+    expect(allowedAgyPermissionOption(agyPermission(toolCall, options ?? AGY_OPTIONS))).toBeNull();
+  }
+  expect(allowedAgyPermissionOption(null)).toBeNull();
+  expect(allowedAgyPermissionOption("mcp_agent-peers_check_messages")).toBeNull();
+});
+
+test("headless agy client answers permission requests through the agy matcher and fails closed", async () => {
+  const transport = new FakeTransport((message, fake) => {
+    if (message.method === "initialize") fake.push(responseFor(message, { protocolVersion: 1, agentCapabilities: {} }));
+  });
+  const client = new DroidAcpClient(transport, { profile: AGY_ACP_PROFILE });
+  await client.initialize();
+  transport.push({ jsonrpc: "2.0", id: 70, method: "session/request_permission",
+    params: agyPermission({ name: "mcp_agent-peers_check_messages", title: "Run mcp_agent-peers_check_messages" }) });
+  transport.push({ jsonrpc: "2.0", id: 71, method: "session/request_permission",
+    params: agyPermission({ name: "run_command", title: "git push --force", kind: "execute" }) });
+  // Droid's title form is not an Antigravity tool name.
+  transport.push({ jsonrpc: "2.0", id: 72, method: "session/request_permission",
+    params: agyPermission({ title: "agent-peers___check_messages" }) });
+  await Bun.sleep(0);
+  expect(transport.written.slice(-3)).toEqual([
+    { jsonrpc: "2.0", id: 70, result: { outcome: { outcome: "selected", optionId: "allow" } } },
+    { jsonrpc: "2.0", id: 71, result: { outcome: { outcome: "cancelled" } } },
+    { jsonrpc: "2.0", id: 72, result: { outcome: { outcome: "cancelled" } } },
+  ]);
+});

@@ -111,16 +111,27 @@ const RUNTIME_PEER_TYPE: PeerType = process.env.AGENT_PEERS_RUNTIME === "hermes"
     ? "droid"
     : process.env.AGENT_PEERS_RUNTIME === "openclaw"
       ? "openclaw"
-      : "codex";
+      : process.env.AGENT_PEERS_RUNTIME === "antigravity"
+        ? "antigravity"
+        : "codex";
 const RUNTIME_DISPLAY_NAME = RUNTIME_PEER_TYPE === "hermes"
   ? "Hermes"
   : RUNTIME_PEER_TYPE === "droid"
     ? "Factory Droid"
     : RUNTIME_PEER_TYPE === "openclaw"
       ? "OpenClaw"
-      : "Codex";
+      : RUNTIME_PEER_TYPE === "antigravity"
+        ? "Antigravity"
+        : "Codex";
 const RUNTIME_IS_CODEX = RUNTIME_PEER_TYPE === "codex";
-const RUNTIME_IS_DROID = RUNTIME_PEER_TYPE === "droid";
+// Droid and Antigravity are both hosted by an ACP launcher that hands this
+// MCP child a launch claim to bind; that binding is what makes them wakeable.
+const LAUNCH_CLAIM_RUNTIME: "droid" | "antigravity" | null =
+  RUNTIME_PEER_TYPE === "droid" || RUNTIME_PEER_TYPE === "antigravity" ? RUNTIME_PEER_TYPE : null;
+const RUNTIME_USES_LAUNCH_CLAIM = LAUNCH_CLAIM_RUNTIME !== null;
+/** Generic name first; the Droid-specific name keeps already-running Droid
+ *  launchers (started before this change) bindable. */
+const LAUNCH_CLAIM_ID = process.env.AGENT_PEERS_LAUNCH_CLAIM_ID || process.env.AGENT_PEERS_DROID_LAUNCH_CLAIM_ID;
 // bd-b2in.17. One child per OpenClaw session thread, none of which knows its
 // session. Only the child proven to run agent:<id>:main owns the mailbox; see
 // shared/openclaw-gate.ts. Every other child answers with an explanation.
@@ -290,7 +301,7 @@ const TOOLS = [
       type: "object" as const,
       properties: {
         scope: { type: "string" as const, enum: ["machine", "directory", "repo"] },
-        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes", "droid", "openclaw"] },
+        peer_type: { type: "string" as const, enum: ["claude", "codex", "hermes", "droid", "openclaw", "antigravity"] },
       },
       required: ["scope"],
     },
@@ -936,7 +947,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
         const res = await client.renamePeer({ id: myId!, session_token: mySession!, new_name });
         if (!res.ok) return { text: `Rename failed: ${res.error}`, isError: true };
         myName = res.name ?? new_name;
-        if (RUNTIME_IS_DROID) {
+        if (RUNTIME_USES_LAUNCH_CLAIM) {
           await bindDroidLaunchClaim({ peerId: myId!, peerName: myName, cwd: myCwd });
         }
         if (desktopWakeRegistration) {
@@ -1151,8 +1162,8 @@ async function main() {
   // through — it must be able to SEND — it just isn't the address peers use).
   let requestedName: string | undefined = defaultPeerName(myCwd, RUNTIME_PEER_TYPE, process.env.PEER_NAME || undefined);
   let requestDurable = !!process.env.PEER_NAME && process.env.AGENT_PEERS_EPHEMERAL !== "1";
-  const droidResumeClaim = RUNTIME_IS_DROID && process.env.AGENT_PEERS_DROID_LAUNCH_CLAIM_ID
-    ? await new DroidLaunchClaimStore().readClaim(process.env.AGENT_PEERS_DROID_LAUNCH_CLAIM_ID)
+  const droidResumeClaim = LAUNCH_CLAIM_RUNTIME && LAUNCH_CLAIM_ID
+    ? await new DroidLaunchClaimStore({ runtime: LAUNCH_CLAIM_RUNTIME }).readClaim(LAUNCH_CLAIM_ID)
     : null;
   let hermesClaims: HermesNameClaims | null = null;
   let hermesClaimedName: string | null = null;
@@ -1251,7 +1262,7 @@ async function main() {
       gitRoot: myGitRoot,
       tty,
     });
-  } else if (RUNTIME_IS_DROID) {
+  } else if (RUNTIME_USES_LAUNCH_CLAIM) {
     isWakeableSession = await bindDroidLaunchClaim({
       peerId: myId,
       peerName: myName,
@@ -1373,7 +1384,7 @@ async function main() {
             gitRoot: myGitRoot,
             tty,
           });
-        } else if (RUNTIME_IS_DROID) {
+        } else if (RUNTIME_USES_LAUNCH_CLAIM) {
           isWakeableSession = await bindDroidLaunchClaim({
             peerId: myId,
             peerName: myName,
@@ -1419,16 +1430,17 @@ async function bindDroidLaunchClaim(opts: {
   peerName: string;
   cwd: string;
 }): Promise<boolean> {
-  const claimId = process.env.AGENT_PEERS_DROID_LAUNCH_CLAIM_ID;
+  const claimId = LAUNCH_CLAIM_ID;
+  const runtime = LAUNCH_CLAIM_RUNTIME ?? "droid";
   if (!claimId) {
-    log("Droid registered without an ACP launch claim; this session is not wakeable");
+    log(`${RUNTIME_DISPLAY_NAME} registered without an ACP launch claim; this session is not wakeable`);
     return false;
   }
 
   try {
-    const rootDir = resolveStateDir({ runtime: "droid", kind: "coordination",
+    const rootDir = resolveStateDir({ runtime, kind: "coordination",
       rootDir: process.env.AGENT_PEERS_STATE_DIR });
-    const claims = new DroidLaunchClaimStore({ rootDir });
+    const claims = new DroidLaunchClaimStore({ rootDir, runtime });
     await claims.bindClaim(claimId, {
       peerId: opts.peerId,
       peerName: opts.peerName,
@@ -1438,7 +1450,7 @@ async function bindDroidLaunchClaim(opts: {
     log(`bound ACP launch claim ${claimId} to ${opts.peerName} (${opts.peerId})`);
     return true;
   } catch (error) {
-    log(`Droid ACP launch claim binding failed; session is not wakeable: ${error instanceof Error ? error.message : String(error)}`);
+    log(`${RUNTIME_DISPLAY_NAME} ACP launch claim binding failed; session is not wakeable: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
 }

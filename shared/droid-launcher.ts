@@ -11,7 +11,9 @@ import { resolveStateDir } from "./state-dir.ts";
 
 import {
   DroidAcpClient,
+  DROID_ACP_PROFILE,
   spawnDroidAcpTransport,
+  type AcpHostProfile,
   type AcpInitializeResult,
   type AcpMcpServer,
 } from "./droid-acp-client.ts";
@@ -35,9 +37,43 @@ export interface DroidLauncherOptions {
   model?: string;
   reasoningEffort?: string;
   autonomyLevel?: string;
+  /** Antigravity only: `agy` executable, ACP mode and thinking level. */
+  agyCommand?: string;
+  mode?: string;
+  thinkingLevel?: string;
   pollMs: number;
   claimTimeoutMs: number;
 }
+
+/** What differs between ACP-hosted peer runtimes. The wake controller, claim
+ * sources, retry ladder and shutdown are shared; Droid is the default. */
+export interface AcpLauncherProfile {
+  /** State-dir runtime, claim-store runtime and peer type. */
+  runtime: "droid" | "antigravity";
+  /** Harness word used for the default `<persona>-<repo>-<harness>` name. */
+  harness: string;
+  host: AcpHostProfile;
+  /** Executable override chosen on the command line, if any. */
+  executable(opts: DroidLauncherOptions): string | undefined;
+  /** MCP child env names for the launch claim and the coordination root. */
+  claimEnvName: string;
+  stateEnvName: string;
+  serverPath: string;
+  configureSession(client: DroidLauncherClient, sessionId: string, opts: DroidLauncherOptions): Promise<void>;
+  /** Optional readiness check before anything is spawned (e.g. signed in). */
+  preflight?(opts: DroidLauncherOptions): Promise<void>;
+}
+
+export const DROID_LAUNCHER_PROFILE: AcpLauncherProfile = {
+  runtime: "droid",
+  harness: "droid",
+  host: DROID_ACP_PROFILE,
+  executable: (opts) => opts.droidCommand,
+  claimEnvName: "AGENT_PEERS_DROID_LAUNCH_CLAIM_ID",
+  stateEnvName: "AGENT_PEERS_DROID_STATE_DIR",
+  serverPath: fileURLToPath(new URL("../droid-server.ts", import.meta.url)),
+  configureSession: (client, sessionId, opts) => configureDroidSession(client, sessionId, opts),
+};
 
 export class DroidLauncherUsageError extends Error {
   constructor(message: string) {
@@ -146,11 +182,13 @@ export function buildDroidMcpServer(opts: {
   peerName?: string;
   bunCommand?: string;
   serverPath?: string;
+  profile?: AcpLauncherProfile;
 }): AcpMcpServer {
+  const profile = opts.profile ?? DROID_LAUNCHER_PROFILE;
   const env: Array<{ name: string; value: string }> = [
-    { name: "AGENT_PEERS_RUNTIME", value: "droid" },
-    { name: "AGENT_PEERS_DROID_LAUNCH_CLAIM_ID", value: opts.claimId },
-    { name: "AGENT_PEERS_DROID_STATE_DIR", value: opts.stateRoot },
+    { name: "AGENT_PEERS_RUNTIME", value: profile.runtime },
+    { name: profile.claimEnvName, value: opts.claimId },
+    { name: profile.stateEnvName, value: opts.stateRoot },
     { name: "AGENT_PEERS_STATE_DIR", value: opts.stateRoot },
     { name: "AGENT_PEERS_DISABLE_TAB_TITLE", value: "1" },
   ];
@@ -167,7 +205,7 @@ export function buildDroidMcpServer(opts: {
   return {
     name: "agent-peers",
     command: opts.bunCommand ?? process.execPath,
-    args: [opts.serverPath ?? fileURLToPath(new URL("../droid-server.ts", import.meta.url))],
+    args: [opts.serverPath ?? profile.serverPath],
     env,
   };
 }
@@ -313,6 +351,8 @@ export interface DroidLauncherDependencies {
   shutdownGraceMs?: number;
   onReady?: (state: { peerId: string; peerName: string; sessionId: string }) => void;
   onWakeError?: (error: unknown) => void;
+  /** Runtime profile; defaults to Factory Droid. */
+  profile?: AcpLauncherProfile;
 }
 
 export interface DroidLauncherClient extends WakePromptClient {
@@ -326,6 +366,7 @@ export interface DroidLauncherClient extends WakePromptClient {
     capabilities: AcpInitializeResult["agentCapabilities"];
   }): Promise<string>;
   setConfigOption(sessionId: string, configId: string, value: string): Promise<void>;
+  setMode?(sessionId: string, modeId: string): Promise<void>;
   cancel(sessionId: string): Promise<void>;
   close(): void;
 }
@@ -335,16 +376,19 @@ export async function runDroidLauncher(
   deps: DroidLauncherDependencies = {},
   signal?: AbortSignal,
 ): Promise<number> {
-  const stateRoot = resolveStateDir({ runtime: "droid", kind: "coordination", rootDir: deps.stateRoot });
-  const claims = deps.claimStore ?? new DroidLaunchClaimStore({ rootDir: stateRoot });
+  const profile = deps.profile ?? DROID_LAUNCHER_PROFILE;
+  const stateRoot = resolveStateDir({ runtime: profile.runtime, kind: "coordination", rootDir: deps.stateRoot });
+  const claims = deps.claimStore ?? new DroidLaunchClaimStore({ rootDir: stateRoot, runtime: profile.runtime });
   const saved = opts.sessionId ? await claims.readSession(opts.sessionId) : null;
   const effectiveOpts: DroidLauncherOptions = {
     ...opts,
     cwd: opts.sessionId && opts.cwdExplicit === false && saved ? saved.cwd : opts.cwd,
     peerName: opts.peerName ?? saved?.peer_name ?? saved?.requested_peer_name ?? (process.env.PEER_NAME || undefined),
   };
-  effectiveOpts.peerName = await defaultPeerName(effectiveOpts.cwd, "droid", effectiveOpts.peerName);
+  effectiveOpts.peerName = await defaultPeerName(effectiveOpts.cwd, profile.harness, effectiveOpts.peerName);
   if (signal?.aborted) return 0;
+  // Before the claim exists, so a signed-out host leaves nothing behind.
+  await profile.preflight?.(effectiveOpts);
   const claim = await claims.createClaim({ cwd: effectiveOpts.cwd, requestedPeerName: effectiveOpts.peerName, previousPeerId: saved?.peer_id });
   let client: DroidLauncherClient | undefined;
   let sessionId: string | null = null;
@@ -362,21 +406,22 @@ export async function runDroidLauncher(
     if (effectiveOpts.sessionId) releaseSession = await acquireDroidSession(stateRoot, effectiveOpts.sessionId);
     client = deps.clientFactory?.(effectiveOpts) ?? new DroidAcpClient(spawnDroidAcpTransport({
       cwd: effectiveOpts.cwd,
-      droidCommand: effectiveOpts.droidCommand,
+      droidCommand: profile.executable(effectiveOpts),
+      profile: profile.host,
       onStderr: (chunk) => process.stderr.write(chunk),
-    }));
+    }), { profile: profile.host });
     // Subscribe once per process, not once per inbox poll. Otherwise each
     // idle day retains another 86,400 handlers on an unresolved exit promise.
     void client.closed.then((code) => { exitCode = code; stopped.abort(); });
     if (signal?.aborted) { abortHandler(); return 0; }
-    const initialized = await untilStopped(client.initialize(), stopped.signal);
+    const initialized = await untilStopped(client.initialize(), stopped.signal, profile.host.displayName);
     const mcpServer = deps.mcpServerFactory?.(claim.claim_id, stateRoot, effectiveOpts.peerName)
-      ?? buildDroidMcpServer({ claimId: claim.claim_id, stateRoot, peerName: effectiveOpts.peerName });
+      ?? buildDroidMcpServer({ claimId: claim.claim_id, stateRoot, peerName: effectiveOpts.peerName, profile });
     sessionId = await untilStopped(effectiveOpts.sessionId
       ? resumeExactSession(client, initialized, effectiveOpts.sessionId, effectiveOpts.cwd, [mcpServer])
-      : client.newSession({ cwd: effectiveOpts.cwd, mcpServers: [mcpServer] }), stopped.signal);
+      : client.newSession({ cwd: effectiveOpts.cwd, mcpServers: [mcpServer] }), stopped.signal, profile.host.displayName);
     if (!releaseSession) releaseSession = await acquireDroidSession(stateRoot, sessionId);
-    await untilStopped(configureDroidSession(client, sessionId, effectiveOpts), stopped.signal);
+    await untilStopped(profile.configureSession(client, sessionId, effectiveOpts), stopped.signal, profile.host.displayName);
     await claims.waitForBinding(claim.claim_id, { timeoutMs: effectiveOpts.claimTimeoutMs, signal: stopped.signal });
     // The MCP child can bind during session/new or session/resume. Finalize
     // the session id only after observing that completed write so the two
@@ -391,7 +436,7 @@ export async function runDroidLauncher(
 
     while (!stopped.signal.aborted) {
       await controller.pollOnce();
-      await untilStopped(sleep(effectiveOpts.pollMs), stopped.signal).catch(() => {});
+      await untilStopped(sleep(effectiveOpts.pollMs), stopped.signal, profile.host.displayName).catch(() => {});
     }
     return signal?.aborted ? 0 : exitCode ?? 1;
   } catch (error) {
@@ -412,9 +457,9 @@ export async function runDroidLauncher(
   }
 }
 
-function untilStopped<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+function untilStopped<T>(operation: Promise<T>, signal: AbortSignal, hostName = "Factory Droid"): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const abort = () => reject(new Error("Factory Droid ACP host stopped"));
+    const abort = () => reject(new Error(`${hostName} ACP host stopped`));
     signal.addEventListener("abort", abort, { once: true });
     operation.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
     if (signal.aborted) abort();

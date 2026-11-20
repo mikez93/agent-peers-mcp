@@ -55,3 +55,14 @@ test("openclaw has its own root for inbox and coordination, with no Codex inbox 
   expect(resolveStateDir({ runtime: "openclaw", kind: "coordination", env: { ...env, AGENT_PEERS_STATE_DIR: "/one" } })).toBe("/one");
   expect(resolveStateDir({ runtime: "openclaw", env: { ...env, AGENT_PEERS_OPENCLAW_STATE_DIR: "/oc" } })).toBe("/oc");
 });
+
+test("antigravity has its own coordination root and follows droid's inbox fallback", () => {
+  const env = { HOME: "/home/test", AGENT_PEERS_CODEX_STATE_DIR: "/codex" };
+  expect(resolveStateDir({ runtime: "antigravity", kind: "coordination", env })).toBe("/home/test/.agent-peers-antigravity");
+  expect(resolveStateDir({ runtime: "antigravity", kind: "coordination", env: { ...env, AGENT_PEERS_ANTIGRAVITY_STATE_DIR: "/agy" } })).toBe("/agy");
+  // Coordination ignores the inbox override, as for droid; the launcher sets both.
+  expect(resolveStateDir({ runtime: "antigravity", kind: "coordination", env: { ...env, AGENT_PEERS_STATE_DIR: "/inbox" } })).toBe("/home/test/.agent-peers-antigravity");
+  expect(resolveStateDir({ env: { ...env, AGENT_PEERS_RUNTIME: "antigravity", AGENT_PEERS_STATE_DIR: "/inbox" } })).toBe("/inbox");
+  expect(resolveStateDir({ env: { ...env, AGENT_PEERS_RUNTIME: "antigravity" } })).toBe("/codex");
+  expect(resolveStateDir({ env: { HOME: "/home/test", AGENT_PEERS_RUNTIME: "antigravity" } })).toBe("/home/test/.agent-peers-antigravity");
+});

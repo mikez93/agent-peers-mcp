@@ -53,6 +53,28 @@ export interface AcpPromptResult {
   [key: string]: unknown;
 }
 
+/** What differs between ACP hosts. The protocol logic is shared; Droid is the
+ * default profile, so existing Droid callers behave exactly as before. */
+export interface AcpHostProfile {
+  /** Used in error strings ("Factory Droid", "Antigravity"). */
+  displayName: string;
+  clientInfo: { name: string; title: string; version: string };
+  /** Default executable and its ACP arguments. */
+  command: string;
+  args: string[];
+  /** Returns the optionId to select for a headless permission request, or
+   * null to cancel it. Must fail closed for anything it does not recognize. */
+  permissionOption(params: unknown): string | null;
+}
+
+export const DROID_ACP_PROFILE: AcpHostProfile = {
+  displayName: "Factory Droid",
+  clientInfo: { name: "agent-peers-droid", title: "Agent Peers Droid", version: "0.1.2" },
+  command: "droid",
+  args: ["exec", "--output-format", "acp"],
+  permissionOption: allowedAgentPeersPermissionOption,
+};
+
 export class AcpRpcError extends Error {
   constructor(
     message: string,
@@ -73,14 +95,17 @@ export class DroidAcpClient {
   private promptInFlight = false;
   private initialized = false;
   private readerFailure: Error | null = null;
+  private readonly profile: AcpHostProfile;
 
   constructor(
     private readonly transport: AcpLineTransport,
     private readonly opts: {
       requestTimeoutMs?: number;
       onNotification?: (method: string, params: unknown) => void;
+      profile?: AcpHostProfile;
     } = {},
   ) {
+    this.profile = opts.profile ?? DROID_ACP_PROFILE;
     this.closed = transport.closed;
     void this.readLoop();
   }
@@ -96,18 +121,14 @@ export class DroidAcpClient {
       // The headless wake client intentionally exposes no terminal, filesystem,
       // auth-terminal, or elicitation surface. Droid receives tools through MCP.
       clientCapabilities: {},
-      clientInfo: {
-        name: "agent-peers-droid",
-        title: "Agent Peers Droid",
-        version: "0.1.2",
-      },
+      clientInfo: this.profile.clientInfo,
     }) as AcpInitializeResult;
 
     if (!result || result.protocolVersion !== 1) {
-      throw new Error(`Factory Droid negotiated unsupported ACP protocol ${String(result?.protocolVersion)}`);
+      throw new Error(`${this.profile.displayName} negotiated unsupported ACP protocol ${String(result?.protocolVersion)}`);
     }
     if (!result.agentCapabilities || typeof result.agentCapabilities !== "object") {
-      throw new Error("Factory Droid initialize response omitted agentCapabilities");
+      throw new Error(`${this.profile.displayName} initialize response omitted agentCapabilities`);
     }
     this.initialized = true;
     return result;
@@ -117,7 +138,7 @@ export class DroidAcpClient {
     this.requireInitialized();
     const result = await this.request("session/new", opts) as { sessionId?: unknown };
     if (typeof result?.sessionId !== "string" || result.sessionId.length === 0) {
-      throw new Error("Factory Droid session/new response omitted sessionId");
+      throw new Error(`${this.profile.displayName} session/new response omitted sessionId`);
     }
     return result.sessionId;
   }
@@ -130,10 +151,10 @@ export class DroidAcpClient {
   }): Promise<string> {
     this.requireInitialized();
     if (opts.capabilities.loadSession !== true) {
-      throw new Error("Factory Droid does not advertise ACP loadSession support");
+      throw new Error(`${this.profile.displayName} does not advertise ACP loadSession support`);
     }
     if (!opts.capabilities.sessionCapabilities?.resume) {
-      throw new Error("Factory Droid does not advertise ACP session/resume");
+      throw new Error(`${this.profile.displayName} does not advertise ACP session/resume`);
     }
     await this.request("session/resume", {
       sessionId: opts.sessionId,
@@ -145,7 +166,7 @@ export class DroidAcpClient {
 
   async prompt(sessionId: string, text: string): Promise<AcpPromptResult> {
     this.requireInitialized();
-    if (this.promptInFlight) throw new Error("Factory Droid ACP session is busy");
+    if (this.promptInFlight) throw new Error(`${this.profile.displayName} ACP session is busy`);
     this.promptInFlight = true;
     try {
       return await this.request("session/prompt", {
@@ -164,6 +185,12 @@ export class DroidAcpClient {
   async setConfigOption(sessionId: string, configId: string, value: string): Promise<void> {
     this.requireInitialized();
     await this.request("session/set_config_option", { sessionId, configId, value });
+  }
+
+  /** Standard ACP mode switch. Antigravity modes: default|accept-edits|auto|plan. */
+  async setMode(sessionId: string, modeId: string): Promise<void> {
+    this.requireInitialized();
+    await this.request("session/set_mode", { sessionId, modeId });
   }
 
   close(): void {
@@ -222,11 +249,11 @@ export class DroidAcpClient {
         try {
           message = JSON.parse(line);
         } catch {
-          throw new Error("Factory Droid emitted a non-JSON ACP stdout line");
+          throw new Error(`${this.profile.displayName} emitted a non-JSON ACP stdout line`);
         }
         await this.handleMessage(message);
       }
-      throw new Error("Factory Droid ACP stdout closed");
+      throw new Error(`${this.profile.displayName} ACP stdout closed`);
     } catch (error) {
       this.readerFailure = error instanceof Error ? error : new Error(String(error));
       for (const pending of this.pending.values()) pending.reject(this.readerFailure);
@@ -239,9 +266,9 @@ export class DroidAcpClient {
   }
 
   private async handleMessage(message: unknown): Promise<void> {
-    if (!message || typeof message !== "object") throw new Error("Factory Droid emitted an invalid ACP message");
+    if (!message || typeof message !== "object") throw new Error(`${this.profile.displayName} emitted an invalid ACP message`);
     const rpc = message as Partial<JsonRpcResponse & JsonRpcRequest>;
-    if (rpc.jsonrpc !== "2.0") throw new Error("Factory Droid emitted an unsupported JSON-RPC version");
+    if (rpc.jsonrpc !== "2.0") throw new Error(`${this.profile.displayName} emitted an unsupported JSON-RPC version`);
 
     if (rpc.id !== undefined && typeof rpc.method === "string") {
       await this.handleServerRequest(rpc as JsonRpcRequest);
@@ -251,7 +278,7 @@ export class DroidAcpClient {
       const pending = this.pending.get(rpc.id);
       if (!pending) return;
       if (rpc.error) {
-        pending.reject(new AcpRpcError(rpc.error.message || "Factory Droid ACP request failed", rpc.error.code));
+        pending.reject(new AcpRpcError(rpc.error.message || `${this.profile.displayName} ACP request failed`, rpc.error.code));
       } else {
         pending.resolve(rpc.result);
       }
@@ -266,7 +293,7 @@ export class DroidAcpClient {
     // only for this invocation. Every filesystem, shell, browser, connector,
     // and unknown tool remains denied; elicitation also fails closed.
     if (request.method === "session/request_permission") {
-      const optionId = allowedAgentPeersPermissionOption(request.params);
+      const optionId = this.profile.permissionOption(request.params);
       await this.send({
         jsonrpc: "2.0",
         id: request.id,
@@ -312,17 +339,20 @@ function allowedAgentPeersPermissionOption(params: unknown): string | null {
 
 export function spawnDroidAcpTransport(opts: {
   cwd: string;
+  /** Executable override (`--droid PATH` / `--agy PATH`). */
   droidCommand?: string;
+  profile?: AcpHostProfile;
   env?: NodeJS.ProcessEnv;
   onStderr?: (chunk: string) => void;
   shutdownGraceMs?: number;
 }): AcpLineTransport {
-  const child = spawn(opts.droidCommand ?? "droid", ["exec", "--output-format", "acp"], {
+  const profile = opts.profile ?? DROID_ACP_PROFILE;
+  const child = spawn(opts.droidCommand ?? profile.command, profile.args, {
     cwd: opts.cwd,
     env: opts.env ?? process.env,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  return new ChildProcessAcpTransport(child, opts.onStderr, opts.shutdownGraceMs);
+  return new ChildProcessAcpTransport(child, opts.onStderr, opts.shutdownGraceMs, profile.displayName);
 }
 
 class ChildProcessAcpTransport implements AcpLineTransport {
@@ -336,6 +366,7 @@ class ChildProcessAcpTransport implements AcpLineTransport {
     private readonly child: ChildProcessWithoutNullStreams,
     onStderr?: (chunk: string) => void,
     private readonly shutdownGraceMs = 2_000,
+    private readonly displayName = DROID_ACP_PROFILE.displayName,
   ) {
     this.closed = new Promise<number>((resolve) => {
       const finish = (code: number) => {
@@ -364,7 +395,7 @@ class ChildProcessAcpTransport implements AcpLineTransport {
 
   async writeLine(line: string): Promise<void> {
     if (this.processError) throw this.processError;
-    if (this.closedByClient || this.exited || this.child.stdin.destroyed) throw new Error("Factory Droid ACP stdin is closed");
+    if (this.closedByClient || this.exited || this.child.stdin.destroyed) throw new Error(`${this.displayName} ACP stdin is closed`);
     await new Promise<void>((resolve, reject) => {
       this.child.stdin.write(`${line}\n`, (error) => error ? reject(error) : resolve());
     });
