@@ -56,3 +56,4 @@ The launcher starts agy in `accept-edits` mode, Mike's default: Antigravity edit
 | agypeer with the user-level entry present | Started, registered and replied |
 | Accept-edits mode (the default), idle wake | Replied with no permission prompts and restarted the waiter |
 | Mail sent while the chat was closed and reopened | Picked up and answered in the new chat's first turn |
+| Studio and omarchy over SSH, agy at its sign-in screen | Shell function, launch claim, MCP binding and the waiter's wake note all worked, and closing the window removed the claim; the agent's own turn needs a signed-in agy |
