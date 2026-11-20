@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { armPrompt, interactiveSessionId, launchPlan, mergePermissionRules, permissionRules, readNotified, waitForNewMail, WAIT_COMMAND } from "../agy-interactive.ts";
+import { armPrompt, desiredMcpEntry, interactiveSessionId, launchPlan, mcpEntryCurrent, mergePermissionRules, permissionRules, readNotified, waitForNewMail, WAIT_COMMAND } from "../agy-interactive.ts";
 import { acquireDroidSession } from "../shared/droid-session-owner.ts";
 import { DroidLaunchClaimStore } from "../shared/droid-launch-claims.ts";
 
@@ -38,6 +38,22 @@ test("armPrompt starts the waiter in the background and keeps the user's own pro
   expect(withPrompt).toContain(WAIT_COMMAND);
   expect(withPrompt.endsWith("Then: review the diff")).toBe(true);
   expect(withPrompt).not.toContain("wake is on");
+});
+
+test("setup skips agy mcp add when the stored agent-peers entry already matches", () => {
+  const desired = desiredMcpEntry("/bin/bun", "/repo", "/state");
+  // The shape agy itself writes, including the user-owned disabled flag.
+  const stored = {
+    args: ["/repo/agy-server.ts"],
+    command: "/bin/bun",
+    disabled: true,
+    env: { AGENT_PEERS_STATE_DIR: "/state", AGENT_PEERS_AGY_USER_CONFIG: "1" },
+  };
+  expect(mcpEntryCurrent(stored, desired)).toBe(true);
+  expect(mcpEntryCurrent({ ...stored, command: "/other/bun" }, desired)).toBe(false);
+  expect(mcpEntryCurrent({ ...stored, env: { AGENT_PEERS_STATE_DIR: "/state" } }, desired)).toBe(false);
+  expect(mcpEntryCurrent({ ...stored, env: { ...stored.env, EXTRA: "1" } }, desired)).toBe(false);
+  expect(mcpEntryCurrent(undefined, desired)).toBe(false);
 });
 
 test("mergePermissionRules adds missing rules once and keeps the user's settings", () => {

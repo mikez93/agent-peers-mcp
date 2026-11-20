@@ -22,7 +22,7 @@
 // peer's mailbox.
 
 import { realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { chmod, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DroidLaunchClaimStore } from "./shared/droid-launch-claims.ts";
@@ -216,15 +216,53 @@ export function mergePermissionRules(settings: Record<string, unknown>, rules: s
   return { settings: { ...settings, permissions: { ...permissions, allow: [...allow, ...missing] } }, changed: true };
 }
 
+/** The agent-peers entry agy stores in mcp_config.json after `agy mcp add`. */
+export function desiredMcpEntry(bun: string, repoRoot: string, stateRoot: string) {
+  return {
+    command: bun,
+    args: [join(repoRoot, "agy-server.ts")],
+    env: { AGENT_PEERS_AGY_USER_CONFIG: "1", AGENT_PEERS_STATE_DIR: stateRoot },
+  };
+}
+
+/** True when the stored entry already runs the desired command (enabled state is the user's). */
+export function mcpEntryCurrent(stored: unknown, desired: ReturnType<typeof desiredMcpEntry>): boolean {
+  if (!stored || typeof stored !== "object") return false;
+  const entry = stored as Record<string, unknown>;
+  const env = (entry.env && typeof entry.env === "object" ? entry.env : {}) as Record<string, unknown>;
+  return entry.command === desired.command
+    && JSON.stringify(entry.args) === JSON.stringify(desired.args)
+    && Object.keys(env).length === Object.keys(desired.env).length
+    && Object.entries(desired.env).every(([key, value]) => env[key] === value);
+}
+
 async function setup(): Promise<number> {
   const stateRoot = agyStateRoot();
-  const add = Bun.spawnSync(["agy", "mcp", "add",
-    "--env", `AGENT_PEERS_STATE_DIR=${stateRoot}`,
-    "--env", "AGENT_PEERS_AGY_USER_CONFIG=1",
-    "agent-peers", process.execPath, join(REPO_ROOT, "agy-server.ts")], { stdout: "pipe", stderr: "pipe" });
-  if (add.exitCode !== 0) {
-    console.log(`agy setup: agy mcp add failed: ${add.stderr.toString().trim() || add.stdout.toString().trim()}`);
-    return 1;
+  const mcpPath = join(homedir(), ".gemini", "config", "mcp_config.json");
+  const desired = desiredMcpEntry(process.execPath, REPO_ROOT, stateRoot);
+  let stored: unknown;
+  let mode: number | undefined;
+  try {
+    const parsed = JSON.parse(await readFile(mcpPath, "utf8")) as { mcpServers?: Record<string, unknown> };
+    stored = parsed.mcpServers?.["agent-peers"];
+    mode = (await stat(mcpPath)).mode & 0o777;
+  } catch {
+    // No config yet, or unreadable: `agy mcp add` creates or repairs it.
+  }
+  // `agy mcp add` rewrites the whole file as 0644. The fleet keeps it 0600
+  // because it also holds GBrain bearer tokens, so only add when the entry
+  // changed, and put the previous mode back afterwards.
+  const entryCurrent = mcpEntryCurrent(stored, desired);
+  if (!entryCurrent) {
+    const add = Bun.spawnSync(["agy", "mcp", "add",
+      "--env", `AGENT_PEERS_STATE_DIR=${stateRoot}`,
+      "--env", "AGENT_PEERS_AGY_USER_CONFIG=1",
+      "agent-peers", desired.command, ...desired.args], { stdout: "pipe", stderr: "pipe" });
+    if (add.exitCode !== 0) {
+      console.log(`agy setup: agy mcp add failed: ${add.stderr.toString().trim() || add.stdout.toString().trim()}`);
+      return 1;
+    }
+    if (mode !== undefined) await chmod(mcpPath, mode).catch(() => {});
   }
   const settingsPath = join(homedir(), ".gemini", "antigravity-cli", "settings.json");
   let current: Record<string, unknown> = {};
@@ -239,7 +277,7 @@ async function setup(): Promise<number> {
   }
   const merged = mergePermissionRules(current, permissionRules(REPO_ROOT, stateRoot));
   if (merged.changed) await Bun.write(settingsPath, `${JSON.stringify(merged.settings, null, 2)}\n`);
-  console.log(`agy setup: agent-peers MCP entry current; permission rules ${merged.changed ? "added" : "already present"}`);
+  console.log(`agy setup: agent-peers MCP entry ${entryCurrent ? "already current" : "updated"}; permission rules ${merged.changed ? "added" : "already present"}`);
   return 0;
 }
 
