@@ -106,6 +106,23 @@ export async function configureAgySession(
   else await client.setConfigOption(sessionId, "mode", mode);
 }
 
+/** SSH session markers that make agy skip the OS credential store. */
+export const AGY_SSH_MARKERS = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] as const;
+
+/**
+ * The environment to start agy with. agy 1.5.13 doesn't try the OS credential
+ * store when it sees SSH variables, so on omarchy an agy started from an SSH
+ * shell looked signed out while gnome-keyring on the same machine held a valid
+ * sign-in; without them it reads it (2026-11-20). Nothing is copied: the
+ * keyring still decides access, and macOS still refuses an SSH session its
+ * login keychain, so this changes nothing there.
+ */
+export function agyEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const clean = { ...env };
+  for (const name of AGY_SSH_MARKERS) delete clean[name];
+  return clean;
+}
+
 export class AgySignedOutError extends Error {
   constructor(message: string) {
     super(message);
@@ -130,14 +147,14 @@ export async function checkAgySignedIn(
   }
   if (result.code === 0) return;
   if (/sign in/i.test(result.output)) {
-    throw new AgySignedOutError("agy can't read its Google sign-in from this session. Over SSH or in a sandboxed shell it can't reach the keychain or keyring, so it looks signed out even when it isn't; start agypeer from a terminal in the desktop session. If agy is signed out there too, run `agy` once to sign in.");
+    throw new AgySignedOutError("agy can't read its Google sign-in from this session. On a Mac, an SSH session or a sandboxed shell can't open the login keychain, so agy looks signed out even when it isn't; start agypeer from a terminal in the desktop session (an Orca terminal works). If agy is signed out there too, run `agy` once to sign in.");
   }
   const line = result.output.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? `exit ${result.code}`;
   throw new Error(`agy models failed before launch: ${line}`);
 }
 
 async function runForOutput(cmd: string[]): Promise<{ code: number; output: string }> {
-  const child = Bun.spawn(cmd, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(cmd, { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: agyEnv() });
   const timer = setTimeout(() => child.kill(), 30_000);
   try {
     const [stdout, stderr, code] = await Promise.all([
@@ -162,6 +179,7 @@ export const AGY_LAUNCHER_PROFILE: AcpLauncherProfile = {
   configureSession: configureAgySession,
   preflight: (opts) => checkAgySignedIn(opts.agyCommand ?? "agy"),
   shareMcpEnvWithHost: true,
+  hostEnvOmit: AGY_SSH_MARKERS,
 };
 
 /** `agypeer [start [name] [cwd]] | agypeer resume <session-id> [name] [cwd]`. */

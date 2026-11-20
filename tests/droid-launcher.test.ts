@@ -9,6 +9,7 @@ import {
   DROID_WAKE_PROMPT,
   DroidWakeController,
   buildDroidMcpServer,
+  hostEnvWithMcpEnv,
   parseDroidLauncherArgs,
   runDroidLauncher,
   type BodylessWakeState,
@@ -521,10 +522,29 @@ async function writeMetadata(root: string, peerId: string, ids: number[]): Promi
 
 import {
   AGY_LAUNCHER_PROFILE,
+  AGY_SSH_MARKERS,
   AgySignedOutError,
+  agyEnv,
   checkAgySignedIn,
   parseAgyLauncherArgs,
 } from "../shared/agy-profile.ts";
+
+test("agy starts without SSH markers so it tries the OS credential store", () => {
+  const env = agyEnv({ HOME: "/h", SSH_CONNECTION: "1 2 3 4", SSH_CLIENT: "1 2 3", SSH_TTY: "/dev/pts/1", PATH: "/bin" });
+  expect(env).toEqual({ HOME: "/h", PATH: "/bin" });
+  const saved = Object.fromEntries(AGY_SSH_MARKERS.map((name) => [name, process.env[name]]));
+  try {
+    for (const name of AGY_SSH_MARKERS) process.env[name] = "set";
+    const host = hostEnvWithMcpEnv("claim-1", "/state", "peer", AGY_LAUNCHER_PROFILE);
+    for (const name of AGY_SSH_MARKERS) expect(host[name]).toBeUndefined();
+    expect(host[AGY_LAUNCHER_PROFILE.claimEnvName]).toBe("claim-1");
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
 
 const AGY_TEST_PROFILE = { ...AGY_LAUNCHER_PROFILE, preflight: undefined };
 

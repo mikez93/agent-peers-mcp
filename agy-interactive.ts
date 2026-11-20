@@ -27,7 +27,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DroidLaunchClaimStore } from "./shared/droid-launch-claims.ts";
 import { FileDroidWakeMetadataSource } from "./shared/droid-launcher.ts";
-import { AGY_DEFAULT_MODE, AGY_DEFAULT_MODEL, AGY_DEFAULT_THINKING } from "./shared/agy-profile.ts";
+import { AGY_DEFAULT_MODE, AGY_DEFAULT_MODEL, AGY_DEFAULT_THINKING, agyEnv } from "./shared/agy-profile.ts";
 import { atomicWriteJson } from "./shared/file-state.ts";
 import { resolveStateDir } from "./shared/state-dir.ts";
 
@@ -165,7 +165,8 @@ export function armPrompt(userPrompt?: string, waitCommand: string = WAIT_COMMAN
 }
 
 async function runAgy(args: string[], env: NodeJS.ProcessEnv): Promise<number> {
-  const child = Bun.spawn(["agy", ...args], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env });
+  // agyEnv drops the SSH markers that make agy skip the OS credential store.
+  const child = Bun.spawn(["agy", ...args], { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: agyEnv(env) });
   // The terminal delivers Ctrl-C to agy itself; this wrapper only waits.
   const ignore = () => {};
   const forward = (signal: NodeJS.Signals) => () => { try { child.kill(signal); } catch {} };

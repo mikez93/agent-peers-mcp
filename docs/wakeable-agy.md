@@ -78,15 +78,20 @@ Before anything starts, `agypeer` runs `agy models`. When that can't find a
 Google sign-in, it exits with:
 
 ```
-error: agy can't read its Google sign-in from this session. Over SSH or in a sandboxed shell it can't reach the keychain or keyring, so it looks signed out even when it isn't; start agypeer from a terminal in the desktop session. If agy is signed out there too, run `agy` once to sign in.
+error: agy can't read its Google sign-in from this session. On a Mac, an SSH session or a sandboxed shell can't open the login keychain, so agy looks signed out even when it isn't; start agypeer from a terminal in the desktop session (an Orca terminal works). If agy is signed out there too, run `agy` once to sign in.
 ```
 
 This usually isn't a real sign-out. agy keeps its token in the macOS keychain
-or the Linux keyring, which SSH sessions and sandboxed agent shells often can't
-read; on 2026-11-20 both the Studio and omarchy looked signed out over SSH while
-Mike's desktop terminals were signed in. Start agypeer from a desktop terminal.
-If it is signed out there too, run `agy` once to sign in. Don't copy credential
-files between machines.
+or the Linux Secret Service (gnome-keyring on omarchy). agy 1.5.13 doesn't try
+that store when it sees `SSH_CONNECTION`, `SSH_CLIENT` or `SSH_TTY`, so on
+2026-11-20 both the Studio and omarchy looked signed out over SSH while Mike's
+desktop terminals were signed in. The launchers now start agy without those
+variables (`agyEnv` in `shared/agy-profile.ts`), which fixes omarchy: the
+keyring there is unlocked for Mike's login and still decides access. A Mac
+still refuses an SSH session its login keychain, so on the Studio start
+agypeer from a desktop terminal, such as an Orca terminal. If agy is signed out
+there too, run `agy` once to sign in. Don't copy credential files between
+machines.
 
 ## Permissions and modes
 

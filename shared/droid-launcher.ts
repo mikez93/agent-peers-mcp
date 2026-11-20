@@ -67,6 +67,9 @@ export interface AcpLauncherProfile {
    * same-named server from its user config, which inherits the host's env;
    * with this, whichever copy runs binds this launcher's claim. */
   shareMcpEnvWithHost?: boolean;
+  /** Variables removed from the host env passed to the child (used with
+   * shareMcpEnvWithHost; agy drops SSH markers, see agyEnv). */
+  hostEnvOmit?: readonly string[];
 }
 
 export const DROID_LAUNCHER_PROFILE: AcpLauncherProfile = {
@@ -378,7 +381,9 @@ export interface DroidLauncherClient extends WakePromptClient {
 
 export function hostEnvWithMcpEnv(claimId: string, stateRoot: string, peerName: string | undefined, profile: AcpLauncherProfile): NodeJS.ProcessEnv {
   const server = buildDroidMcpServer({ claimId, stateRoot, peerName, profile });
-  return { ...process.env, ...Object.fromEntries(server.env.map(({ name, value }) => [name, value])) };
+  const env: NodeJS.ProcessEnv = { ...process.env, ...Object.fromEntries(server.env.map(({ name, value }) => [name, value])) };
+  for (const name of profile.hostEnvOmit ?? []) delete env[name];
+  return env;
 }
 
 export async function runDroidLauncher(
