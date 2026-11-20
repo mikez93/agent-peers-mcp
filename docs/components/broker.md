@@ -69,7 +69,7 @@ enters only through the `/federation/*` routes, which Tailscale Serve exposes se
 `tty`, `summary`, `session_token` (NOT NULL), `registered_at`, `started_at`, `last_seen`,
 `durable` (INTEGER, default 0), and four nullable text columns added by migrations: `host`,
 `persona`, `capabilities`, `mailbox_owner`. `peer_type` has a CHECK constraint admitting exactly
-five values: `claude`, `codex`, `hermes`, `droid`, `openclaw`. `started_at` is working-session
+six values: `claude`, `codex`, `hermes`, `droid`, `openclaw`, `antigravity`. `started_at` is working-session
 age; `last_seen` is only the liveness heartbeat. `host` is filled with `os.hostname()` on
 registration, and a legacy `NULL` means unknown. `persona` is the AGENTS.md persona slug.
 `capabilities` is a comma list of feature tags the client implements (for example `chat-mail`).
@@ -119,11 +119,15 @@ startups serialize, and each is idempotent.
 8. `migrate_v3_addressing`: adds `persona`, `capabilities`, `mailbox_owner`, `messages.to_chat`,
    `messages.from_chat`, the `chat_routes` table and its indexes. Additive only, so an older broker
    can still open the database after a rollback.
-9. `migrate_peers_add_openclaw_peer_type`: **must stay last.** It widens the CHECK to admit
+9. `migrate_peers_add_openclaw_peer_type`: widens the CHECK to admit
    `'openclaw'` by copying the table's own stored `CREATE TABLE` text with only the CHECK list
    changed and copying rows by the live column list, so every column added by any earlier migration
    survives. It verifies the row count and rolls back on a mismatch, refuses to run if it cannot
    recognize the stored definition, and recreates the indexes that existed.
+10. `migrate_peers_add_antigravity_peer_type` (2026-11-20): **must stay last.** The same generic
+   rebuild (`migrate_peers_add_peer_type`) for `'antigravity'`. It is a no-op on a fresh database,
+   whose CHECK already lists it. Older brokers can still open the result, because the literals
+   they probe for remain in the CHECK list.
 
 Migrations 1, 2 and 7 rebuild `peers` from a column list written in code, so they know nothing of
 the v3 columns. They are safe only because they run before `migrate_v3_addressing`. The
@@ -270,7 +274,7 @@ classes". `generation` lets the reaper detect a broker restart between classify 
 
 The protected set (`buildProtectedPidSet`) unions two anchor sources: pids from the `peers` table
 that are still alive, and any live process whose command matches
-`agent-peers-mcp/(claude|codex|hermes|droid|openclaw)-server\.ts`. The second source exists because
+`agent-peers-mcp/(claude|codex|hermes|droid|openclaw|agy)-server\.ts`. The second source exists because
 the first expires after 60s without a heartbeat. From each anchor it protects the anchor, its parent
 (the agent host), and, only for **non-GUI** hosts, the host's entire child subtree. GUI hosts
 (`.app/Contents/MacOS/`) are not expanded because ChatGPT.app parents about 200 MCP servers and the

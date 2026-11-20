@@ -14,9 +14,9 @@ Supporting (read for accuracy, documented elsewhere): `codex-server.ts`, `cli.ts
 
 Operator-level companions: [`docs/wakeable-codex.md`](../wakeable-codex.md) (design rationale and
 security model) and [`docs/wake-daemon.md`](../wake-daemon.md) (log reading and tuning). This file is the
-implementation-level reference. Hermes, OpenClaw, Claude and Droid wakes are separate:
+implementation-level reference. Hermes, OpenClaw, Claude, Droid and Antigravity wakes are separate:
 [hermes-desktop-wake.md](hermes-desktop-wake.md), [openclaw-peer.md](openclaw-peer.md),
-[../wakeable-droid.md](../wakeable-droid.md).
+[../wakeable-droid.md](../wakeable-droid.md), [../wakeable-agy.md](../wakeable-agy.md).
 
 ---
 

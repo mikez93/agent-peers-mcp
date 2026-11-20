@@ -1,8 +1,8 @@
 # agent-peers-mcp
 
-### Your Claude Code, Codex CLI, Hermes Agent, Factory Droid, and OpenClaw agents, working as colleagues.
+### Your Claude Code, Codex CLI, Hermes Agent, Factory Droid, Antigravity, and OpenClaw agents, working as colleagues.
 
-Run Claude, Codex, Hermes, Factory Droid, or OpenClaw agents in separate terminals or desktop apps and they **discover each other**, **message each other**, and **take initiative**. Codex finds something Claude should know → it pings Claude. Droid changes an interface Codex depends on → it pings Codex before the build breaks. No cloud. No API keys between them. Each machine runs a tiny SQLite broker on localhost, and with federation switched on, machines on your Tailscale network can reach each other's agents too.
+Run Claude, Codex, Hermes, Factory Droid, Antigravity, or OpenClaw agents in separate terminals or desktop apps and they **discover each other**, **message each other**, and **take initiative**. Codex finds something Claude should know → it pings Claude. Droid changes an interface Codex depends on → it pings Codex before the build breaks. No cloud. No API keys between them. Each machine runs a tiny SQLite broker on localhost, and with federation switched on, machines on your Tailscale network can reach each other's agents too.
 ```
   Terminal 1 (Claude)           Terminal 2 (Codex)           Terminal 3 (Claude)
   ┌──────────────────┐          ┌──────────────────┐         ┌──────────────────┐
@@ -47,6 +47,7 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 | 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Stock Codex CLI has no mid-task push channel for MCP servers, so a plain `codex` session picks up peer messages on its next agent-peers tool call. Its shared instructions tell it to call `check_messages` at the start of every user turn, which bounds delivery latency to one user turn. A durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600) means Codex never loses a message, even across a restart. A Codex session launched through `codex-peer`, or opened as a Codex desktop chat, is also **woken from idle**, and mail for a chat that is mid-task is appended to its running turn ([details](#wakeable-codex-peers-idle-wake-no-fork)). |
 | 🪽 **Hermes ↔ any peer** | Hermes registers as a first-class `hermes` peer through `hermes-server.ts`: one durable peer per profile (for example `ezra-hermes`), with the same durable polling and authoritative `[PEER INBOX]` delivery used by Codex. Mail can be addressed to a single Hermes chat (`ezra-hermes/Instagram ads`). A chat open in Hermes Desktop can be woken by a plugin, and a closed chat by a gateway driver; both are opt-in and off until you enable them ([details](#hermes-chats-mail-and-wake)). |
 | 🏭 **Factory Droid ↔ any peer** | `droidpeer` opens Factory's native Droid terminal UI as a managed `droid` peer. When mail arrives while Droid is idle, the launcher starts a turn with a bodyless wake prompt, and Droid retrieves the real message through `check_messages`. Ordinary `droid` sessions are not wakeable. |
+| 🛰️ **Antigravity ↔ any peer** | `agypeer` hosts a headless Antigravity session (`agy acp`) as a managed `antigravity` peer, with the same bodyless wake as headless Droid ([details](#wakeable-antigravity-peers)). Your interactive `agy` is not wakeable. |
 | 🦞 **OpenClaw ↔ any peer** | An OpenClaw agent joins as an `openclaw` peer through an MCP server entry, and mail can wake its main session ([details](#openclaw)). |
 | 🌐 **Across machines** | With federation on, `name@host` addresses an agent on another machine, and `list_peers` and `list_chats` show remote agents too. Each machine stays authoritative for its own peers and mail ([details](#across-machines-federation)). |
 | 👥 **Colleague behavior protocol** | Shared prompt imported by every MCP server: don't auto-reply "got it", investigate before answering, push back on disagreement, ping proactively when you find something the other peer cares about, close every loop. |
@@ -208,6 +209,7 @@ Open a new terminal and run the launcher for your agent:
 | **Claude Code** | `agentpeers` (the Claude desktop app joins without a launcher) |
 | **Codex** | `codex` joins the network; `codex-peer` joins and is wakeable from idle |
 | **Factory Droid** | `droidpeer` |
+| **Antigravity** | `agypeer` (headless; talk to it through Agent Peers) |
 | **Hermes** | Start Hermes with the MCP configured as above |
 | **OpenClaw** | The OpenClaw gateway loads the MCP entry ([setup](docs/components/openclaw-peer.md)) |
 
@@ -271,7 +273,7 @@ Inspect and control the broker from a terminal (no agent session needed). Run th
 ```bash
 bun cli.ts status                        # Broker health, peer list, and wakeable-peer status
 bun cli.ts peers                         # Peers only
-bun cli.ts wake-status                   # Wakeable Codex and Droid peers: unread counts, true thread status (alias: live)
+bun cli.ts wake-status                   # Wakeable Codex, Droid and Antigravity peers: unread counts, true thread status (alias: live)
 bun cli.ts send frontend-tab "ship it"   # Send a message from the shell (also name@host[/chat])
 bun cli.ts rename calm-fox docs-writer   # Admin rename (operator action)
 bun cli.ts retire docs-writer            # Remove a stale or confusing peer from discovery
@@ -294,7 +296,7 @@ Under a service manager, `kill-broker` just makes the service start a fresh brok
 ## How it works
 
 - **Broker daemon** (`broker.ts`) runs on `localhost:7900` with SQLite at `~/.agent-peers.db`. launchd or systemd starts it; sessions only ask the service to start (see [The broker](#the-broker)). DB + WAL sidecars are 0o600, per-user shared secret at `~/.agent-peers-secret` (also 0o600) authenticates peer HTTP calls.
-- **Each session** spawns an MCP server (`claude-server.ts`, `codex-server.ts`, `hermes-server.ts`, `droid-server.ts`, or `openclaw-server.ts`) that registers with the broker and receives a rotating session token.
+- **Each session** spawns an MCP server (`claude-server.ts`, `codex-server.ts`, `hermes-server.ts`, `droid-server.ts`, `agy-server.ts`, or `openclaw-server.ts`) that registers with the broker and receives a rotating session token.
 - **Claude sessions** poll the broker (every 1s while a conversation is live, every 3s when idle; `AGENT_PEERS_IDLE_POLL_MS`) and push inbound messages via `notifications/claude/channel` → Claude sees the message mid-task. Each message is written to a durable inbox under `~/.agent-peers-claude` before it is pushed.
 - **Codex sessions** have no mid-task MCP push channel ([OpenAI Codex docs list `tools` as the only supported MCP feature](https://github.com/openai/codex/blob/main/docs/config.md) — resources, prompts, and `notifications/message` aren't surfaced). So Codex runs a two-layer delivery pipeline plus a prompt-level nudge:
   1. **Background poll (1s while active, 3s idle)** writes each new leased message to a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600 file, 0o700 dir, fail-closed perm check on read). Crash/restart safe.
@@ -304,6 +306,7 @@ Under a service manager, `kill-broker` just makes the service start a fresh brok
 - **Confirm-on-next-call dedupe.** Codex uses a two-set state machine: `presentedPendingConfirm` (drawn into current response, not yet known-delivered) + `seen` (confirmed delivered). Messages only transition to `seen` (+ get acked + get pruned from disk) at the START of the NEXT tool call, which proves the previous response cycle completed. Dropped MCP responses don't silently lose messages — they re-surface on the next call or after a session restart.
 - **Shared colleague protocol.** The servers import the same `COLLEAGUE_PROTOCOL` string from `shared/colleague-prompt.ts`, so the agents can't drift on reactive/proactive/maintenance behavior.
 - **Wakeable Droid sessions** are launched by `droidpeer`. In a terminal it owns `droid daemon --listen ipc` and relays the native Droid UI; with redirected input or output it hosts an ACP session (`droid exec --output-format acp`) instead. The MCP child persists inbound mail under `~/.agent-peers-droid`; bodyless metadata signals the launcher only after persistence. The launcher never embeds peer message content in its wake prompt.
+- **Wakeable Antigravity sessions** are launched by `agypeer`, which reuses the headless Droid ACP host with an Antigravity profile (`agy acp`). State lives under `~/.agent-peers-antigravity`.
 - **Federation is a layer on the same broker.** With it on, the broker relays a message addressed `name@host` to the other machine's broker over HTTPS and answers discovery queries live. See [Across machines](#across-machines-federation).
 - **Sessions gracefully restart.** If you SIGKILL a session and restart with the same `PEER_NAME` within 60s, the broker reclaims the same UUID AND clears stale leases for that peer so the new session sees any undelivered backlog on its first poll (instead of waiting 30s for leases to expire).
 
@@ -428,6 +431,18 @@ Managed sessions default to autonomy `high` (`--autonomy-level` or `DROID_PEER_A
 
 The guarantee applies only to sessions launched through `droidpeer`. An arbitrary already-running `droid` TUI has no external session handle and cannot be made wakeable after launch. The native launcher relies on Factory's internal IPC, which was verified on Droid 0.213.0 and is not a documented stable interface, so re-run the native smoke test after a Droid upgrade. Run `bun cli.ts wake-status` to inspect broker, process, and wakeability state. See [`docs/wakeable-droid.md`](docs/wakeable-droid.md).
 
+## Wakeable Antigravity peers
+
+`agypeer` hosts a headless Antigravity session (`agy acp`) as a managed, wakeable `antigravity` peer:
+
+```bash
+agypeer                                      # current directory, <persona>-<repo>-antigravity
+agypeer start reviewer ~/code/my-service     # explicit name and directory
+agypeer resume <session-id> [peer-name] [cwd]
+```
+
+It reuses the headless Droid host: a bodyless wake prompt when mail arrives while idle, mail that arrives during a turn waits for the turn to end, and the same retry ladder. The defaults are model `gemini-4-neon` at thinking level `high`, in Antigravity's `auto` mode. The host allows only the six Agent Peers tools and cancels every other permission request. `auto` mode itself runs edits and most shell commands without asking, including destructive ones, so use `--mode accept-edits` for a peer that should not run commands. `agypeer` checks that `agy` is signed in before it starts. See [`docs/wakeable-agy.md`](docs/wakeable-agy.md).
+
 ---
 
 ## Hermes chats: mail and wake
@@ -492,7 +507,7 @@ The Serve commands, ports, access policy, and the contract are in [`docs/compone
 | `AGENT_PEERS_FEDERATION` | — | `1` turns on cross-machine federation in the broker (needs the files described [above](#across-machines-federation)) |
 | `PEER_NAME` | persona-repo-harness | Explicit peer-name override (1-96 chars, `[a-zA-Z0-9_-]`, not a UUID). Setting it also makes the peer durable |
 | `AGENT_PEERS_EPHEMERAL` | — | `1` registers a non-durable peer even when `PEER_NAME` is set |
-| `AGENT_PEERS_STATE_DIR` | `~/.agent-peers-<runtime>` | Overrides the inbox and state directory for whichever runtime reads it (`claude`, `codex`, `droid`, `hermes`, `openclaw`) |
+| `AGENT_PEERS_STATE_DIR` | `~/.agent-peers-<runtime>` | Overrides the inbox and state directory for whichever runtime reads it (`claude`, `codex`, `droid`, `antigravity`, `hermes`, `openclaw`) |
 | `AGENT_PEERS_IDLE_POLL_MS` | `3000` | Poll interval when idle; sessions poll every 1s while a conversation is live |
 | `AGENT_PEERS_HEARTBEAT_MS` | `15000` | Heartbeat interval |
 | `OPENAI_API_KEY` | — | API key used only when `AGENT_PEERS_AUTO_SUMMARY=1` |
@@ -505,6 +520,8 @@ The Serve commands, ports, access policy, and the contract are in [`docs/compone
 | `AGENT_PEERS_WAKE_DISABLED` | — | `1` stops the Hermes Desktop wake plugin |
 | `AGENT_PEERS_CODEX_STATE_DIR` | `~/.agent-peers-codex` | Codex durable inbox + wake registry/daemon state dir |
 | `AGENT_PEERS_DROID_STATE_DIR` | `~/.agent-peers-droid` | Droid durable inbox + launch state dir |
+| `AGENT_PEERS_ANTIGRAVITY_STATE_DIR` | `~/.agent-peers-antigravity` | Antigravity (`agypeer`) launch state dir |
+| `AGY_PEER_MODEL` / `AGY_PEER_THINKING` / `AGY_PEER_MODE` | `gemini-4-neon` / `high` / `auto` | `agypeer` defaults for model, thinking level and ACP mode |
 | `CODEX_PEER_DAEMON_INTERVAL` | `5` | Background wake daemon poll interval (seconds) |
 | `CODEX_PEER_DAEMON_LOG_MAX_BYTES` | `5242880` | Size at which `wake-daemon.log` is rotated (copy-truncate) |
 | `CODEX_PEER_DAEMON_LOG_KEEP` | `3` | Number of rotated wake-daemon logs to keep |
@@ -542,7 +559,7 @@ The `agentpeers` alias sets `AGENT_PEERS_ENABLED=1`. Plain `claude` does not, so
 **Codex always has peers active** (as long as you included `env = { "AGENT_PEERS_ENABLED" = "1" }` in your `config.toml` entry). If you want a Codex session without peers, remove or comment out that `env` line temporarily.
 
 **Idle sessions only reply if they are wakeable. Otherwise they see messages on their next turn.**
-An MCP server cannot start a turn on its own, so a session that nothing wakes processes peer messages **during turns**, not while idle at the prompt. If you send a message to a peer sitting at an empty prompt, it surfaces on the next user turn (when you type something, or ask them to "check messages"). Sessions with a wake path are the exception: `codex-peer` sessions and Codex desktop chats, `droidpeer` sessions, Hermes chats with wake enabled, OpenClaw agents with wake enabled, and Claude sessions without the channel (inbox socket or rewake hook). A Claude session that has the channel gets live push during a turn; on current Claude Code builds the push also wakes it at an idle prompt (observed 2026-11-02), while older builds queued it.
+An MCP server cannot start a turn on its own, so a session that nothing wakes processes peer messages **during turns**, not while idle at the prompt. If you send a message to a peer sitting at an empty prompt, it surfaces on the next user turn (when you type something, or ask them to "check messages"). Sessions with a wake path are the exception: `codex-peer` sessions and Codex desktop chats, `droidpeer` and `agypeer` sessions, Hermes chats with wake enabled, OpenClaw agents with wake enabled, and Claude sessions without the channel (inbox socket or rewake hook). A Claude session that has the channel gets live push during a turn; on current Claude Code builds the push also wakes it at an idle prompt (observed 2026-11-02), while older builds queued it.
 
 What we do to make the other case as painless as possible: **every agent is instructed to call `check_messages` at the start of every user turn.** So the worst-case lag is "one of your own user turns" — type "hi" or "what's new" to a quiet peer and any pending messages surface in their first response.
 
@@ -622,13 +639,14 @@ agent-peers-mcp/
 ├── broker.ts                                  # HTTP+SQLite daemon (7900, 0o600 DB, shared-secret auth, federation endpoints)
 ├── claude-server.ts                           # MCP server — claude/channel push, inbox-socket wake
 ├── codex-server.ts                            # MCP server — durable queue + signal-only preview + [PEER INBOX]; also loaded by the Hermes and OpenClaw entries
-├── hermes-server.ts  droid-server.ts  openclaw-server.ts   # Entry points that set the runtime and load codex-server.ts
+├── hermes-server.ts  droid-server.ts  agy-server.ts  openclaw-server.ts   # Entry points that set the runtime and load codex-server.ts
 ├── cli.ts                                     # Admin / inspection CLI (see Shell CLI)
 ├── bin/
 │   ├── codex-peer                             # Wakeable Codex launcher + background wake daemon manager
 │   ├── droidpeer  droid-peer                  # Wakeable Droid launcher (native TUI or headless ACP)
+│   ├── agypeer                                # Wakeable Antigravity launcher (headless ACP)
 │   └── claude-peer-rewake                     # asyncRewake hook for Claude sessions without the channel
-├── wakeable-codex.ts  wakeable-droid.ts       # Entries behind the launchers
+├── wakeable-codex.ts  wakeable-droid.ts  wakeable-agy.ts   # Entries behind the launchers
 ├── wake-daemon.ts                             # Entry: one wake pass (Codex, Hermes chats, OpenClaw)
 ├── deploy/linux/                              # systemd --user units + install.sh for Linux brokers
 ├── hermes-plugins/agent-peers-desktop-wake/   # Hermes Desktop in-process wake plugin
@@ -640,7 +658,8 @@ agent-peers-mcp/
 │   ├── wake-daemon.ts  wake-registry.ts  wake-launch-claims.ts  wake-launch-role.ts   # Codex wake engine, registry, launch handshake, single-identity election
 │   ├── app-server-client.ts  wakeable-launcher.ts  codex-desktop-wake.ts   # Codex app-server client, launcher, desktop-chat wake
 │   ├── claude-socket-wake.ts                  # Claude inbox-socket wake
-│   ├── droid-*.ts                             # Droid launcher, native relay, ACP client, launch claims
+│   ├── droid-*.ts                             # Droid launcher, native relay, ACP client, launch claims (shared by Antigravity)
+│   ├── agy-profile.ts                         # Antigravity ACP profile: permission matcher, session config, sign-in check
 │   ├── hermes-*.ts  chat-directory.ts  chat-list.ts   # Hermes chat addressing, name claims, chat wake driver and pass
 │   ├── openclaw-*.ts                          # OpenClaw gate, state ledger, gateway calls, wake pass
 │   ├── paperclip-guard.ts                     # Keeps Paperclip agents off the network
@@ -649,7 +668,7 @@ agent-peers-mcp/
 ├── docs/
 │   ├── README.md  ARCHITECTURE.md  delivery-contract.md   # Index, system design, normative delivery guarantees
 │   ├── components/                            # Per-component references: broker, federation, linux-brokers, hermes-desktop-wake, openclaw-peer, ...
-│   ├── wakeable-codex.md  wakeable-droid.md  wake-daemon.md   # Wake design and operations
+│   ├── wakeable-codex.md  wakeable-droid.md  wakeable-agy.md  wake-daemon.md   # Wake design and operations
 │   └── superpowers/ plans/                    # Original spec and historical design records
 ```
 

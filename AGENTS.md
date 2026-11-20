@@ -8,16 +8,17 @@ accepted four-machine v3 baseline.
 - **Stack**: Bun + TypeScript, SQLite (`bun:sqlite`), MCP SDK. No build step; sources run directly.
   One Python plugin (`hermes-plugins/agent-peers-desktop-wake/`), tested through `bun test`.
 - **Entry points**: `broker.ts` (daemon); MCP servers `codex-server.ts` and `claude-server.ts`, plus
-  thin entry points `hermes-server.ts`, `droid-server.ts` and `openclaw-server.ts` that set
+  thin entry points `hermes-server.ts`, `droid-server.ts`, `agy-server.ts` and `openclaw-server.ts` that set
   `AGENT_PEERS_RUNTIME` and load `codex-server.ts`; `cli.ts` (ops); `wake-daemon.ts` +
   `bin/codex-peer` (the wake daemon: Codex, Hermes chat and OpenClaw passes); `wakeable-droid.ts` +
-  `bin/droidpeer` (Droid wake); `bin/claude-peer-rewake` (Claude desktop-app wake hook);
+  `bin/droidpeer` (Droid wake); `wakeable-agy.ts` + `bin/agypeer` (Antigravity wake, headless ACP on the
+  Droid host code); `bin/claude-peer-rewake` (Claude desktop-app wake hook);
   `deploy/linux/install.sh` (Linux broker and wake units).
-- **Peer types**: `claude`, `codex`, `hermes`, `droid`, `openclaw`. Adding one means touching the
+- **Peer types**: `claude`, `codex`, `hermes`, `droid`, `openclaw`, `antigravity`. Adding one means touching the
   `peers` CHECK constraint (a migration), `shared/types.ts`, `shared/federation.ts` and
   `shared/state-dir.ts`.
 - **Test**: `bun test`. **Typecheck**: `bun run typecheck`. Both must be clean before you commit.
-  `bun install` first on a fresh checkout. The suite is 579 tests in 66 files at `9be6159`; broker
+  `bun install` first on a fresh checkout. The suite is 606 tests in 68 files as of 2026-11-20; broker
   tests start isolated brokers on their own ports and temporary databases.
 - **Runtime state** (not in the repo, all under `$HOME`):
   - Broker: `~/.agent-peers.db`, `~/.agent-peers-secret` (0600).
@@ -25,7 +26,7 @@ accepted four-machine v3 baseline.
     `~/.agent-peers-fleet.json`, `~/.agent-peers-federation-secret` (0600, separate from the local
     secret). Its state lives in the broker DB (`federation_outbox`, `federation_receipts`,
     `federation_routes`, `federation_senders`).
-  - Per-harness inboxes and coordination: `~/.agent-peers-{codex,claude,hermes,droid,openclaw}/`.
+  - Per-harness inboxes and coordination: `~/.agent-peers-{codex,claude,hermes,droid,openclaw,antigravity}/`.
   - Codex wake: `~/.agent-peers-codex/wake-registry.json`, `wake-ledger/`, `wake-daemon.log`.
   - Hermes chat wake, under `~/.agent-peers-hermes/`: `disabled` (kill switch),
     `chat-wake/enabled` (profiles the gateway driver may wake), `chat-wake/desktop-enabled` (the
@@ -49,6 +50,7 @@ accepted four-machine v3 baseline.
 | Codex idle wake (incl. desktop chats over SSH) | `wake-daemon.ts`, `wakeable-codex.ts`, `bin/codex-peer`, `shared/wake-*.ts`, `shared/app-server-client.ts`, `shared/codex-desktop-wake.ts` | `docs/components/wake-subsystem.md`, `docs/wakeable-codex.md`, `docs/wake-daemon.md` |
 | Claude wake (channel, inbox socket, desktop hook) | `shared/claude-socket-wake.ts`, `bin/claude-peer-rewake` | `docs/ARCHITECTURE.md` §7 |
 | Droid idle wake | `wakeable-droid.ts`, `bin/droidpeer`, `shared/droid-*.ts` | `docs/wakeable-droid.md` |
+| Antigravity idle wake (headless ACP, Droid host profile) | `wakeable-agy.ts`, `bin/agypeer`, `agy-server.ts`, `shared/agy-profile.ts` | `docs/wakeable-agy.md` |
 | Hermes chat wake (gateway driver) | `shared/hermes-wake-pass.ts`, `shared/hermes-chat-wake.ts` | `docs/ARCHITECTURE.md` §7 |
 | Hermes Desktop wake plugin | `hermes-plugins/agent-peers-desktop-wake/`, tests in `tests/python/` | `docs/components/hermes-desktop-wake.md` |
 | OpenClaw peer (main-session binding, followup wake, custody ledger) | `openclaw-server.ts`, `shared/openclaw-*.ts` | `docs/components/openclaw-peer.md` |

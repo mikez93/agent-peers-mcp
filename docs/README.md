@@ -40,6 +40,7 @@ Status words used below:
 | [wakeable-codex.md](wakeable-codex.md) | Current for launcher-started Codex | Codex idle wake design and security model. Desktop chats over SSH are covered only in [ARCHITECTURE.md](ARCHITECTURE.md) §7 |
 | [wake-daemon.md](wake-daemon.md) | Current for the Codex pass | Wake daemon operations and log reading. The daemon also runs a Hermes pass and an OpenClaw pass; see [ARCHITECTURE.md](ARCHITECTURE.md) §7 |
 | [wakeable-droid.md](wakeable-droid.md) | Current | `droidpeer`: native Factory Droid TUI or headless ACP host, wake path, trust boundaries, recovery |
+| [wakeable-agy.md](wakeable-agy.md) | Current | `agypeer`: headless Antigravity ACP host on the Droid host code, permissions and `auto`-mode caveats, resume, verification |
 | [evidence/](evidence/) | History | Dated Droid acceptance receipts (2026-09-07) |
 
 ## Retired
