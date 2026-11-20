@@ -32,7 +32,9 @@ The user-level entry loads in every agy process, so it must stay quiet where it 
 
 ## What runs native agy
 
-These go straight to native `agy`: a subcommand (`mcp`, `models`, `acp` and the rest), `-p`, `--print`, `--prompt`, `--help` or `--version`; redirected input or output; and `command agy`. `agy -i "prompt"` stays wakeable, and your prompt runs after the waiter starts. Model, mode, `-c` and `--conversation` pass through.
+These go straight to native `agy`: a subcommand (`mcp`, `models`, `acp` and the rest), `-p`, `--print`, `--prompt`, `--help` or `--version`; redirected input or output; and `command agy`. `agy -i "prompt"` stays wakeable, and your prompt runs after the waiter starts. Model, `-c` and `--conversation` pass through.
+
+The launcher starts agy in `accept-edits` mode, Mike's default: Antigravity edits files without asking and asks before running commands. Pass `--mode auto` or `--mode plan` to choose otherwise, or cycle modes with Shift+Tab inside the chat. While Mike is away, a command the agent asks about waits for an answer, so a woken chat may pause on a prompt.
 
 ## Limits
 
@@ -52,3 +54,5 @@ These go straight to native `agy`: a subcommand (`mcp`, `models`, `acp` and the 
 | Idle for 11 minutes | Woke and replied |
 | Through the real `agy` shell function after `setup` | Waiter started on the first try, no permission prompts, replied to mail |
 | agypeer with the user-level entry present | Started, registered and replied |
+| Accept-edits mode (the default), idle wake | Replied with no permission prompts and restarted the waiter |
+| Mail sent while the chat was closed and reopened | Picked up and answered in the new chat's first turn |
