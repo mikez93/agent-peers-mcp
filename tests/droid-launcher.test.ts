@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -46,6 +47,23 @@ test("Droid MCP config uses the ACP stdio schema and carries only launch metadat
   expect(JSON.stringify(server)).not.toContain("session_token");
 });
 
+// macOS: /tmp is a symlink to /private/tmp. The launchers store the resolved path.
+const TMP_REAL = realpathSync("/tmp");
+
+test("launchers resolve a symlinked cwd so the MCP child's getcwd() can bind the claim", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cwd-real-"));
+  const link = `${dir}-link`;
+  try {
+    await symlink(dir, link);
+    expect(parseDroidLauncherArgs(["start", "peer", link]).cwd).toBe(realpathSync(dir));
+    expect(parseAgyLauncherArgs(["start", "peer", link], {}).cwd).toBe(realpathSync(dir));
+    expect(parseDroidLauncherArgs(["start", "peer", `${dir}/missing`]).cwd).toBe(`${dir}/missing`);
+  } finally {
+    await rm(link, { force: true });
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("argument parser rejects unknown flags and canonicalizes cwd", () => {
   expect(parseDroidLauncherArgs(["start", "--cwd", ".", "--name", "droid", "--poll-ms", "5"])).toEqual(expect.objectContaining({
     cwd: process.cwd(),
@@ -58,12 +76,12 @@ test("argument parser rejects unknown flags and canonicalizes cwd", () => {
 test("argument parser supports start and exact resume command forms", () => {
   expect(parseDroidLauncherArgs(["start", "build-droid", "/tmp"])).toMatchObject({
     peerName: "build-droid",
-    cwd: "/tmp",
+    cwd: TMP_REAL,
   });
   expect(parseDroidLauncherArgs(["resume", "factory-session", "build-droid", "/tmp", "--model", "custom:test"])).toMatchObject({
     sessionId: "factory-session",
     peerName: "build-droid",
-    cwd: "/tmp",
+    cwd: TMP_REAL,
     model: "custom:test",
   });
   expect(() => parseDroidLauncherArgs(["resume"])).toThrow("requires a Factory session id");
@@ -87,7 +105,7 @@ test("empty autonomy environment still defaults managed sessions to High", () =>
 
 test("ordinary launcher syntax supports bare start and exact resume flags without accepting ambiguous selectors", () => {
   expect(parseDroidLauncherArgs([])).toEqual(parseDroidLauncherArgs(["start"]));
-  expect(parseDroidLauncherArgs(["--cwd", "/tmp", "--resume", "factory-session"])).toMatchObject({ cwd: "/tmp", cwdExplicit: true, sessionId: "factory-session" });
+  expect(parseDroidLauncherArgs(["--cwd", "/tmp", "--resume", "factory-session"])).toMatchObject({ cwd: TMP_REAL, cwdExplicit: true, sessionId: "factory-session" });
   expect(parseDroidLauncherArgs(["--resume=factory-session"])).toMatchObject({ sessionId: "factory-session", cwdExplicit: false });
   expect(() => parseDroidLauncherArgs(["--resume"])).toThrow("requires a value");
   expect(() => parseDroidLauncherArgs(["--resume="])).toThrow("requires a Factory session id");
@@ -601,7 +619,8 @@ test("Antigravity MCP config runs agy-server with the generic launch-claim env",
 
 test("agy launcher names the peer <persona>-<repo>-antigravity and configures model, thinking and auto mode", async () => {
   const root = await mkdtemp(join(tmpdir(), "agy-launcher-"));
-  const cwd = await mkdtemp(join(tmpdir(), "agyrepo-"));
+  // A real MCP child reports getcwd(), which resolves the tmpdir symlink on macOS.
+  const cwd = realpathSync(await mkdtemp(join(tmpdir(), "agyrepo-")));
   roots.push(root, cwd);
   await writeFile(join(cwd, "AGENTS.md"), "You are **Orion**, the test persona.\n");
   const claims = new DroidLaunchClaimStore({ rootDir: root, runtime: "antigravity" });
@@ -690,7 +709,7 @@ test("agy argument parser: start/resume forms, env defaults, flags, and strict v
     headless: true, cwd: process.cwd(), model: "gemini-4-argon", thinkingLevel: "medium", mode: "plan", pollMs: 1000, claimTimeoutMs: 15000,
   }));
   expect(parseAgyLauncherArgs(["start", "reviewer", "/tmp"], {})).toEqual(expect.objectContaining({
-    peerName: "reviewer", cwd: "/tmp", cwdExplicit: true, mode: "auto",
+    peerName: "reviewer", cwd: TMP_REAL, cwdExplicit: true, mode: "auto",
   }));
   const resumed = parseAgyLauncherArgs(["resume", "sess-9", "reviewer", "--agy", "/opt/agy", "--model", "claude-opus-5-5", "--poll-ms", "250"], {});
   expect(resumed).toEqual(expect.objectContaining({

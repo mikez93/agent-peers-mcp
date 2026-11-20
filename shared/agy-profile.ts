@@ -4,11 +4,11 @@
 // this file only says what is different about Antigravity. Payload shapes
 // below were captured from agy 1.5.13 (ACP server 1.5.13) on 2026-11-20.
 
-import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AcpHostProfile } from "./droid-acp-client.ts";
 import {
   DroidLauncherUsageError,
+  canonicalCwd,
   type AcpLauncherProfile,
   type DroidLauncherClient,
   type DroidLauncherOptions,
@@ -247,7 +247,7 @@ export function parseAgyLauncherArgs(argv: string[], env: NodeJS.ProcessEnv = pr
     else if (arg === "--claim-timeout-ms") opts.claimTimeoutMs = positiveInt(requireValue(args, ++i, arg), arg);
     else throw new DroidLauncherUsageError(`unknown option: ${arg}`);
   }
-  opts.cwd = resolve(opts.cwd);
+  opts.cwd = canonicalCwd(opts.cwd);
   if (opts.peerName && !isValidName(opts.peerName)) {
     throw new DroidLauncherUsageError(`peer name must be 1-${NAME_MAX_LEN} letters, digits, underscores or hyphens, and cannot be a UUID`);
   }

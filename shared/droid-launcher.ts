@@ -1,5 +1,6 @@
 // Managed ACP launcher and bodyless wake controller for Factory Droid peers.
 
+import { realpathSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import { platform } from "node:os";
 import { join, resolve } from "node:path";
@@ -113,6 +114,20 @@ const DEFAULT_WAKE_RETRY_SCHEDULE_MS = [5 * 60_000, 30 * 60_000, 2 * 60 * 60_000
 
 export const DROID_WAKE_PROMPT = `[agent-peers wake]\nPending peer mail is available. Call the agent-peers check_messages tool exactly once; that tool is the only authoritative source of message content. Handle the returned messages normally, then become idle again.`;
 
+/** The MCP child reports its cwd from getcwd(), which resolves symlinks, and a
+ * claim binds only when the two paths match exactly. So the launcher resolves
+ * them too: `/tmp` on macOS is `/private/tmp`, and omarchy's `~/www` points at
+ * `/mnt/nvme-2tb/@www` (agypeer never bound there, 2026-11-20). A missing path
+ * stays as given so the later error names what the user typed. */
+export function canonicalCwd(path: string): string {
+  const absolute = resolve(path);
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
 export function parseDroidLauncherArgs(argv: string[]): DroidLauncherOptions {
   const args = [...argv];
   const opts: DroidLauncherOptions = {
@@ -174,7 +189,7 @@ export function parseDroidLauncherArgs(argv: string[]): DroidLauncherOptions {
     else if (arg === "--claim-timeout-ms") opts.claimTimeoutMs = positiveInt(requireValue(args, ++i, arg), arg);
     else throw new DroidLauncherUsageError(`unknown option: ${arg}`);
   }
-  opts.cwd = resolve(opts.cwd);
+  opts.cwd = canonicalCwd(opts.cwd);
   if (opts.peerName && !isValidName(opts.peerName)) {
     throw new DroidLauncherUsageError(`peer name must be 1-${NAME_MAX_LEN} letters, digits, underscores or hyphens, and cannot be a UUID`);
   }
