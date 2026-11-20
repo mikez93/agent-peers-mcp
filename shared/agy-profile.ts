@@ -41,9 +41,19 @@ const AGENT_PEERS_TOOLS = [
  *          { optionId: "deny",  kind: "reject_once" }]. */
 const AGY_AGENT_PEERS_TOOL_NAMES = new Set(AGENT_PEERS_TOOLS.map((tool) => `mcp_agent-peers_${tool}`));
 
-/** Allow exactly the six Agent Peers tools, once. Everything else is
- * cancelled: the headless host has nobody to ask. The tool `name` decides when
- * present; `title` is consulted only when `name` is absent. */
+/** The five shared GBrains every fleet harness uses (the fleet overlay adds
+ * them to agy's mcp_config.json). agy asks the ACP host before every MCP call
+ * even when settings.json allows the server, so the host approves them, as
+ * Codex does with default_tools_approval_mode = "approve" (Mike, 2026-11-20). */
+const AGY_GBRAIN_TOOL = /^mcp_gbrain-(portfolio|imekka|valentina|ccr|human-design)_[A-Za-z0-9_]+$/;
+
+function isAllowedAgyTool(name: string): boolean {
+  return AGY_AGENT_PEERS_TOOL_NAMES.has(name) || AGY_GBRAIN_TOOL.test(name);
+}
+
+/** Allow the Agent Peers tools and the shared GBrain tools, once. Everything
+ * else is refused: the headless host has nobody to ask. The tool `name` decides
+ * when present; `title` is consulted only when `name` is absent. */
 export function allowedAgyPermissionOption(params: unknown): string | null {
   if (!params || typeof params !== "object") return null;
   const value = params as {
@@ -54,10 +64,10 @@ export function allowedAgyPermissionOption(params: unknown): string | null {
   const title = value.toolCall?.title;
   let recognized = false;
   if (typeof name === "string") {
-    recognized = AGY_AGENT_PEERS_TOOL_NAMES.has(name);
+    recognized = isAllowedAgyTool(name);
   } else if (typeof title === "string") {
     const bare = title.startsWith("Run ") ? title.slice(4) : title;
-    recognized = AGY_AGENT_PEERS_TOOL_NAMES.has(bare);
+    recognized = isAllowedAgyTool(bare);
   }
   if (!recognized) return null;
   const allowOnce = value.options?.find((option) =>

@@ -104,6 +104,11 @@ answer, so the host answers permission requests itself:
   `set_summary`, `check_messages`, `wait_for_peer_messages`, `rename_peer`),
   one call at a time. Antigravity names MCP tools `mcp_<server>_<tool>`, so the
   host matches `mcp_agent-peers_<tool>` on the request's `toolCall.name`.
+- It allows the five shared GBrains (`mcp_gbrain-portfolio_*`, `-imekka`,
+  `-valentina`, `-ccr`, `-human-design`), which the fleet adds to agy's
+  `mcp_config.json`. agy asks the host before every MCP call even when
+  `settings.json` allows the server. When the host refused a GBrain `whoami`
+  on 2026-11-20, agy cancelled the whole turn and the peer never replied.
 - It refuses every other request by selecting Antigravity's own `reject_once`
   option. The agent is told "user denied permission" and carries on, so it can
   still reply to the sender. The host never answers `cancelled` when a

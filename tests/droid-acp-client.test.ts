@@ -361,6 +361,16 @@ test("agy matcher allows the six Agent Peers tools once, matched on Antigravity'
   expect(allowedAgyPermissionOption(agyPermission({ title: "Run mcp_agent-peers_send_message" }))).toBe("allow");
 });
 
+test("agy matcher allows the five shared GBrains and nothing that only resembles them", () => {
+  for (const brain of ["portfolio", "imekka", "valentina", "ccr", "human-design"]) {
+    expect(allowedAgyPermissionOption(agyPermission({ name: `mcp_gbrain-${brain}_whoami` }))).toBe("allow");
+  }
+  expect(allowedAgyPermissionOption(agyPermission({ title: "Run mcp_gbrain-ccr_search" }))).toBe("allow");
+  for (const name of ["mcp_gbrain-private_whoami", "mcp_gbrain-quinn_search", "mcp_gbrain_portfolio_whoami", "mcp_gbrain-portfolio_"]) {
+    expect(allowedAgyPermissionOption(agyPermission({ name }))).toBeNull();
+  }
+});
+
 test("agy matcher cancels shell, edits, other servers, lookalikes and missing allow_once", () => {
   const cancelled: Array<[Record<string, unknown>, unknown?]> = [
     [{ name: "run_command", title: "rm -rf doomed-dir", kind: "execute" }],
