@@ -12,7 +12,7 @@ accepted four-machine v3 baseline.
   `AGENT_PEERS_RUNTIME` and load `codex-server.ts`; `cli.ts` (ops); `wake-daemon.ts` +
   `bin/codex-peer` (the wake daemon: Codex, Hermes chat and OpenClaw passes); `wakeable-droid.ts` +
   `bin/droidpeer` (Droid wake); `wakeable-agy.ts` + `bin/agypeer` (Antigravity wake, headless ACP on the
-  Droid host code); `bin/claude-peer-rewake` (Claude desktop-app wake hook);
+  Droid host code); `agy-interactive.ts` (interactive `agy` wake through a background-task mail waiter); `bin/claude-peer-rewake` (Claude desktop-app wake hook);
   `deploy/linux/install.sh` (Linux broker and wake units).
 - **Peer types**: `claude`, `codex`, `hermes`, `droid`, `openclaw`, `antigravity`. Adding one means touching the
   `peers` CHECK constraint (a migration), `shared/types.ts`, `shared/federation.ts` and
@@ -51,6 +51,7 @@ accepted four-machine v3 baseline.
 | Claude wake (channel, inbox socket, desktop hook) | `shared/claude-socket-wake.ts`, `bin/claude-peer-rewake` | `docs/ARCHITECTURE.md` §7 |
 | Droid idle wake | `wakeable-droid.ts`, `bin/droidpeer`, `shared/droid-*.ts` | `docs/wakeable-droid.md` |
 | Antigravity idle wake (headless ACP, Droid host profile) | `wakeable-agy.ts`, `bin/agypeer`, `agy-server.ts`, `shared/agy-profile.ts` | `docs/wakeable-agy.md` |
+| Interactive `agy` wake (background-task mail waiter) | `agy-interactive.ts`, `agy-server.ts`, `shared/noop-mcp.ts` | `docs/agy-interactive.md` |
 | Hermes chat wake (gateway driver) | `shared/hermes-wake-pass.ts`, `shared/hermes-chat-wake.ts` | `docs/ARCHITECTURE.md` §7 |
 | Hermes Desktop wake plugin | `hermes-plugins/agent-peers-desktop-wake/`, tests in `tests/python/` | `docs/components/hermes-desktop-wake.md` |
 | OpenClaw peer (main-session binding, followup wake, custody ledger) | `openclaw-server.ts`, `shared/openclaw-*.ts` | `docs/components/openclaw-peer.md` |

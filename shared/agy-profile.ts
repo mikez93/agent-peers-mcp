@@ -160,6 +160,7 @@ export const AGY_LAUNCHER_PROFILE: AcpLauncherProfile = {
   serverPath: fileURLToPath(new URL("../agy-server.ts", import.meta.url)),
   configureSession: configureAgySession,
   preflight: (opts) => checkAgySignedIn(opts.agyCommand ?? "agy"),
+  shareMcpEnvWithHost: true,
 };
 
 /** `agypeer [start [name] [cwd]] | agypeer resume <session-id> [name] [cwd]`. */

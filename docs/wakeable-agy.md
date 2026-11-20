@@ -13,13 +13,14 @@ then reads the actual message by calling the Agent Peers `check_messages` MCP
 tool, and replies with `send_message`.
 
 `agypeer` is always headless. Antigravity has no IPC relay like Droid's native
-launcher, so you talk to an `agypeer` session through Agent Peers. Your own
-interactive `agy` is untouched and stays non-wakeable.
+launcher, so you talk to an `agypeer` session through Agent Peers. The
+interactive `agy` chat is wakeable by a different mechanism, described in
+[agy-interactive.md](agy-interactive.md).
 
 Use it only when you want a background Antigravity worker that other agents can
 hand work to while nobody is watching. It has no chat window: after it prints
 its name and session id it waits for mail, and Ctrl-C stops it. For normal
-work, type `agy`.
+work, type `agy`, which is a wakeable peer on fleet machines.
 
 ## Account and policy
 

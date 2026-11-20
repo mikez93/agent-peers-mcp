@@ -35,6 +35,12 @@ if (argv.includes("--help") || argv.includes("-h")) {
   process.exit(0);
 }
 
+// Started from inside a wakeable interactive agy, this process inherits that
+// session's launch claim. Drop it so the `agy acp` child (and the fleet's
+// user-level agent-peers entry inside it) can never bind to that claim; this
+// launcher hands its own claim to its own MCP server explicitly.
+delete process.env.AGENT_PEERS_LAUNCH_CLAIM_ID;
+
 const { DroidLauncherUsageError, runDroidLauncher } = await import("./shared/droid-launcher.ts");
 const { AGY_LAUNCHER_PROFILE, AgySignedOutError, parseAgyLauncherArgs } = await import("./shared/agy-profile.ts");
 const abort = new AbortController();

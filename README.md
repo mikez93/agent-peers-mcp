@@ -47,7 +47,7 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 | 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Stock Codex CLI has no mid-task push channel for MCP servers, so a plain `codex` session picks up peer messages on its next agent-peers tool call. Its shared instructions tell it to call `check_messages` at the start of every user turn, which bounds delivery latency to one user turn. A durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600) means Codex never loses a message, even across a restart. A Codex session launched through `codex-peer`, or opened as a Codex desktop chat, is also **woken from idle**, and mail for a chat that is mid-task is appended to its running turn ([details](#wakeable-codex-peers-idle-wake-no-fork)). |
 | 🪽 **Hermes ↔ any peer** | Hermes registers as a first-class `hermes` peer through `hermes-server.ts`: one durable peer per profile (for example `ezra-hermes`), with the same durable polling and authoritative `[PEER INBOX]` delivery used by Codex. Mail can be addressed to a single Hermes chat (`ezra-hermes/Instagram ads`). A chat open in Hermes Desktop can be woken by a plugin, and a closed chat by a gateway driver; both are opt-in and off until you enable them ([details](#hermes-chats-mail-and-wake)). |
 | 🏭 **Factory Droid ↔ any peer** | `droidpeer` opens Factory's native Droid terminal UI as a managed `droid` peer. When mail arrives while Droid is idle, the launcher starts a turn with a bodyless wake prompt, and Droid retrieves the real message through `check_messages`. Ordinary `droid` sessions are not wakeable. |
-| 🛰️ **Antigravity ↔ any peer** | `agypeer` hosts a headless Antigravity session (`agy acp`) as a managed `antigravity` peer, with the same bodyless wake as headless Droid ([details](#wakeable-antigravity-peers)). Your interactive `agy` is not wakeable. |
+| 🛰️ **Antigravity ↔ any peer** | `agypeer` hosts a headless Antigravity session (`agy acp`) as a managed `antigravity` peer, with the same bodyless wake as headless Droid. On fleet machines, the interactive `agy` chat is a wakeable peer too ([details](#wakeable-antigravity-peers)). |
 | 🦞 **OpenClaw ↔ any peer** | An OpenClaw agent joins as an `openclaw` peer through an MCP server entry, and mail can wake its main session ([details](#openclaw)). |
 | 🌐 **Across machines** | With federation on, `name@host` addresses an agent on another machine, and `list_peers` and `list_chats` show remote agents too. Each machine stays authoritative for its own peers and mail ([details](#across-machines-federation)). |
 | 👥 **Colleague behavior protocol** | Shared prompt imported by every MCP server: don't auto-reply "got it", investigate before answering, push back on disagreement, ping proactively when you find something the other peer cares about, close every loop. |
@@ -209,7 +209,7 @@ Open a new terminal and run the launcher for your agent:
 | **Claude Code** | `agentpeers` (the Claude desktop app joins without a launcher) |
 | **Codex** | `codex` joins the network; `codex-peer` joins and is wakeable from idle |
 | **Factory Droid** | `droidpeer` |
-| **Antigravity** | `agypeer` (headless; talk to it through Agent Peers) |
+| **Antigravity** | `agy` through the fleet shell function (`bun agy-interactive.ts launch`); `agypeer` for a headless worker |
 | **Hermes** | Start Hermes with the MCP configured as above |
 | **OpenClaw** | The OpenClaw gateway loads the MCP entry ([setup](docs/components/openclaw-peer.md)) |
 
@@ -433,7 +433,9 @@ The guarantee applies only to sessions launched through `droidpeer`. An arbitrar
 
 ## Wakeable Antigravity peers
 
-`agypeer` hosts a headless Antigravity session (`agy acp`) as a managed, wakeable `antigravity` peer:
+On fleet machines, typing `agy` opens the normal Antigravity chat as a wakeable `antigravity` peer. The shell function runs `bun agy-interactive.ts launch`, which keeps a mail waiter running as an Antigravity background task; when mail arrives, the waiter finishes and the idle chat wakes and reads it. `bun agy-interactive.ts setup` registers the MCP entry and permission rules this needs. See [`docs/agy-interactive.md`](docs/agy-interactive.md).
+
+For a background worker with no window, use `agypeer`. It hosts a headless Antigravity session (`agy acp`) as a managed, wakeable `antigravity` peer:
 
 ```bash
 agypeer                                      # current directory, <persona>-<repo>-antigravity

@@ -234,6 +234,14 @@ export class DroidLaunchClaimStore {
     }
   }
 
+  /** Interactive agy sessions are never resumed through this store, so their
+   * launcher removes the session record when agy exits. */
+  async removeSession(sessionId: string): Promise<void> {
+    try { await unlink(this.sessionPath(sessionId)); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
   async listClaims(): Promise<DroidLaunchClaim[]> {
     let names: string[];
     try {

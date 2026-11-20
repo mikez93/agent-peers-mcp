@@ -62,6 +62,11 @@ export interface AcpLauncherProfile {
   configureSession(client: DroidLauncherClient, sessionId: string, opts: DroidLauncherOptions): Promise<void>;
   /** Optional readiness check before anything is spawned (e.g. signed in). */
   preflight?(opts: DroidLauncherOptions): Promise<void>;
+  /** Also give the host process the MCP server's env (claim id, state root,
+   * peer name). Antigravity runs one MCP server per name and prefers a
+   * same-named server from its user config, which inherits the host's env;
+   * with this, whichever copy runs binds this launcher's claim. */
+  shareMcpEnvWithHost?: boolean;
 }
 
 export const DROID_LAUNCHER_PROFILE: AcpLauncherProfile = {
@@ -371,6 +376,11 @@ export interface DroidLauncherClient extends WakePromptClient {
   close(): void;
 }
 
+export function hostEnvWithMcpEnv(claimId: string, stateRoot: string, peerName: string | undefined, profile: AcpLauncherProfile): NodeJS.ProcessEnv {
+  const server = buildDroidMcpServer({ claimId, stateRoot, peerName, profile });
+  return { ...process.env, ...Object.fromEntries(server.env.map(({ name, value }) => [name, value])) };
+}
+
 export async function runDroidLauncher(
   opts: DroidLauncherOptions,
   deps: DroidLauncherDependencies = {},
@@ -408,6 +418,7 @@ export async function runDroidLauncher(
       cwd: effectiveOpts.cwd,
       droidCommand: profile.executable(effectiveOpts),
       profile: profile.host,
+      env: profile.shareMcpEnvWithHost ? hostEnvWithMcpEnv(claim.claim_id, stateRoot, effectiveOpts.peerName, profile) : undefined,
       onStderr: (chunk) => process.stderr.write(chunk),
     }), { profile: profile.host });
     // Subscribe once per process, not once per inbox poll. Otherwise each
