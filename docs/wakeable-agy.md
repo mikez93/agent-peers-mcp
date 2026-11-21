@@ -103,9 +103,12 @@ machines.
 ## Permissions and modes
 
 The default mode is `auto` (Mike, 2026-11-20, replacing his earlier
-`accept-edits`). Antigravity edits files and runs the commands it judges safe
-without asking. It still asks about some calls, and nobody is present to
-answer, so the host answers permission requests itself:
+`accept-edits`). On fleet machines agy also saves `toolPermission`
+`always-proceed` and `allowNonWorkspaceAccess` `true` (Mike, 2026-11-20), so it
+rarely asks the host anything: in a 2026-11-20 test an `agypeer` wrote outside
+its workspace, ran shell commands and called GBrain with no permission request,
+while dcg's hook still guarded its commands. Whatever agy does ask, the host
+answers itself, because nobody is present:
 
 - It allows the six Agent Peers tools (`list_peers`, `send_message`,
   `set_summary`, `check_messages`, `wait_for_peer_messages`, `rename_peer`),
