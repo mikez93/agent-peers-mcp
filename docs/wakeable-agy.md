@@ -75,8 +75,9 @@ claim", and omarchy's `~/www` symlink would have done the same.
 
 `resume` uses ACP `session/resume` on the exact session id. It restores the
 saved peer name, peer UUID and working directory, and drains mail that queued
-while the host was down. A resumed session keeps its own model unless you pass
-`--model` or `--thinking`. The mode is set on every start and resume.
+while the host was down. A resumed session keeps its own model and thinking
+level; `--model` or `--thinking` changes only the one you pass. The mode is set
+on every start and resume.
 
 ### Signed-out machines
 
@@ -117,7 +118,8 @@ answer, so the host answers permission requests itself:
   tool `call_mcp_tool`, with the server in `rawInput.ServerName`. When the
   host refused a GBrain `whoami` on 2026-11-20, agy cancelled the whole turn
   and the peer never replied. The host now writes every refusal to stderr
-  (`agent-peers: refused Antigravity permission: {...}`), so a silent turn
+  (`agent-peers: refused Antigravity permission: {...}`, with the tool name
+  and kind but not the title, which can hold command text), so a silent turn
   leaves a trace in the agypeer output.
 - It refuses every other request by selecting Antigravity's own `reject_once`
   option. The agent is told "user denied permission" and carries on, so it can

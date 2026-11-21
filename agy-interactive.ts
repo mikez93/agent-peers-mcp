@@ -26,7 +26,7 @@ import { chmod, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DroidLaunchClaimStore } from "./shared/droid-launch-claims.ts";
-import { FileDroidWakeMetadataSource } from "./shared/droid-launcher.ts";
+import { ClaimBoundDroidWakeMetadataSource } from "./shared/droid-launcher.ts";
 import { AGY_DEFAULT_MODE, AGY_DEFAULT_MODEL, AGY_DEFAULT_THINKING, agyEnv } from "./shared/agy-profile.ts";
 import { atomicWriteJson } from "./shared/file-state.ts";
 import { resolveStateDir } from "./shared/state-dir.ts";
@@ -79,15 +79,24 @@ export interface WaitOptions {
  * or null when the session's claim is gone (agy exited). */
 export async function waitForNewMail(opts: WaitOptions): Promise<string | null> {
   const claims = new DroidLaunchClaimStore({ rootDir: opts.stateRoot, runtime: "antigravity" });
-  const binding = await claims.waitForBinding(opts.claimId, {
+  await claims.waitForBinding(opts.claimId, {
     timeoutMs: opts.bindTimeoutMs ?? BIND_TIMEOUT_MS,
     signal: opts.signal,
   });
-  const source = new FileDroidWakeMetadataSource({ stateRoot: opts.stateRoot, peerId: binding.peer_id });
+  // Follow the claim on every poll: a broker re-registration can give the same
+  // MCP child a new peer id, and a frozen id would watch the old inbox forever.
+  const source = new ClaimBoundDroidWakeMetadataSource(claims, opts.claimId, opts.stateRoot);
   const sleep = opts.sleep ?? ((ms: number) => Bun.sleep(ms));
   while (!opts.signal?.aborted) {
     if (!(await claims.readClaim(opts.claimId))) return null;
-    const state = await source.read();
+    let state;
+    try {
+      state = await source.read();
+    } catch {
+      // The claim exists but is between bindings; wait for it to bind again.
+      await sleep(opts.pollMs ?? 1000);
+      continue;
+    }
     const notified = await readNotified(opts.stateRoot, opts.claimId);
     if (state.lastMessageId !== null && (notified === null || state.lastMessageId > notified)) {
       await atomicWriteJson(notifiedPath(opts.stateRoot, opts.claimId), {

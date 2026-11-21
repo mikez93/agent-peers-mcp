@@ -440,6 +440,31 @@ test("headless agy client answers permission requests through the agy matcher an
   ]);
 });
 
+test("agy refusal log names the tool and kind but never the title, which can hold command text", async () => {
+  const transport = new FakeTransport((message, fake) => {
+    if (message.method === "initialize") fake.push(responseFor(message, { protocolVersion: 1, agentCapabilities: {} }));
+  });
+  const client = new DroidAcpClient(transport, { profile: AGY_ACP_PROFILE });
+  await client.initialize();
+  const lines: string[] = [];
+  const write = process.stderr.write;
+  process.stderr.write = ((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try {
+    transport.push({ jsonrpc: "2.0", id: 80, method: "session/request_permission",
+      params: agyPermission({ name: "run_command", title: "curl -H 'Authorization: Bearer s3cret' x", kind: "execute" }) });
+    transport.push({ jsonrpc: "2.0", id: 81, method: "session/request_permission",
+      params: agyPermission({ name: "call_mcp_tool", title: "MCP Tool deploy", kind: "other",
+        rawInput: { ServerName: "other-server", ToolName: "deploy", Arguments: { token: "s3cret" } } }) });
+    await Bun.sleep(0);
+  } finally {
+    process.stderr.write = write;
+  }
+  const log = lines.join("");
+  expect(log).toContain('"name":"run_command","kind":"execute","answer":"deny"');
+  expect(log).toContain('"name":"call_mcp_tool","kind":"other","server":"other-server","tool":"deploy","answer":"deny"');
+  expect(log).not.toContain("s3cret");
+});
+
 test("agy reject option picks reject_once only, never reject_always", () => {
   expect(rejectAgyPermissionOption(agyPermission({ name: "run_command" }))).toBe("deny");
   expect(rejectAgyPermissionOption(agyPermission({ name: "run_command" },

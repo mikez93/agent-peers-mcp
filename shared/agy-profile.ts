@@ -119,11 +119,14 @@ export async function configureAgySession(
   sessionId: string,
   opts: Pick<DroidLauncherOptions, "model" | "thinkingLevel" | "mode" | "sessionId" | "settingsExplicit">,
 ): Promise<void> {
-  // A resumed session keeps its own model unless the caller chose one; a new
-  // session gets the defaults. The mode is always set: headless needs it.
-  const applyModel = !opts.sessionId || opts.settingsExplicit;
-  if (applyModel) {
+  // A new session gets the defaults. A resumed session keeps its own model and
+  // thinking level, and only the one the caller passed changes (--thinking alone
+  // must not reset the model). The mode is always set: headless needs it.
+  const isNew = !opts.sessionId;
+  if (isNew || opts.model) {
     await client.setConfigOption(sessionId, "model", opts.model || AGY_DEFAULT_MODEL);
+  }
+  if (isNew || opts.thinkingLevel) {
     await client.setConfigOption(sessionId, "thought_level", opts.thinkingLevel || AGY_DEFAULT_THINKING);
   }
   const mode = opts.mode || AGY_DEFAULT_MODE;
@@ -229,6 +232,10 @@ export function parseAgyLauncherArgs(argv: string[], env: NodeJS.ProcessEnv = pr
     args.shift();
     if (!args[0] || args[0].startsWith("-")) throw new DroidLauncherUsageError("resume requires an Antigravity session id");
     opts.sessionId = args.shift();
+    // AGY_PEER_MODEL / AGY_PEER_THINKING are defaults for new sessions; on
+    // resume only --model or --thinking changes the saved session.
+    opts.model = undefined;
+    opts.thinkingLevel = undefined;
     if (args[0] && !args[0].startsWith("-")) opts.peerName = args.shift();
     if (args[0] && !args[0].startsWith("-")) { opts.cwd = args.shift()!; opts.cwdExplicit = true; }
   } else {

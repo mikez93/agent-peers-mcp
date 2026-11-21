@@ -109,6 +109,22 @@ test("waiter reports new mail once, stays quiet on the same message, and reports
   expect(await readNotified(root, claimId)).toBe(7);
 });
 
+test("waiter follows the claim when a broker re-registration gives the MCP child a new peer id", async () => {
+  const { root, claims, claimId } = await boundClaim();
+  let rebound = false;
+  const result = await waitForNewMail({ claimId, stateRoot: root, pollMs: 1,
+    sleep: async () => {
+      if (rebound) return;
+      rebound = true;
+      await claims.bindClaim(claimId, { peerId: "peer-2", peerName: "orion-repo-antigravity", mcpPid: process.pid, cwd: "/repo" });
+      const path = join(root, "peer-2.metadata.json");
+      await writeFile(path, JSON.stringify({ unread: [{ id: 11 }] }));
+      await chmod(path, 0o600);
+    } });
+  expect(result).toContain("1 new message(s)");
+  expect(await readNotified(root, claimId)).toBe(11);
+});
+
 test("waiter stays quiet with an empty mailbox and exits quietly once agy's claim is released", async () => {
   const { root, claims, claimId } = await boundClaim();
   let polls = 0;

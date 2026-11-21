@@ -302,11 +302,17 @@ export class DroidAcpClient {
       const allowed = this.profile.permissionOption(request.params);
       const optionId = allowed ?? this.profile.rejectOption?.(request.params) ?? null;
       if (!allowed) {
-        // A refusal can end the turn silently (agy cancels it), so say what was refused.
-        const params = (request.params ?? {}) as { toolCall?: { name?: unknown; title?: unknown; kind?: unknown } };
+        // A refusal can end the turn silently (agy cancels it), so say what was
+        // refused. Tool name and kind only: a title can carry the command text.
+        const params = (request.params ?? {}) as {
+          toolCall?: { name?: unknown; kind?: unknown; rawInput?: { ServerName?: unknown; ToolName?: unknown } };
+        };
         const call = params.toolCall ?? {};
+        const proxied = call.name === "call_mcp_tool"
+          ? { server: call.rawInput?.ServerName, tool: call.rawInput?.ToolName }
+          : {};
         process.stderr.write(`agent-peers: refused ${this.profile.displayName} permission: ${JSON.stringify({
-          name: call.name, title: call.title, kind: call.kind, answer: optionId ?? "cancelled",
+          name: call.name, kind: call.kind, ...proxied, answer: optionId ?? "cancelled",
         })}\n`);
       }
       await this.send({

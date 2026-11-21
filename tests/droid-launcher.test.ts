@@ -544,6 +544,7 @@ import {
   AgySignedOutError,
   agyEnv,
   checkAgySignedIn,
+  configureAgySession,
   parseAgyLauncherArgs,
 } from "../shared/agy-profile.ts";
 
@@ -658,8 +659,8 @@ test("agy resume keeps the session's model unless one is chosen, and always sets
   const claims = new DroidLaunchClaimStore({ rootDir: root, runtime: "antigravity" });
   for (const [argv, expected] of [
     [["resume", "sess-1", "--cwd", "/repo"], [["mode", "sess-1", "auto"]]],
+    // --thinking alone changes only the thinking level; the saved model stays.
     [["resume", "sess-1", "--cwd", "/repo", "--thinking", "low", "--mode", "plan"], [
-      ["config", "sess-1", "model", "gemini-4-neon"],
       ["config", "sess-1", "thought_level", "low"],
       ["mode", "sess-1", "plan"],
     ]],
@@ -701,6 +702,24 @@ test("agy sign-in preflight passes when models list, and explains a missing bina
     .rejects.toBeInstanceOf(AgySignedOutError);
   await expect(checkAgySignedIn("agy", async () => ({ code: 2, output: "boom\nquota exhausted\n" })))
     .rejects.toThrow("agy models failed before launch: quota exhausted");
+});
+
+test("agy session config: defaults for a new session, only the passed override on resume", async () => {
+  const calls: string[] = [];
+  const client = {
+    setConfigOption: async (_id: string, key: string, value: string) => { calls.push(`${key}=${value}`); },
+    setMode: async (_id: string, mode: string) => { calls.push(`mode=${mode}`); },
+  };
+  await configureAgySession(client as never, "s", parseAgyLauncherArgs([], {}));
+  expect(calls).toEqual(["model=gemini-4-neon", "thought_level=high", "mode=auto"]);
+  calls.length = 0;
+  // Env defaults are for new sessions; --thinking alone keeps the saved model.
+  const env = { AGY_PEER_MODEL: "gemini-4-argon", AGY_PEER_THINKING: "low" };
+  await configureAgySession(client as never, "s", parseAgyLauncherArgs(["resume", "sess-1", "--thinking", "medium"], env));
+  expect(calls).toEqual(["thought_level=medium", "mode=auto"]);
+  calls.length = 0;
+  await configureAgySession(client as never, "s", parseAgyLauncherArgs(["resume", "sess-1"], env));
+  expect(calls).toEqual(["mode=auto"]);
 });
 
 test("agy argument parser: start/resume forms, env defaults, flags, and strict validation", () => {
